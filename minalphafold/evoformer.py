@@ -152,10 +152,30 @@ class MSATransition(torch.nn.Module):
 class OuterProductMean(torch.nn.Module):
     def __init__(self, config):
         super().__init__()
-        pass
+        self.layer_norm = torch.nn.LayerNorm(config.c_s)
+
+        self.c = config.outer_product_dim
+
+        self.linear_left = torch.nn.Linear(config.c_s, self.c)
+        self.linear_right = torch.nn.Linear(config.c_s, self.c)
+
+        self.linear_out = torch.nn.Linear(in_features=self.c*self.c, out_features=config.c_z)
 
     def forward(self, msa_representation: torch.Tensor):
-        pass
+        msa_representation = self.layer_norm(msa_representation)
+
+        # Shape (batch, N_seq, N_res, self.c)
+        A = self.linear_left(msa_representation)
+        B = self.linear_right(msa_representation)
+
+        # Shape (batch, N_seq, N_res, N_res, self.c, self.c)
+        outer = torch.einsum('bsic, bsjd -> bsijcd', A, B)
+        
+        # Shape (batch. N_res, N_res, self.c, self.c)
+        mean_val = torch.mean(outer, dim=1)
+        mean_val = mean_val.reshape(mean_val.shape[0], mean_val.shape[1], mean_val.shape[2], -1)
+
+        return self.linear_out(mean_val)
 
 class TriangleMultiplicationOutgoing(torch.nn.Module):
     def __init__(self, config):
