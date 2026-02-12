@@ -67,7 +67,7 @@ class StructureModule(torch.nn.Module):
         alpha = torch.zeros((s.shape[0], s.shape[1], 7, 2), device=single_representation.device)
 
         for l in range(self.num_layers):
-            # Stop rotation gradients between iterations (Alg. 20, lines 19-20)
+            # Stop rotation gradients between iterations
             if l < self.num_layers - 1:
                 rotations = rotations.detach()
 
@@ -105,7 +105,7 @@ class StructureModule(torch.nn.Module):
         all_translations = torch.stack(all_translations)
         all_torsion_angles = torch.stack(all_torsion_angles)
 
-        # Alg. 20, line 24: compute all-atom coordinates from final backbone + torsions
+        # Compute all-atom coordinates from final backbone + torsions
         all_frames_R, all_frames_t, atom_coords, mask = compute_all_atom_coordinates(
             translations,
             rotations,
@@ -113,7 +113,7 @@ class StructureModule(torch.nn.Module):
             aatype
         )
 
-        # Alg. 20, line 25: concat backbone frame T_i with per-group frames T_i^f
+        # Concat backbone frame T_i with per-group frames T_i^f
         # all_frames already has backbone as frame 0, but we prepend the standalone
         # backbone frame so the FAPE loss can address it separately (9 frames total)
         backbone_R = rotations.unsqueeze(2)      # (batch, N_res, 1, 3, 3)
@@ -123,11 +123,11 @@ class StructureModule(torch.nn.Module):
 
         predictions = {
             # Per-layer backbone frames for auxiliary FAPE loss
-            "traj_rotations": all_rotations,          # (L, batch, N_res, 3, 3)
-            "traj_translations": all_translations,     # (L, batch, N_res, 3)
+            "traj_rotations": all_rotations,          # (num_layers, batch, N_res, 3, 3)
+            "traj_translations": all_translations,     # (num_layers, batch, N_res, 3)
 
             # Per-layer torsion angles for torsion angle loss
-            "traj_torsion_angles": all_torsion_angles, # (L, batch, N_res, 7, 2)
+            "traj_torsion_angles": all_torsion_angles, # (num_layers, batch, N_res, 7, 2)
 
             # Final backbone frames
             "final_rotations": rotations,              # (batch, N_res, 3, 3)
