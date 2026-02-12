@@ -17,3 +17,20 @@ def dropout_columnwise(x, p, training):
     mask = x.new_ones(mask_shape)
     mask = torch.nn.functional.dropout(mask, p=p, training=True)
     return x * mask
+
+def make_rot_x(alpha: torch.Tensor):
+    a1 = alpha[..., 0]
+    a2 = alpha[..., 1]
+
+    zeros = torch.zeros_like(a1)
+    ones = torch.ones_like(a1)
+
+    R = torch.stack([
+        torch.stack([ones,  zeros, zeros], dim=-1),
+        torch.stack([zeros, a1,    -a2],   dim=-1),
+        torch.stack([zeros, a2,     a1],   dim=-1),
+    ], dim=-2)
+
+    t = torch.zeros(*alpha.shape[:-1], 3, device=alpha.device, dtype=alpha.dtype)
+
+    return R, t

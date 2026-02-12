@@ -1,5 +1,12 @@
 import torch    
 import math
+from residue_constants import (
+    restype_rigid_group_default_frame,
+    restype_atom14_rigid_group_positions,
+    restype_atom14_to_rigid_group,
+    restype_atom14_mask,
+)
+
 class StructureModule(torch.nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -193,3 +200,108 @@ class BackboneUpdate(torch.nn.Module):
         t = vals[:, :, 3:]
 
         return R, t
+    
+def make_rot_x(alpha: torch.Tensor):
+    a1 = alpha[..., 0]
+    a2 = alpha[..., 1]
+
+    zeros = torch.zeros_like(a1)
+    ones = torch.ones_like(a1)
+
+    R = torch.stack([
+        torch.stack([ones,  zeros, zeros], dim=-1),
+        torch.stack([zeros, a1,    -a2],   dim=-1),
+        torch.stack([zeros, a2,     a1],   dim=-1),
+    ], dim=-2)
+
+    t = torch.zeros(*alpha.shape[:-1], 3, device=alpha.device, dtype=alpha.dtype)
+
+    return R, t
+
+def compose_transforms(R1, t1, R2, t2):
+    """Compose two rigid transforms: T1 ∘ T2 = (R1 @ R2, R1 @ t2 + t1)"""
+    R = R1 @ R2
+    t = (R1 @ t2.unsqueeze(-1)).squeeze(-1) + t1
+    return R, t
+
+
+def compute_all_atom_coordinates(
+    translations: torch.Tensor,   # (batch, N_res, 3)
+    rotations: torch.Tensor,      # (batch, N_res, 3, 3)
+    torsion_angles: torch.Tensor, # (batch, N_res, 7, 2) — [ω, φ, ψ, χ1, χ2, χ3, χ4]
+    aatype: torch.Tensor,         # (batch, N_res) — integer residue type indices
+):
+    device = translations.device
+    dtype = translations.dtype
+
+    # --- Step 1: Normalize torsion angles to unit vectors ---
+    torsion_angles = torsion_angles / (torch.norm(torsion_angles, dim=-1, keepdim=True) + 1e-8)
+
+    # --- Step 2: Get literature constants, indexed by residue type ---
+    default_frames = torch.tensor(
+        restype_rigid_group_default_frame, device=device, dtype=dtype
+    )  # (21, 8, 4, 4)
+    lit_all = default_frames[aatype]          # (batch, N_res, 8, 4, 4)
+    lit_R = lit_all[..., :3, :3]              # (batch, N_res, 8, 3, 3)
+    lit_t = lit_all[..., :3, 3]               # (batch, N_res, 8, 3)
+
+    # --- Step 3: Build torsion rotations via makeRotX ---
+    torsion_R, torsion_t = make_rot_x(torsion_angles)  # (batch, N_res, 7, 3, 3), (batch, N_res, 7, 3)
+
+    # --- Step 4: Build all 8 frames ---
+    frames_R = [rotations]   # Frame 0: backbone
+    frames_t = [translations]
+
+    # Frames 1–4: T_i ∘ T_lit[f] ∘ makeRotX(angle_f)
+    # Each branches independently from the backbone frame
+    for f in range(4):
+        mid_R, mid_t = compose_transforms(
+            lit_R[:, :, f + 1], lit_t[:, :, f + 1],
+            torsion_R[:, :, f], torsion_t[:, :, f],
+        )
+        frame_R, frame_t = compose_transforms(rotations, translations, mid_R, mid_t)
+        frames_R.append(frame_R)
+        frames_t.append(frame_t)
+
+    # Frames 5–7: chain sequentially from previous sidechain frame
+    # Frame 5 = T_i4 ∘ T_lit[5] ∘ makeRotX(χ2)
+    # Frame 6 = T_i5 ∘ T_lit[6] ∘ makeRotX(χ3)
+    # Frame 7 = T_i6 ∘ T_lit[7] ∘ makeRotX(χ4)
+    for f in range(3):
+        prev_R = frames_R[f + 4]
+        prev_t = frames_t[f + 4]
+        mid_R, mid_t = compose_transforms(
+            lit_R[:, :, f + 5], lit_t[:, :, f + 5],
+            torsion_R[:, :, f + 4], torsion_t[:, :, f + 4],
+        )
+        frame_R, frame_t = compose_transforms(prev_R, prev_t, mid_R, mid_t)
+        frames_R.append(frame_R)
+        frames_t.append(frame_t)
+
+    all_frames_R = torch.stack(frames_R, dim=2)  # (batch, N_res, 8, 3, 3)
+    all_frames_t = torch.stack(frames_t, dim=2)  # (batch, N_res, 8, 3)
+
+    # --- Step 5: Place atoms using their frame assignments ---
+    lit_pos = torch.tensor(
+        restype_atom14_rigid_group_positions, device=device, dtype=dtype
+    )[aatype]  # (batch, N_res, 14, 3)
+
+    atom_frame_idx = torch.tensor(
+        restype_atom14_to_rigid_group, device=device, dtype=torch.long
+    )[aatype]  # (batch, N_res, 14)
+
+    mask = torch.tensor(
+        restype_atom14_mask, device=device, dtype=dtype
+    )[aatype]  # (batch, N_res, 14)
+
+    # Gather the correct frame for each atom
+    idx_R = atom_frame_idx[:, :, :, None, None].expand(-1, -1, -1, 3, 3)
+    atom_R = torch.gather(all_frames_R, 2, idx_R)  # (batch, N_res, 14, 3, 3)
+
+    idx_t = atom_frame_idx[:, :, :, None].expand(-1, -1, -1, 3)
+    atom_t = torch.gather(all_frames_t, 2, idx_t)  # (batch, N_res, 14, 3)
+
+    # x_global = R_frame @ x_lit + t_frame
+    atom_coords = torch.einsum('bnaji, bnaj -> bnai', atom_R, lit_pos) + atom_t
+
+    return all_frames_R, all_frames_t, atom_coords, mask
