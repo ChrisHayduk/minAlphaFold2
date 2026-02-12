@@ -10,7 +10,39 @@ from residue_constants import (
 class StructureModule(torch.nn.Module):
     def __init__(self, config):
         super().__init__()
-        pass
+        self.c = config.structure_module_c
+
+        # Layer Norms
+        self.layer_norm_single_rep_1 = torch.nn.LayerNorm(config.c_s)
+        self.layer_norm_single_rep_2 = torch.nn.LayerNorm(config.c_s)
+        self.layer_norm_single_rep_3 = torch.nn.LayerNorm(config.c_s)
+
+        self.layer_norm_pair_rep = torch.nn.LayerNorm(config.c_z)
+
+        # Dropouts
+        self.dropout_1 = torch.nn.Dropout(p=0.1)
+        self.dropout_2 = torch.nn.Dropout(p=0.2)
+
+        # Linear layers
+        self.single_rep_proj = torch.nn.Linear(in_features=config.c_s, out_features=config.c_s)
+        self.transition_linear_1 = torch.nn.Linear(in_features=config.c_s, out_features=config.c_s)
+        self.transition_linear_2 = torch.nn.Linear(in_features=config.c_s, out_features=config.c_s)
+        self.transition_linear_3 = torch.nn.Linear(in_features=config.c_s, out_features=config.c_s)
+
+        self.angle_linear_1 = torch.nn.Linear(in_features=config.c_s, out_features=self.c)
+        self.angle_linear_2 = torch.nn.Linear(in_features=config.c_s, out_features=self.c)
+
+        self.angle_linear_3 = torch.nn.Linear(in_features=self.c, out_features=self.c)
+        self.angle_linear_4 = torch.nn.Linear(in_features=self.c, out_features=self.c)
+        self.angle_linear_4 = torch.nn.Linear(in_features=self.c, out_features=self.c)
+        self.angle_linear_5 = torch.nn.Linear(in_features=self.c, out_features=self.c)
+
+        self.angle_linear_6 = torch.nn.Linear(in_features=self.c, out_features=2)
+
+        # Core blocks
+        self.IPA = InvariantPointAttention(config)
+        self.backbone_update = BackboneUpdate(config)
+
 
     def forward(self, single_representation: torch.Tensor, pair_representation: torch.Tensor):
         pass
