@@ -11,6 +11,7 @@ class StructureModule(torch.nn.Module):
     def __init__(self, config):
         super().__init__()
         self.c = config.structure_module_c
+        self.num_layers = config.structure_module_layers
 
         # Layer Norms
         self.layer_norm_single_rep_1 = torch.nn.LayerNorm(config.c_s)
@@ -34,18 +35,116 @@ class StructureModule(torch.nn.Module):
 
         self.angle_linear_3 = torch.nn.Linear(in_features=self.c, out_features=self.c)
         self.angle_linear_4 = torch.nn.Linear(in_features=self.c, out_features=self.c)
-        self.angle_linear_4 = torch.nn.Linear(in_features=self.c, out_features=self.c)
         self.angle_linear_5 = torch.nn.Linear(in_features=self.c, out_features=self.c)
+        self.angle_linear_6 = torch.nn.Linear(in_features=self.c, out_features=self.c)
 
-        self.angle_linear_6 = torch.nn.Linear(in_features=self.c, out_features=2)
+        self.angle_linear_7 = torch.nn.Linear(in_features=self.c, out_features=2)
 
         # Core blocks
         self.IPA = InvariantPointAttention(config)
         self.backbone_update = BackboneUpdate(config)
 
+        self.relu = torch.nn.ReLU()
 
-    def forward(self, single_representation: torch.Tensor, pair_representation: torch.Tensor):
-        pass
+    def forward(self, single_representation: torch.Tensor, pair_representation: torch.Tensor, aatype: torch.Tensor):
+        single_representation = self.layer_norm_single_rep_1(single_representation)
+
+        pair_representation = self.layer_norm_pair_rep(pair_representation)
+
+        s = self.single_rep_proj(single_representation)
+
+        rotations = torch.eye((3))
+
+        # Reshape to (batch, N_res, 3, 3)
+        rotations = rotations.view(1, 1, 3, 3).expand(s.shape[0], s.shape[1], 3, 3)
+
+        translations = torch.zeros((s.shape[0], s.shape[1], 3))
+
+        # Collect intermediates for auxiliary losses
+        all_rotations = []
+        all_translations = []
+        all_torsion_angles = []
+        alpha = torch.zeros((s.shape[0], s.shape[1], 7, 2), device=single_representation.device)
+
+        for l in range(self.num_layers):
+            # Stop rotation gradients between iterations (Alg. 20, lines 19-20)
+            if l < self.num_layers - 1:
+                rotations = rotations.detach()
+
+            s += self.IPA(s, pair_representation, rotations, translations)
+
+            s = self.layer_norm_single_rep_1(self.dropout_1(s))
+
+            # Transition
+            s += self.transition_linear_3(self.relu(self.transition_linear_2(self.relu(self.transition_linear_1(s)))))
+            s = self.layer_norm_single_rep_2(self.dropout_2(s))
+
+            # Update backbone
+            new_rotations, new_translations = self.backbone_update(s)
+
+            rotations = torch.einsum('bsij, bsjk -> bsik', rotations, new_rotations)
+
+            temp = torch.einsum('bsij, bsi -> bsj', new_rotations, translations)
+
+            translations = temp + translations
+
+            # Predict side chain and backbone torsion angles
+            a = self.angle_linear_1(s) + self.angle_linear_2(single_representation)
+
+            a += self.angle_linear_4(self.relu(self.angle_linear_3(self.relu(a))))
+
+            a += self.angle_linear_6(self.relu(self.angle_linear_5(self.relu(a))))
+
+            alpha = self.angle_linear_7(self.relu(a))
+
+            all_rotations.append(rotations)
+            all_translations.append(translations)
+            all_torsion_angles.append(alpha)
+
+        all_rotations = torch.stack(all_rotations)
+        all_translations = torch.stack(all_translations)
+        all_torsion_angles = torch.stack(all_torsion_angles)
+
+        # Alg. 20, line 24: compute all-atom coordinates from final backbone + torsions
+        all_frames_R, all_frames_t, atom_coords, mask = compute_all_atom_coordinates(
+            translations,
+            rotations,
+            alpha,
+            aatype
+        )
+
+        # Alg. 20, line 25: concat backbone frame T_i with per-group frames T_i^f
+        # all_frames already has backbone as frame 0, but we prepend the standalone
+        # backbone frame so the FAPE loss can address it separately (9 frames total)
+        backbone_R = rotations.unsqueeze(2)      # (batch, N_res, 1, 3, 3)
+        backbone_t = translations.unsqueeze(2)    # (batch, N_res, 1, 3)
+        all_frames_R = torch.cat([backbone_R, all_frames_R], dim=2)  # (batch, N_res, 9, 3, 3)
+        all_frames_t = torch.cat([backbone_t, all_frames_t], dim=2)  # (batch, N_res, 9, 3)
+
+        predictions = {
+            # Per-layer backbone frames for auxiliary FAPE loss
+            "traj_rotations": all_rotations,          # (L, batch, N_res, 3, 3)
+            "traj_translations": all_translations,     # (L, batch, N_res, 3)
+
+            # Per-layer torsion angles for torsion angle loss
+            "traj_torsion_angles": all_torsion_angles, # (L, batch, N_res, 7, 2)
+
+            # Final backbone frames
+            "final_rotations": rotations,              # (batch, N_res, 3, 3)
+            "final_translations": translations,        # (batch, N_res, 3)
+
+            # Final all-atom outputs (frames include backbone + 8 groups = 9 total)
+            "all_frames_R": all_frames_R,              # (batch, N_res, 9, 3, 3)
+            "all_frames_t": all_frames_t,              # (batch, N_res, 9, 3)
+            "atom14_coords": atom_coords,            # (batch, N_res, 14, 3)
+            "atom14_mask": mask,                # (batch, N_res, 14)
+
+            # Final single representation (for distogram, pLDDT, etc.)
+            "single": s,                               # (batch, N_res, c_s)
+        }
+
+        return predictions
+
 
 class InvariantPointAttention(torch.nn.Module):
     def __init__(self, config):
