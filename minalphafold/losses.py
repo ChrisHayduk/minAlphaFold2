@@ -5,6 +5,52 @@ from residue_constants import (
     restype_atom14_vdw_radius,
 )
 
+class AlphaFoldLoss(torch.nn.Module):
+    def __init__(self, finetune = False):
+        super().__init__()
+        self.torsion_angle_loss = TorsionAngleLoss()
+        self.plddt_loss = PLDDTLoss()
+        self.distogram_loss = DistogramLoss()
+        self.msa_loss = MSALoss()
+        self.experimentally_resolved_loss = ExperimentallyResolvedLoss()
+        self.structural_violation_loss = StructuralViolationLoss()
+        self.aux_loss = AuxiliaryLoss()
+
+        self.finetune = finetune
+
+    def forward(
+            self, 
+            structure_model_prediction: dict, 
+            msa_representation: torch.Tensor,
+            true_rotations,           # (b, N_res, 3, 3)
+            true_translations,        # (b, N_res, 3)
+            true_atom_positions,      # (b, N_atoms, 3)
+            true_torsion_angles
+        ):
+        loss = 0
+        
+        if self.finetune:
+            loss = 0.5*self.fape_loss() + 0.5*self.aux_loss() + 0.3*self.distogram_loss() + 2.0*self.msa_loss() + 0.01*self.plddt_loss() + 0.01*self.experimentally_resolved_loss() + 1.0*self.structural_violation_loss()
+        else:
+            loss = 0.5*self.fape_loss() + 0.5*self.aux_loss() + 0.3*self.distogram_loss() + 2.0*self.msa_loss() + 0.01*self.plddt_loss()
+
+        return loss
+    
+class AuxiliaryLoss(torch.nn.Module):
+    def __init__(self):
+        self.torsion_angle_loss = TorsionAngleLoss()
+        self.fape_loss = FAPELoss()
+
+    def forward(
+            self, 
+            structure_model_prediction: dict,
+            true_rotations: torch.Tensor,
+            true_translation: torch.Tensor,
+            true_atom_positions: torch.Tensor,
+            true_torsion_angles: torch.Tensor,
+        ):
+            pass
+
 class TorsionAngleLoss(torch.nn.Module):
     def __init__(self):
         super().__init__()
