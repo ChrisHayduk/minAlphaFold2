@@ -30,8 +30,6 @@ class pLDDTHead(torch.nn.Module):
 
 
 class MaskedMSAHead(torch.nn.Module):
-    """Supplementary Section 1.9.9 — predicts masked MSA tokens."""
-
     def __init__(self, config):
         super().__init__()
         self.linear = torch.nn.Linear(config.c_s, config.n_msa_classes)
