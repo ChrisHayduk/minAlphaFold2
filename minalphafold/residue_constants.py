@@ -359,6 +359,32 @@ restype_1to3 = {
 }
 
 
+# Van der Waals radii [Å] by element (from Wikipedia, used in original AF2)
+van_der_waals_radius = {'C': 1.7, 'N': 1.55, 'O': 1.52, 'S': 1.8}
+
+# Between-residue C-N peptide bond: [general, proline]
+between_res_bond_length_c_n = [1.329, 1.341]
+between_res_bond_length_stddev_c_n = [0.014, 0.016]
+
+# Between-residue cos(bond angles): [mean, stddev]
+between_res_cos_angles_c_n_ca = [-0.5203, 0.0353]  # C(i)-N(i+1)-CA(i+1), ~121.4°
+between_res_cos_angles_ca_c_n = [-0.4473, 0.0311]  # CA(i)-C(i)-N(i+1), ~116.6°
+
+# VDW radius per atom14 slot per residue type: (21, 14)
+restype_atom14_vdw_radius = np.zeros([21, 14], dtype=np.float32)
+
+
+def _make_atom14_vdw_radius():
+    for restype, restype_letter in enumerate(restypes):
+        resname = restype_1to3[restype_letter]
+        for atom_idx, atom_name in enumerate(restype_name_to_atom14_names[resname]):
+            if atom_name:
+                restype_atom14_vdw_radius[restype, atom_idx] = van_der_waals_radius[atom_name[0]]
+
+
+_make_atom14_vdw_radius()
+
+
 def _make_rigid_transformation_4x4(ex, ey, translation):
   """Create a rigid 4x4 transformation matrix from two axes and transl."""
   # Normalize ex.

@@ -1,4 +1,9 @@
 import torch
+from residue_constants import (
+    between_res_bond_length_c_n, between_res_bond_length_stddev_c_n,
+    between_res_cos_angles_c_n_ca, between_res_cos_angles_ca_c_n,
+    restype_atom14_vdw_radius,
+)
 
 class TorsionAngleLoss(torch.nn.Module):
     def __init__(self):
@@ -153,18 +158,108 @@ class StructuralViolationLoss(torch.nn.Module):
         atom_mask,            # (batch, N_res, 14)    — 1 if atom exists, 0 otherwise
         residue_types,        # (batch, N_res)         — integer residue type index (0–20)
     ):
-        pass
+        # Between-residue C-N peptide bond: C of residue i to N of residue i+1
+        # atom14 indices: N=0, CA=1, C=2
+        C_i = predicted_positions[:, :-1, 2, :]     # (batch, N_res-1, 3)
+        N_next = predicted_positions[:, 1:, 0, :]   # (batch, N_res-1, 3)
+
+        d = torch.sqrt(torch.sum((C_i - N_next) ** 2, dim=-1) + 1e-8)  # (batch, N_res-1)
+
+        # Ideal bond length depends on whether residue i+1 is proline (index 14)
+        is_proline = (residue_types[:, 1:] == 14).float()  # (batch, N_res-1)
+        d_ideal = (1.0 - is_proline) * between_res_bond_length_c_n[0] + \
+                  is_proline * between_res_bond_length_c_n[1]
+        d_stddev = (1.0 - is_proline) * between_res_bond_length_stddev_c_n[0] + \
+                   is_proline * between_res_bond_length_stddev_c_n[1]
+
+        # Mask: both C of residue i and N of residue i+1 must exist
+        mask = atom_mask[:, :-1, 2] * atom_mask[:, 1:, 0]  # (batch, N_res-1)
+
+        loss = ((d - d_ideal) / d_stddev) ** 2 * mask
+        return torch.sum(loss) / torch.sum(mask).clamp(min=1)
 
     def bond_angle_loss(self,
         predicted_positions,  # (batch, N_res, 14, 3) — all-atom coordinates
         atom_mask,            # (batch, N_res, 14)    — 1 if atom exists, 0 otherwise
         residue_types,        # (batch, N_res)         — integer residue type index (0–20)
     ):
-        pass
+        # Between-residue angles via law of cosines
+        # atom14 indices: N=0, CA=1, C=2
+        CA_i = predicted_positions[:, :-1, 1, :]    # (batch, N_res-1, 3)
+        C_i = predicted_positions[:, :-1, 2, :]     # (batch, N_res-1, 3)
+        N_next = predicted_positions[:, 1:, 0, :]   # (batch, N_res-1, 3)
+        CA_next = predicted_positions[:, 1:, 1, :]  # (batch, N_res-1, 3)
+
+        eps = 1e-8
+
+        # Pairwise squared distances
+        d_CA_C_sq = torch.sum((CA_i - C_i) ** 2, dim=-1)       # (batch, N_res-1)
+        d_C_N_sq = torch.sum((C_i - N_next) ** 2, dim=-1)
+        d_CA_N_sq = torch.sum((CA_i - N_next) ** 2, dim=-1)
+        d_N_CA_sq = torch.sum((N_next - CA_next) ** 2, dim=-1)
+        d_C_CA_sq = torch.sum((C_i - CA_next) ** 2, dim=-1)
+
+        d_CA_C = torch.sqrt(d_CA_C_sq + eps)
+        d_C_N = torch.sqrt(d_C_N_sq + eps)
+        d_N_CA = torch.sqrt(d_N_CA_sq + eps)
+
+        # Angle 1: CA(i)-C(i)-N(i+1) — vertex at C(i)
+        # cos = (d_CA_C^2 + d_C_N^2 - d_CA_N^2) / (2 * d_CA_C * d_C_N)
+        cos_ca_c_n = (d_CA_C_sq + d_C_N_sq - d_CA_N_sq) / (2.0 * d_CA_C * d_C_N + eps)
+
+        # Angle 2: C(i)-N(i+1)-CA(i+1) — vertex at N(i+1)
+        # cos = (d_C_N^2 + d_N_CA^2 - d_C_CA^2) / (2 * d_C_N * d_N_CA)
+        cos_c_n_ca = (d_C_N_sq + d_N_CA_sq - d_C_CA_sq) / (2.0 * d_C_N * d_N_CA + eps)
+
+        # Mask: all 4 backbone atoms must exist
+        mask = atom_mask[:, :-1, 1] * atom_mask[:, :-1, 2] * \
+               atom_mask[:, 1:, 0] * atom_mask[:, 1:, 1]  # (batch, N_res-1)
+
+        loss_1 = ((cos_ca_c_n - between_res_cos_angles_ca_c_n[0]) / between_res_cos_angles_ca_c_n[1]) ** 2
+        loss_2 = ((cos_c_n_ca - between_res_cos_angles_c_n_ca[0]) / between_res_cos_angles_c_n_ca[1]) ** 2
+
+        loss = (loss_1 + loss_2) * mask
+        return torch.sum(loss) / torch.sum(mask).clamp(min=1)
 
     def clash_loss(self,
         predicted_positions,  # (batch, N_res, 14, 3) — all-atom coordinates
         atom_mask,            # (batch, N_res, 14)    — 1 if atom exists, 0 otherwise
         residue_types,        # (batch, N_res)         — integer residue type index (0–20)
     ):
-        pass
+        batch, N_res = predicted_positions.shape[:2]
+        overlap_tolerance = 1.5
+
+        # Flatten atoms: (batch, N_res*14, 3) and (batch, N_res*14)
+        pos_flat = predicted_positions.reshape(batch, N_res * 14, 3)
+        mask_flat = atom_mask.reshape(batch, N_res * 14)
+
+        # VDW radii per atom: look up from precomputed table
+        # residue_types: (batch, N_res) -> vdw: (batch, N_res, 14)
+        vdw_table = torch.tensor(restype_atom14_vdw_radius, device=predicted_positions.device)
+        residue_types_clamped = residue_types.clamp(max=20)
+        vdw = vdw_table[residue_types_clamped]  # (batch, N_res, 14)
+        vdw_flat = vdw.reshape(batch, N_res * 14)  # (batch, N_res*14)
+
+        # Pairwise distances: (batch, N_res*14, N_res*14)
+        diff = pos_flat[:, :, None, :] - pos_flat[:, None, :, :]  # (batch, M, M, 3)
+        dist = torch.sqrt(torch.sum(diff ** 2, dim=-1) + 1e-8)   # (batch, M, M)
+
+        # Pair mask: both atoms valid
+        pair_mask = mask_flat[:, :, None] * mask_flat[:, None, :]  # (batch, M, M)
+
+        # Exclude same-residue and adjacent-residue pairs (seq separation < 2)
+        residue_idx = torch.arange(N_res, device=predicted_positions.device)
+        # Each atom's residue index: (N_res*14,)
+        atom_res_idx = residue_idx.repeat_interleave(14)
+        # Sequence separation matrix: (M, M)
+        seq_sep = torch.abs(atom_res_idx[None, :] - atom_res_idx[:, None])  # (M, M)
+        sep_mask = (seq_sep >= 2).float().unsqueeze(0)  # (1, M, M)
+
+        pair_mask = pair_mask * sep_mask
+
+        # Overlap: vdw_i + vdw_j - tolerance - dist
+        vdw_sum = vdw_flat[:, :, None] + vdw_flat[:, None, :]  # (batch, M, M)
+        overlap = vdw_sum - overlap_tolerance - dist
+
+        clash = torch.clamp(overlap, min=0) * pair_mask
+        return torch.sum(clash) / torch.sum(pair_mask).clamp(min=1)
