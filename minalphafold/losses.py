@@ -15,6 +15,7 @@ class AlphaFoldLoss(torch.nn.Module):
         self.experimentally_resolved_loss = ExperimentallyResolvedLoss()
         self.structural_violation_loss = StructuralViolationLoss()
         self.aux_loss = AuxiliaryLoss()
+        self.fape_loss = FAPELoss()
 
         self.finetune = finetune
 
