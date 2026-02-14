@@ -15,25 +15,101 @@ class AlphaFoldLoss(torch.nn.Module):
         self.experimentally_resolved_loss = ExperimentallyResolvedLoss()
         self.structural_violation_loss = StructuralViolationLoss()
         self.aux_loss = AuxiliaryLoss()
-        self.fape_loss = FAPELoss()
+        self.fape_loss = AllAtomFAPE()
 
         self.finetune = finetune
 
     def forward(
-            self, 
-            structure_model_prediction: dict, 
-            msa_representation: torch.Tensor,
-            true_rotations,           # (b, N_res, 3, 3)
-            true_translations,        # (b, N_res, 3)
-            true_atom_positions,      # (b, N_atoms, 3)
-            true_torsion_angles
+            self,
+            structure_model_prediction: dict,
+            true_rotations: torch.Tensor,           # (b, N_res, 3, 3)
+            true_translations: torch.Tensor,        # (b, N_res, 3)
+            true_atom_positions: torch.Tensor,      # (b, N_res, 14, 3)
+            true_torsion_angles: torch.Tensor,      # (b, N_res, 7, 2)
+            experimentally_resolved_pred: torch.Tensor,
+            experimentally_resolved_true: torch.Tensor,
+            msa_pred: torch.Tensor,
+            msa_true: torch.Tensor,
+            msa_mask: torch.Tensor,
+            plddt_pred: torch.Tensor,
+            distogram_pred: torch.Tensor,
+            res_types: torch.Tensor,                # (b, N_res) integer 0-20
         ):
-        loss = 0
+        final_rotations = structure_model_prediction["traj_rotations"][-1]      # (batch, N_res, 3, 3)
+        final_translations = structure_model_prediction["traj_translations"][-1]  # (batch, N_res, 3)
+        atom_coords = structure_model_prediction["atom14_coords"]   # (batch, N_res, 14, 3)
+        atom_mask = structure_model_prediction["atom14_mask"]       # (batch, N_res, 14)
+
+        fape_loss = self.fape_loss(
+                final_rotations, final_translations, atom_coords, atom_mask,
+                true_rotations, true_translations, true_atom_positions,
+            )
+
+        # --- Derive true_torsion_angles_alt ---
+        # For symmetric side chains, the alternative swaps equivalent atoms,
+        # which is equivalent to negating the (sin, cos) of the relevant chi angle.
+        # ASP(3), PHE(13), TYR(18): chi2 (torsion index 4)
+        # GLU(6): chi3 (torsion index 5)
+        true_torsion_angles_alt = true_torsion_angles.clone()
+        chi2_sym = ((res_types == 3) | (res_types == 13) | (res_types == 18)).unsqueeze(-1)
+        true_torsion_angles_alt[:, :, 4, :] = torch.where(
+            chi2_sym, -true_torsion_angles[:, :, 4, :], true_torsion_angles[:, :, 4, :])
+        chi3_sym = (res_types == 6).unsqueeze(-1)
+        true_torsion_angles_alt[:, :, 5, :] = torch.where(
+            chi3_sym, -true_torsion_angles[:, :, 5, :], true_torsion_angles[:, :, 5, :])
+
+        aux_loss = self.aux_loss(structure_model_prediction, true_rotations, true_translations,
+                                 true_torsion_angles, true_torsion_angles_alt)
+
+        # --- Derive distogram_true ---
+        # CB-CB distances (CA for GLY) binned into distance buckets
+        is_gly = (res_types == 7)  # (batch, N_res)
+        cb_idx = torch.where(is_gly, 1, 4)  # CA=1 for GLY, CB=4 otherwise
+        cb_pos = torch.gather(
+            true_atom_positions, 2,
+            cb_idx[:, :, None, None].expand(-1, -1, 1, 3),
+        ).squeeze(2)  # (batch, N_res, 3)
+        cb_dists = torch.cdist(cb_pos, cb_pos)  # (batch, N_res, N_res)
+        n_dist_bins = distogram_pred.shape[-1]
+        dist_bin_edges = torch.linspace(2, 22, n_dist_bins - 1, device=cb_dists.device)
+        dist_bin_idx = torch.bucketize(cb_dists, dist_bin_edges)
+        distogram_true = torch.nn.functional.one_hot(dist_bin_idx, n_dist_bins).float()
+
+        dist_loss = self.distogram_loss(distogram_pred, distogram_true)
+
+        msa_loss = self.msa_loss(msa_pred, msa_true, msa_mask)
+
+        # --- Derive plddt_true ---
+        # Per-residue lDDT between predicted and true CA positions, then binned
+        N_res = atom_coords.shape[1]
+        with torch.no_grad():
+            pred_ca = atom_coords[:, :, 1, :]       # (batch, N_res, 3)
+            true_ca = true_atom_positions[:, :, 1, :]
+            true_ca_dists = torch.cdist(true_ca, true_ca)  # (batch, N_res, N_res)
+            pred_ca_dists = torch.cdist(pred_ca, pred_ca)
+            # Include pairs within 15 Å in the true structure, exclude self
+            inclusion = (true_ca_dists < 15.0).float() * (
+                1.0 - torch.eye(N_res, device=pred_ca.device).unsqueeze(0))
+            dist_error = torch.abs(pred_ca_dists - true_ca_dists)
+            # Average fraction of preserved distances across four thresholds
+            lddt = torch.zeros(pred_ca.shape[:2], device=pred_ca.device)  # (batch, N_res)
+            n_included = inclusion.sum(dim=-1).clamp(min=1)
+            for thresh in [0.5, 1.0, 2.0, 4.0]:
+                lddt = lddt + ((dist_error < thresh).float() * inclusion).sum(dim=-1) / n_included
+            lddt = lddt / 4.0  # (batch, N_res) in [0, 1]
+            n_plddt_bins = plddt_pred.shape[-1]
+            plddt_edges = torch.arange(1, n_plddt_bins, device=pred_ca.device).float() / n_plddt_bins
+            plddt_bin_idx = torch.bucketize(lddt, plddt_edges)
+            plddt_true = torch.nn.functional.one_hot(plddt_bin_idx, n_plddt_bins).float()
+
+        plddt_loss = self.plddt_loss(plddt_pred, plddt_true)
+
+        loss = 0.5*fape_loss + 0.5*aux_loss + 0.3*dist_loss + 2.0*msa_loss + 0.01*plddt_loss
         
         if self.finetune:
-            loss = 0.5*self.fape_loss() + 0.5*self.aux_loss() + 0.3*self.distogram_loss() + 2.0*self.msa_loss() + 0.01*self.plddt_loss() + 0.01*self.experimentally_resolved_loss() + 1.0*self.structural_violation_loss()
-        else:
-            loss = 0.5*self.fape_loss() + 0.5*self.aux_loss() + 0.3*self.distogram_loss() + 2.0*self.msa_loss() + 0.01*self.plddt_loss()
+            exp_resolved_loss = self.experimentally_resolved_loss(experimentally_resolved_pred, experimentally_resolved_true)
+            struct_violation_loss = self.structural_violation_loss(atom_coords, atom_mask, res_types)
+            loss += 0.01*exp_resolved_loss + 1.0*struct_violation_loss
 
         return loss
     
@@ -41,7 +117,7 @@ class AuxiliaryLoss(torch.nn.Module):
     def __init__(self):
         super().__init__()
         self.torsion_angle_loss = TorsionAngleLoss()
-        self.fape_loss = FAPELoss()
+        self.fape_loss = BackboneFAPE()
 
     def forward(
             self,
@@ -78,13 +154,13 @@ class TorsionAngleLoss(torch.nn.Module):
     def forward(self, torsion_angles: torch.Tensor, torsion_angles_true: torch.Tensor, torsion_angles_true_alt: torch.Tensor):
         # torsion_angles shape: (batch, N_res, 7, 2)
 
-        norm = torch.sqrt(torch.sum(torsion_angles**2, dim=-1, keepdim=True))
+        norm = torch.sqrt(torch.sum(torsion_angles**2, dim=-1, keepdim=True) + 1e-8)
 
         torsion_angles = torsion_angles / norm
 
-        true_dist = torch.sqrt(torch.sum((torsion_angles_true - torsion_angles)**2, dim=-1, keepdim=True))
+        true_dist = torch.sqrt(torch.sum((torsion_angles_true - torsion_angles)**2, dim=-1, keepdim=True) + 1e-8)
 
-        alt_true_dist = torch.sqrt(torch.sum((torsion_angles_true_alt - torsion_angles)**2, dim=-1, keepdim=True))
+        alt_true_dist = torch.sqrt(torch.sum((torsion_angles_true_alt - torsion_angles)**2, dim=-1, keepdim=True) + 1e-8)
 
         torsion_loss = torch.mean(torch.minimum(true_dist, alt_true_dist), dim=(2, 3))
 
@@ -92,7 +168,7 @@ class TorsionAngleLoss(torch.nn.Module):
 
         return torsion_loss + 0.02 * angle_norm_loss
     
-class FAPELoss(torch.nn.Module):
+class BackboneFAPE(torch.nn.Module):
     def __init__(self, d_clamp=10.0, eps=1e-4, Z=10.0):
         super().__init__()
         self.eps = eps
@@ -133,7 +209,61 @@ class FAPELoss(torch.nn.Module):
         fape_loss = (1.0 / self.Z) * torch.mean(dist_clamped, dim=(-1, -2))
 
         return fape_loss
-    
+
+class AllAtomFAPE(torch.nn.Module):
+    def __init__(self, d_clamp=10.0, eps=1e-4, Z=10.0):
+        super().__init__()
+        self.eps = eps
+        self.d_clamp_val = d_clamp
+        self.Z = Z
+
+    def forward(self,
+                predicted_rotations,      # (b, N_res, 3, 3)
+                predicted_translations,   # (b, N_res, 3)
+                predicted_atom_positions, # (b, N_res, 14, 3)
+                atom_mask,                # (b, N_res, 14)
+                true_rotations,           # (b, N_res, 3, 3)
+                true_translations,        # (b, N_res, 3)
+                true_atom_positions,      # (b, N_res, 14, 3)
+    ):
+        b, N_res = predicted_rotations.shape[:2]
+
+        # Flatten atoms: (b, N_res*14, 3) and mask: (b, N_res*14)
+        pred_pos = predicted_atom_positions.reshape(b, N_res * 14, 3)
+        true_pos = true_atom_positions.reshape(b, N_res * 14, 3)
+        mask = atom_mask.reshape(b, N_res * 14)
+
+        # Predicted inverse frames
+        R_pred_inv = predicted_rotations.transpose(-1, -2)
+        t_pred_inv = -torch.einsum('birc, bic -> bir', R_pred_inv, predicted_translations)
+
+        # True inverse frames
+        R_true_inv = true_rotations.transpose(-1, -2)
+        t_true_inv = -torch.einsum('birc, bic -> bir', R_true_inv, true_translations)
+
+        # Project all atoms through all frames
+        # Result: (b, N_frames, N_atoms, 3)
+        x_frames_pred = torch.einsum('biop, bjp -> bijo', R_pred_inv, pred_pos) \
+                         + t_pred_inv[:, :, None, :]
+        x_frames_true = torch.einsum('biop, bjp -> bijo', R_true_inv, true_pos) \
+                         + t_true_inv[:, :, None, :]
+
+        # Distance: (b, N_frames, N_atoms)
+        dist = torch.sqrt(
+            torch.sum((x_frames_pred - x_frames_true) ** 2, dim=-1) + self.eps
+        )
+
+        # Clamp
+        dist_clamped = torch.clamp(dist, max=self.d_clamp_val)
+
+        # Masked average over atoms, then average over frames
+        # mask: (b, N_atoms) -> broadcast over frames
+        n_atoms = mask.sum(dim=-1, keepdim=True).clamp(min=1)  # (b, 1)
+        frame_means = (dist_clamped * mask[:, None, :]).sum(dim=-1) / n_atoms  # (b, N_frames)
+        fape_loss = frame_means.mean(dim=-1) / self.Z  # (b,)
+
+        return fape_loss
+
 class PLDDTLoss(torch.nn.Module):
     def __init__(self):
         super().__init__()
@@ -191,35 +321,31 @@ class MSALoss(torch.nn.Module):
         return msa_loss
     
 class ExperimentallyResolvedLoss(torch.nn.Module):
-    def __init__(self, eps=1e-4):
+    def __init__(self):
         super().__init__()
-        self.eps = eps
 
-    def forward(self, preds: torch.Tensor, ground_truth: torch.Tensor):
-        # preds shape: (batch, N_res, 14)
-        # groud_truth shape: (batch, N_res, 14) - binary, 1 if atom is exp resolved, 0 if not
+    def forward(self, exp_resolved_preds: torch.Tensor, exp_resolved_true: torch.Tensor):
+        # exp_resolved_preds shape: (batch, N_res, 14) — raw logits
+        # exp_resolved_true shape: (batch, N_res, 14) - binary, 1 if atom is exp resolved, 0 if not
 
-        probs = torch.sigmoid(preds)
-
-        log_probs = torch.log(probs + self.eps)
-        log_inv_probs = torch.log(1 - probs + self.eps)
-
-        exp_resolved_loss = torch.mean(- ground_truth * log_probs - (1 - ground_truth) * log_inv_probs, dim=(1,2))
-
-        return exp_resolved_loss
+        return torch.nn.functional.binary_cross_entropy_with_logits(
+            exp_resolved_preds, exp_resolved_true, reduction='none'
+        ).mean(dim=(1, 2))
     
 class StructuralViolationLoss(torch.nn.Module):
     def __init__(self):
         super().__init__()
 
-    def forward(self,
+    def forward(
+        self,
         predicted_positions,  # (batch, N_res, 14, 3) — all-atom coordinates
         atom_mask,            # (batch, N_res, 14)    — 1 if atom exists, 0 otherwise
         residue_types,        # (batch, N_res)         — integer residue type index (0–20)
     ):
         return self.bond_length_loss(predicted_positions, atom_mask, residue_types) + self.bond_angle_loss(predicted_positions, atom_mask, residue_types) + self.clash_loss(predicted_positions, atom_mask, residue_types)
 
-    def bond_length_loss(self,
+    def bond_length_loss(
+        self,
         predicted_positions,  # (batch, N_res, 14, 3) — all-atom coordinates
         atom_mask,            # (batch, N_res, 14)    — 1 if atom exists, 0 otherwise
         residue_types,        # (batch, N_res)         — integer residue type index (0–20)
@@ -242,9 +368,10 @@ class StructuralViolationLoss(torch.nn.Module):
         mask = atom_mask[:, :-1, 2] * atom_mask[:, 1:, 0]  # (batch, N_res-1)
 
         loss = ((d - d_ideal) / d_stddev) ** 2 * mask
-        return torch.sum(loss) / torch.sum(mask).clamp(min=1)
+        return torch.sum(loss, dim=-1) / torch.sum(mask, dim=-1).clamp(min=1)
 
-    def bond_angle_loss(self,
+    def bond_angle_loss(
+        self,
         predicted_positions,  # (batch, N_res, 14, 3) — all-atom coordinates
         atom_mask,            # (batch, N_res, 14)    — 1 if atom exists, 0 otherwise
         residue_types,        # (batch, N_res)         — integer residue type index (0–20)
@@ -285,9 +412,10 @@ class StructuralViolationLoss(torch.nn.Module):
         loss_2 = ((cos_c_n_ca - between_res_cos_angles_c_n_ca[0]) / between_res_cos_angles_c_n_ca[1]) ** 2
 
         loss = (loss_1 + loss_2) * mask
-        return torch.sum(loss) / torch.sum(mask).clamp(min=1)
+        return torch.sum(loss, dim=-1) / torch.sum(mask, dim=-1).clamp(min=1)
 
-    def clash_loss(self,
+    def clash_loss(
+        self,
         predicted_positions,  # (batch, N_res, 14, 3) — all-atom coordinates
         atom_mask,            # (batch, N_res, 14)    — 1 if atom exists, 0 otherwise
         residue_types,        # (batch, N_res)         — integer residue type index (0–20)
@@ -328,4 +456,4 @@ class StructuralViolationLoss(torch.nn.Module):
         overlap = vdw_sum - overlap_tolerance - dist
 
         clash = torch.clamp(overlap, min=0) * pair_mask
-        return torch.sum(clash) / torch.sum(pair_mask).clamp(min=1)
+        return torch.sum(clash, dim=(1, 2)) / torch.sum(pair_mask, dim=(1, 2)).clamp(min=1)
