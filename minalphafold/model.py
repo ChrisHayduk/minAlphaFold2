@@ -1,6 +1,7 @@
 import torch
 from evoformer import Evoformer
 from structure_module import StructureModule
+from utils import distance_bin
 from random import randint
 
 class AlphaFold2(torch.nn.Module):
@@ -39,7 +40,7 @@ class AlphaFold2(torch.nn.Module):
                 
                 msa_repr[:, 0, :, :] += self.recycle_linear_s(self.recycle_norm_s(single_rep_prev))
                 pair_repr += self.recycle_linear_z(self.recycle_norm_z(z_prev))
-                pair_repr += self.recycle_linear_d(distance_bin(x_prev))
+                pair_repr += self.recycle_linear_d(distance_bin(x_prev, self.config.n_dist_bins))
 
                 for block in self.evoformer_blocks:
                     msa_repr, pair_repr = block(msa_repr, pair_repr)
@@ -47,11 +48,11 @@ class AlphaFold2(torch.nn.Module):
                 # MSA rep has shape (batch, N_seq, N_res, channels)
                 single_rep = msa_repr[:, 0,:,:]
 
-                structure = self.structure_model(single_rep, pair_repr)
+                structure_predictions = self.structure_model(single_rep, pair_repr)
 
                 single_rep_prev = msa_repr[:, 0, :, :].detach()
                 z_prev = pair_repr.detach()
-                x_prev = structure.ca_positions.detach()
+                x_prev = structure_predictions["final_translations"].detach()
         
         # Now pass with gradients
         msa_repr = msa_representation.clone()
@@ -59,7 +60,7 @@ class AlphaFold2(torch.nn.Module):
                 
         msa_repr[:, 0, :, :] += self.recycle_linear_s(self.recycle_norm_s(single_rep_prev))
         pair_repr += self.recycle_linear_z(self.recycle_norm_z(z_prev))
-        pair_repr += self.recycle_linear_d(distance_bin(x_prev))
+        pair_repr += self.recycle_linear_d(distance_bin(x_prev, self.config.n_dist_bins))
 
         for block in self.evoformer_blocks:
             msa_repr, pair_repr = block(msa_repr, pair_repr)
@@ -67,6 +68,6 @@ class AlphaFold2(torch.nn.Module):
         # MSA rep has shape (batch, N_seq, N_res, channels)
         single_rep = msa_repr[:, 0, :, :]
 
-        structure = self.structure_model(single_rep, pair_repr)
+        structure_predictions = self.structure_model(single_rep, pair_repr)
 
-        return structure, pair_repr, msa_repr, single_rep
+        return structure_predictions, pair_repr, msa_repr, single_rep

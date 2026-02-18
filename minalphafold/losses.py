@@ -1,4 +1,5 @@
 import torch
+from utils import distance_bin
 from residue_constants import (
     between_res_bond_length_c_n, between_res_bond_length_stddev_c_n,
     between_res_cos_angles_c_n_ca, between_res_cos_angles_ca_c_n,
@@ -69,11 +70,8 @@ class AlphaFoldLoss(torch.nn.Module):
             true_atom_positions, 2,
             cb_idx[:, :, None, None].expand(-1, -1, 1, 3),
         ).squeeze(2)  # (batch, N_res, 3)
-        cb_dists = torch.cdist(cb_pos, cb_pos)  # (batch, N_res, N_res)
         n_dist_bins = distogram_pred.shape[-1]
-        dist_bin_edges = torch.linspace(2, 22, n_dist_bins - 1, device=cb_dists.device)
-        dist_bin_idx = torch.bucketize(cb_dists, dist_bin_edges)
-        distogram_true = torch.nn.functional.one_hot(dist_bin_idx, n_dist_bins).float()
+        distogram_true = distance_bin(cb_pos, n_dist_bins)
 
         dist_loss = self.distogram_loss(distogram_pred, distogram_true)
 

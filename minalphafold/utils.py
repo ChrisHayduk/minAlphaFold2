@@ -9,6 +9,12 @@ def dropout_rowwise(x, p, training):
     mask = torch.nn.functional.dropout(mask, p=p, training=True)
     return x * mask
 
+def distance_bin(positions, n_bins, d_min=2.0, d_max=22.0):
+    dists = torch.cdist(positions, positions)
+    bin_edges = torch.linspace(d_min, d_max, n_bins - 1, device=positions.device)
+    bin_idx = torch.bucketize(dists, bin_edges)
+    return torch.nn.functional.one_hot(bin_idx, n_bins).float()
+
 def dropout_columnwise(x, p, training):
     """Mask shared across dim 1 (rows)."""
     if not training or p == 0.0:
