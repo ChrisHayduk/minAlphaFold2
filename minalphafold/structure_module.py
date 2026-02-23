@@ -1,5 +1,6 @@
-import torch    
+import torch
 import math
+from typing import Optional
 from residue_constants import (
     restype_rigid_group_default_frame,
     restype_atom14_rigid_group_positions,
@@ -61,7 +62,9 @@ class StructureModule(torch.nn.Module):
 
         self.relu = torch.nn.ReLU()
 
-    def forward(self, single_representation: torch.Tensor, pair_representation: torch.Tensor, aatype: torch.Tensor):
+    def forward(self, single_representation: torch.Tensor, pair_representation: torch.Tensor,
+                aatype: torch.Tensor, seq_mask: Optional[torch.Tensor] = None):
+        # seq_mask: (batch, N_res) — 1 for valid residues, 0 for padding
         assert single_representation.ndim == 3, \
             f"single_representation must be (batch, N_res, c_s), got {single_representation.shape}"
         assert pair_representation.ndim == 4, \
@@ -92,13 +95,13 @@ class StructureModule(torch.nn.Module):
             if l < self.num_layers - 1:
                 rotations = rotations.detach()
 
-            # Post-norm pattern (Algorithm 20): residual add -> dropout -> LayerNorm
-            s = s + self.dropout_1(self.IPA(s, pair_representation, rotations, translations))
-            s = self.layer_norm_single_rep_3(s)
+            # Algorithm 20, line 6-7: s += IPA(s); s = LN(Dropout(s))
+            s = s + self.IPA(s, pair_representation, rotations, translations, seq_mask)
+            s = self.layer_norm_single_rep_3(self.dropout_1(s))
 
-            # Transition: residual add -> dropout -> LayerNorm
-            s = s + self.dropout_2(self.transition_linear_3(self.relu(self.transition_linear_2(self.relu(self.transition_linear_1(s))))))
-            s = self.layer_norm_single_rep_2(s)
+            # Algorithm 20, line 8-9: s += Transition(s); s = LN(Dropout(s))
+            s = s + self.transition_linear_3(self.relu(self.transition_linear_2(self.relu(self.transition_linear_1(s)))))
+            s = self.layer_norm_single_rep_2(self.dropout_2(s))
 
             # Update backbone
             new_rotations, new_translations = self.backbone_update(s)
@@ -193,11 +196,14 @@ class InvariantPointAttention(torch.nn.Module):
 
         self.head_weights = torch.nn.Parameter(torch.zeros(self.num_heads))
 
-    def forward(self, single_representation: torch.Tensor, pair_representation: torch.Tensor, rotations: torch.Tensor, translation: torch.Tensor):
+    def forward(self, single_representation: torch.Tensor, pair_representation: torch.Tensor,
+                rotations: torch.Tensor, translation: torch.Tensor,
+                seq_mask: Optional[torch.Tensor] = None):
         # single_rep shape: (batch, N_res, c_s)
         # pair_rep shape: (batch, N_res, N_res, c_z)
         # rotations shape: (batch, N_res, 3, 3)
         # translations shape: (batch, N_res, 3)
+        # seq_mask shape: (batch, N_res) — 1 for valid, 0 for padding
         assert rotations.shape[-2:] == (3, 3), \
             f"rotations must end with (3, 3), got {rotations.shape}"
         assert translation.shape[-1] == 3, \
@@ -251,6 +257,12 @@ class InvariantPointAttention(torch.nn.Module):
         # Shape (batch, N_res, N_res, self.num_heads)
         scores = self.w_l * rep_scores + point_scores
 
+        # Algorithm 22: mask key positions (j dimension) before softmax
+        if seq_mask is not None:
+            # seq_mask: (batch, N_res) -> (batch, 1, N_res, 1) for j dimension
+            mask_bias = (1.0 - seq_mask[:, None, :, None]) * (-1e9)
+            scores = scores + mask_bias
+
         # Shape (batch, N_res, N_res, self.num_heads)
         attention = torch.nn.functional.softmax(scores, dim=-2)
 
@@ -292,6 +304,10 @@ class InvariantPointAttention(torch.nn.Module):
         # Final concatenation and projection
         output = torch.cat([output_rep, output_values, output_norms, output_pair], dim=-1)
         output = self.linear_output(output)
+
+        # Zero out padded query positions
+        if seq_mask is not None:
+            output = output * seq_mask[:, :, None]
 
         return output
     

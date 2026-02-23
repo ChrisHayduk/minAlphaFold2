@@ -215,7 +215,7 @@ class AlphaFold2(torch.nn.Module):
 
                 single_rep = self.single_rep_proj(msa_first_row)
 
-                structure_predictions = self.structure_model(single_rep, pair_repr, aatype)
+                structure_predictions = self.structure_model(single_rep, pair_repr, aatype, seq_mask=seq_mask)
 
                 if is_last:
                     return structure_predictions, pair_repr, msa_repr, {

@@ -1,9 +1,19 @@
 import torch
 
+
+def _zero_init_linear(linear: torch.nn.Linear):
+    """Zero-initialize weights and bias of a Linear layer (Supplement 1.11.4)."""
+    torch.nn.init.zeros_(linear.weight)
+    if linear.bias is not None:
+        torch.nn.init.zeros_(linear.bias)
+
+
 class DistogramHead(torch.nn.Module):
     def __init__(self, config):
         super().__init__()
         self.linear = torch.nn.Linear(config.c_z, config.n_dist_bins)
+        # Supplement 1.11.4: zero-init residue distance prediction logits
+        _zero_init_linear(self.linear)
 
     def forward(self, pair_representation: torch.Tensor):
         # pair_representation: (batch, N_res, N_res, c_z)
@@ -23,6 +33,9 @@ class PLDDTHead(torch.nn.Module):
             torch.nn.ReLU(),
             torch.nn.Linear(config.plddt_hidden_dim, config.n_plddt_bins),
         )
+        # Supplement 1.11.4: zero-init model confidence prediction logits
+        final_linear: torch.nn.Linear = self.net[-1]  # type: ignore[assignment]
+        _zero_init_linear(final_linear)
 
     def forward(self, single_representation: torch.Tensor):
         # single_representation: (batch, N_res, c_s)
@@ -33,6 +46,8 @@ class MaskedMSAHead(torch.nn.Module):
     def __init__(self, config):
         super().__init__()
         self.linear = torch.nn.Linear(config.c_m, config.n_msa_classes)
+        # Supplement 1.11.4: zero-init masked MSA prediction logits
+        _zero_init_linear(self.linear)
 
     def forward(self, msa_representation: torch.Tensor):
         # msa_representation: (batch, N_seq, N_res, c_m)

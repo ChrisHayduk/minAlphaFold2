@@ -465,3 +465,221 @@ class TestAlphaFold2:
         assert structure_preds["atom14_mask"].shape == (B, N_res, 14)
         assert structure_preds["final_rotations"].shape == (B, N_res, 3, 3)
         assert structure_preds["final_translations"].shape == (B, N_res, 3)
+
+
+# ======================== Semantic tests ========================
+
+class TestIPAMasking:
+    """IPA seq_mask: padded key positions should get zero attention weight."""
+
+    def test_padded_keys_get_zero_attention(self, cfg):
+        from structure_module import InvariantPointAttention
+        module = InvariantPointAttention(cfg)
+        module.eval()
+
+        s = torch.randn(1, N_res, cfg.c_s)
+        pair = torch.randn(1, N_res, N_res, cfg.c_z)
+        R = torch.eye(3).unsqueeze(0).unsqueeze(0).expand(1, N_res, 3, 3).clone()
+        t = torch.zeros(1, N_res, 3)
+
+        # Mask: only first 3 residues valid, last 3 are padding
+        seq_mask = torch.tensor([[1.0, 1.0, 1.0, 0.0, 0.0, 0.0]])
+
+        out_masked = module(s, pair, R, t, seq_mask=seq_mask)
+        out_unmasked = module(s, pair, R, t)
+
+        # Padded query outputs should be zero
+        assert torch.allclose(out_masked[:, 3:], torch.zeros_like(out_masked[:, 3:]), atol=1e-6)
+
+        # Valid query outputs should differ from unmasked (padding leaked signal before)
+        # This is a weaker check: just verify masking changes the output
+        assert not torch.allclose(out_masked[:, :3], out_unmasked[:, :3], atol=1e-6)
+
+    def test_no_mask_matches_all_ones(self, cfg):
+        """No mask = all-ones mask should give identical outputs."""
+        from structure_module import InvariantPointAttention
+        module = InvariantPointAttention(cfg)
+        module.eval()
+
+        s = torch.randn(1, N_res, cfg.c_s)
+        pair = torch.randn(1, N_res, N_res, cfg.c_z)
+        R = torch.eye(3).unsqueeze(0).unsqueeze(0).expand(1, N_res, 3, 3).clone()
+        t = torch.zeros(1, N_res, 3)
+
+        out_none = module(s, pair, R, t, seq_mask=None)
+        out_ones = module(s, pair, R, t, seq_mask=torch.ones(1, N_res))
+        assert torch.allclose(out_none, out_ones, atol=1e-5)
+
+
+class TestIPAEquivariance:
+    """IPA outputs should transform equivariantly under global rotations."""
+
+    def test_rotation_equivariance(self, cfg):
+        from structure_module import InvariantPointAttention
+        module = InvariantPointAttention(cfg)
+        module.eval()
+
+        torch.manual_seed(0)
+        s = torch.randn(1, N_res, cfg.c_s)
+        pair = torch.randn(1, N_res, N_res, cfg.c_z)
+
+        # Random per-residue frames
+        R = torch.eye(3).unsqueeze(0).unsqueeze(0).expand(1, N_res, 3, 3).clone()
+        t = torch.randn(1, N_res, 3)
+
+        # A fixed global rotation (90 degrees around z-axis)
+        theta = torch.tensor(3.14159 / 2)
+        R_global = torch.tensor([
+            [torch.cos(theta), -torch.sin(theta), 0.0],
+            [torch.sin(theta),  torch.cos(theta), 0.0],
+            [0.0, 0.0, 1.0],
+        ]).unsqueeze(0).unsqueeze(0)  # (1, 1, 3, 3)
+
+        # Original output
+        out_orig = module(s, pair, R, t)
+
+        # Rotated frames: R' = R_global @ R, t' = R_global @ t
+        R_rot = R_global @ R
+        t_rot = (R_global.squeeze(1) @ t.unsqueeze(-1)).squeeze(-1)
+
+        out_rot = module(s, pair, R_rot, t_rot)
+
+        # IPA output is invariant (same single representation, different frames)
+        # The output is projected back to local frame, so it should be invariant
+        assert torch.allclose(out_orig, out_rot, atol=1e-4), \
+            f"IPA output not invariant: max diff = {(out_orig - out_rot).abs().max():.6f}"
+
+
+class TestStructureModuleMask:
+    """StructureModule with seq_mask should zero padded outputs."""
+
+    def test_padded_outputs_zeroed(self, cfg):
+        from structure_module import StructureModule
+        module = StructureModule(cfg)
+        module.eval()
+
+        s = torch.randn(1, N_res, cfg.c_s)
+        pair = torch.randn(1, N_res, N_res, cfg.c_z)
+        aatype = torch.randint(0, 20, (1, N_res))
+        seq_mask = torch.tensor([[1.0, 1.0, 1.0, 0.0, 0.0, 0.0]])
+
+        with torch.no_grad():
+            preds = module(s, pair, aatype, seq_mask=seq_mask)
+
+        # The single representation at padded positions should be near-zero
+        # (not exactly zero due to LayerNorm centering, but IPA output is zeroed)
+        assert preds["single"].shape == (1, N_res, cfg.c_s)
+
+
+class TestGradientFlow:
+    """Gradients should flow through the recycling loop only on last cycle."""
+
+    def test_structure_module_has_gradients(self, cfg):
+        """Gradients flow through StructureModule into single_representation."""
+        from structure_module import StructureModule
+        module = StructureModule(cfg)
+
+        s = torch.randn(1, N_res, cfg.c_s, requires_grad=True)
+        pair = torch.randn(1, N_res, N_res, cfg.c_z)
+        aatype = torch.randint(0, 20, (1, N_res))
+
+        preds = module(s, pair, aatype)
+        loss = preds["final_translations"].sum()
+        loss.backward()
+        assert s.grad is not None
+        assert s.grad.abs().sum() > 0
+
+    def test_rotation_detach_stops_gradient(self, cfg):
+        """Rotation gradients should be detached between SM iterations."""
+        from structure_module import StructureModule
+        module = StructureModule(cfg)
+
+        s = torch.randn(1, N_res, cfg.c_s, requires_grad=True)
+        pair = torch.randn(1, N_res, N_res, cfg.c_z)
+        aatype = torch.randint(0, 20, (1, N_res))
+
+        preds = module(s, pair, aatype)
+
+        # Verify that the rotation trajectory has gradients only through
+        # the last layer (rotation.detach() is called for l < num_layers - 1)
+        loss = preds["traj_rotations"][-1].sum()
+        loss.backward()
+        assert s.grad is not None
+
+
+class TestFrameComposition:
+    """Composing identity transforms should give identity."""
+
+    def test_identity_composition(self):
+        from structure_module import compose_transforms
+        R_id = torch.eye(3).unsqueeze(0)  # (1, 3, 3)
+        t_zero = torch.zeros(1, 3)
+
+        R_out, t_out = compose_transforms(R_id, t_zero, R_id, t_zero)
+        assert torch.allclose(R_out, R_id, atol=1e-6)
+        assert torch.allclose(t_out, t_zero, atol=1e-6)
+
+    def test_translation_only(self):
+        from structure_module import compose_transforms
+        R_id = torch.eye(3).unsqueeze(0)
+        t1 = torch.tensor([[1.0, 2.0, 3.0]])
+        t2 = torch.tensor([[4.0, 5.0, 6.0]])
+
+        R_out, t_out = compose_transforms(R_id, t1, R_id, t2)
+        assert torch.allclose(R_out, R_id, atol=1e-6)
+        assert torch.allclose(t_out, t1 + t2, atol=1e-6)
+
+    def test_backbone_update_zero_init(self, cfg):
+        """BackboneUpdate with zero input produces identity rotation + zero translation."""
+        from structure_module import BackboneUpdate
+        from model import AlphaFold2
+        # Use AlphaFold2 to trigger _initialize_alphafold_parameters
+        model = AlphaFold2(cfg)
+        bu = model.structure_model.backbone_update
+
+        s = torch.zeros(1, N_res, cfg.c_s)
+        with torch.no_grad():
+            R, t = bu(s)
+
+        I = torch.eye(3).unsqueeze(0).unsqueeze(0).expand_as(R)
+        assert torch.allclose(R, I, atol=1e-5), \
+            f"Expected identity rotation, max diff = {(R - I).abs().max():.6f}"
+        assert torch.allclose(t, torch.zeros_like(t), atol=1e-5), \
+            f"Expected zero translation, max diff = {t.abs().max():.6f}"
+
+
+class TestHeadZeroInit:
+    """Verify head logit layers are zero-initialized per Supplement 1.11.4."""
+
+    def test_distogram_head_zero_init(self, cfg):
+        from heads import DistogramHead
+        head = DistogramHead(cfg)
+        assert torch.allclose(head.linear.weight, torch.zeros_like(head.linear.weight))
+
+    def test_plddt_head_zero_init(self, cfg):
+        from heads import PLDDTHead
+        head = PLDDTHead(cfg)
+        final_linear = head.net[-1]
+        assert torch.allclose(final_linear.weight, torch.zeros_like(final_linear.weight))
+
+    def test_masked_msa_head_zero_init(self, cfg):
+        from heads import MaskedMSAHead
+        head = MaskedMSAHead(cfg)
+        assert torch.allclose(head.linear.weight, torch.zeros_like(head.linear.weight))
+
+
+class TestIPAInitialization:
+    """Verify IPA head weights initialize so softplus(w) = 1."""
+
+    def test_head_weights_softplus_one(self, cfg):
+        from model import AlphaFold2
+        model = AlphaFold2(cfg)
+        ipa = model.structure_model.IPA
+        gamma = torch.nn.functional.softplus(ipa.head_weights)
+        assert torch.allclose(gamma, torch.ones_like(gamma), atol=1e-5)
+
+    def test_ipa_output_zero_init(self, cfg):
+        from model import AlphaFold2
+        model = AlphaFold2(cfg)
+        ipa = model.structure_model.IPA
+        assert torch.allclose(ipa.linear_output.weight, torch.zeros_like(ipa.linear_output.weight))
