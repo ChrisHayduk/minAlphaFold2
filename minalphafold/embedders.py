@@ -358,26 +358,22 @@ class MSAColumnGlobalAttention(torch.nn.Module):
         self.linear_output = torch.nn.Linear(in_features=self.total_dim, out_features=self.c_in)
 
     def forward(self, msa_representation: torch.Tensor, msa_mask: Optional[torch.Tensor] = None):
+        # msa_representation: (batch, N_seq, N_res, c_in)
         # msa_mask: (batch, N_seq, N_res) — 1 for valid, 0 for padding
-        msa_representation = self.layer_norm_msa(msa_representation)
-
         b, s, i, _ = msa_representation.shape
 
-        # Shape (batch, N_seq, N_res, self.total_dim)
-        Q = self.linear_q(msa_representation).reshape((b, s, i, self.num_heads, self.head_dim))
-        K = self.linear_k(msa_representation).reshape((b, s, i, self.num_heads, self.head_dim))
-        V = self.linear_v(msa_representation).reshape((b, s, i, self.num_heads, self.head_dim))
+        # K, V, G from per-sequence LN(x_si) (Algorithm 19)
+        x_ln = self.layer_norm_msa(msa_representation)  # (b, s, i, c_in)
+        K = self.linear_k(x_ln).reshape(b, s, i, self.num_heads, self.head_dim)
+        V = self.linear_v(x_ln).reshape(b, s, i, self.num_heads, self.head_dim)
+        G = torch.sigmoid(self.linear_gate(x_ln)).reshape(b, s, i, self.num_heads, self.head_dim)
 
-        # Shape: (batch, N_res, self.num_heads, self.head_dim)
-        Q = torch.mean(Q, dim=1)
+        # Q from LN(mean_s(x_si)) — mean raw input first, then normalize, then project
+        x_mean = msa_representation.mean(dim=1)          # (b, i, c_in)
+        x_mean_ln = self.layer_norm_msa(x_mean)          # (b, i, c_in)
+        Q = self.linear_q(x_mean_ln).reshape(b, i, self.num_heads, self.head_dim)
 
-        G = self.linear_gate(msa_representation)
-        G = G.reshape((b, s, i, self.num_heads, self.head_dim))
-
-        # Squash values in range 0 to 1 to act as gating mechanism
-        G = torch.sigmoid(G)
-
-        # Shape (batch, N_seq, self.num_heads, N_res)
+        # Attention scores: (batch, N_seq, num_heads, N_res)
         scores = torch.einsum('bihd, bsihd -> bshi', Q, K)
         scores = scores / math.sqrt(self.head_dim)
 
@@ -387,24 +383,19 @@ class MSAColumnGlobalAttention(torch.nn.Module):
             mask_bias = (1.0 - msa_mask[:, :, None, :]) * (-1e9)
             scores = scores + mask_bias
 
-        # Softmax over sequences
+        # Softmax over sequences (dim=1)
         attention = torch.nn.functional.softmax(scores, dim=1)
 
-        # Weighted sum over sequences (contract over t)
-        # Output: (batch, N_res, num_heads, head_dim)
+        # Weighted sum over sequences: (batch, N_res, num_heads, head_dim)
         weighted = torch.einsum('bshi, bsihd -> bihd', attention, V)
 
         # Broadcast to all sequences: (batch, 1, N_res, num_heads, head_dim)
         weighted = weighted.unsqueeze(1)
 
-        # G: (batch, N_seq, N_res, num_heads, head_dim)
-        values = G * weighted
+        # Gate and project: G is (batch, N_seq, N_res, num_heads, head_dim)
+        output = self.linear_output((G * weighted).reshape(b, s, i, -1))
 
-        values = values.reshape(values.shape[0], values.shape[1], values.shape[2], -1)
-
-        output = self.linear_output(values)
-
-        # Zero out padded query positions
+        # Zero out padded positions
         if msa_mask is not None:
             output = output * msa_mask[..., None]
 

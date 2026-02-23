@@ -374,6 +374,16 @@ class TestDropoutRowwise:
         out = dropout_rowwise(x, p=0.5, training=False)
         assert torch.equal(out, x)
 
+    def test_shares_mask_across_rows(self):
+        """DropoutRowwise: identical mask for every row (dim=1)."""
+        from utils import dropout_rowwise
+        torch.manual_seed(42)
+        x = torch.ones(2, 5, 7, 3)
+        y = dropout_rowwise(x, p=0.5, training=True)
+        # All rows should be identical since mask broadcasts over dim=1
+        assert torch.allclose(y[:, 0], y[:, 1])
+        assert torch.allclose(y[:, 0], y[:, 3])
+
 
 class TestDropoutColumnwise:
     def test_noop_in_eval(self):
@@ -381,6 +391,16 @@ class TestDropoutColumnwise:
         x = torch.randn(B, N_seq, N_res, 32)
         out = dropout_columnwise(x, p=0.5, training=False)
         assert torch.equal(out, x)
+
+    def test_shares_mask_across_columns(self):
+        """DropoutColumnwise: identical mask for every column (dim=2)."""
+        from utils import dropout_columnwise
+        torch.manual_seed(42)
+        x = torch.ones(2, 5, 7, 3)
+        y = dropout_columnwise(x, p=0.5, training=True)
+        # All columns should be identical since mask broadcasts over dim=2
+        assert torch.allclose(y[:, :, 0], y[:, :, 1])
+        assert torch.allclose(y[:, :, 0], y[:, :, 4])
 
 
 class TestDistanceBin:
@@ -391,6 +411,21 @@ class TestDistanceBin:
         out = distance_bin(pos, n_bins)
         assert out.shape == (B, N_res, N_res, n_bins)
         # Each position should be one-hot (sum to 1)
+        assert torch.allclose(out.sum(dim=-1), torch.ones(B, N_res, N_res))
+
+
+class TestRecyclingDistanceBin:
+    def test_output_shape(self):
+        from utils import recycling_distance_bin
+        pos = torch.randn(B, N_res, 3)
+        out = recycling_distance_bin(pos, n_bins=15)
+        assert out.shape == (B, N_res, N_res, 15)
+
+    def test_one_hot(self):
+        from utils import recycling_distance_bin
+        pos = torch.randn(B, N_res, 3)
+        out = recycling_distance_bin(pos, n_bins=15)
+        # Each entry should be one-hot (sum to 1)
         assert torch.allclose(out.sum(dim=-1), torch.ones(B, N_res, N_res))
 
 

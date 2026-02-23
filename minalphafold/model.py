@@ -4,7 +4,7 @@ from typing import cast
 from evoformer import Evoformer
 from structure_module import StructureModule
 from embedders import InputEmbedder, TemplatePair, TemplatePointwiseAttention, ExtraMsaStack
-from utils import distance_bin
+from utils import recycling_distance_bin
 
 class AlphaFold2(torch.nn.Module):
     def __init__(self, config):
@@ -14,12 +14,10 @@ class AlphaFold2(torch.nn.Module):
 
         self.input_embedder = InputEmbedder(config)
 
-        # Recycling embedders — single rep uses c_m (MSA channel dimension)
+        # Recycling embedders (Algorithm 32): LayerNorm only, no learned projections
         self.recycle_norm_s = torch.nn.LayerNorm(config.c_m)
         self.recycle_norm_z = torch.nn.LayerNorm(config.c_z)
-        self.recycle_linear_s = torch.nn.Linear(config.c_m, config.c_m)
-        self.recycle_linear_z = torch.nn.Linear(config.c_z, config.c_z)
-        self.recycle_linear_d = torch.nn.Linear(config.n_dist_bins, config.c_z)
+        self.recycle_linear_d = torch.nn.Linear(15, config.c_z)
 
         # Project from MSA channel dim (c_m) to single rep dim (c_s)
         self.single_rep_proj = torch.nn.Linear(config.c_m, config.c_s)
@@ -120,7 +118,8 @@ class AlphaFold2(torch.nn.Module):
         assert(n_cycles > 0)
 
         if self.training:
-            n_cycles = int(torch.randint(1, 5, (1,), device=target_feat.device).item())
+            # Algorithm 31: sample uniformly from {1, ..., n_cycles}
+            n_cycles = int(torch.randint(1, n_cycles + 1, (1,), device=target_feat.device).item())
 
         outer_grad = torch.is_grad_enabled()
 
@@ -165,9 +164,10 @@ class AlphaFold2(torch.nn.Module):
                     msa_repr = msa_representation.clone()
                     pair_repr = pair_representation.clone()
 
-                    msa_repr[:, 0, :, :] += self.recycle_linear_s(self.recycle_norm_s(single_rep_prev))
-                    pair_repr += self.recycle_linear_z(self.recycle_norm_z(z_prev))
-                    pair_repr += self.recycle_linear_d(distance_bin(x_prev, self.config.n_dist_bins))
+                    # Algorithm 32: LayerNorm only (no learned projection)
+                    msa_repr[:, 0, :, :] += self.recycle_norm_s(single_rep_prev)
+                    pair_repr += self.recycle_norm_z(z_prev)
+                    pair_repr += self.recycle_linear_d(recycling_distance_bin(x_prev, n_bins=15))
 
                     # Template processing
                     template_pair = self.template_pair_feat_linear(template_pair_feat)

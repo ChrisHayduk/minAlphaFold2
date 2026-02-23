@@ -88,17 +88,17 @@ class StructureModule(torch.nn.Module):
         alpha = torch.zeros(s.shape[0], s.shape[1], 7, 2, device=s.device, dtype=s.dtype)
 
         for l in range(self.num_layers):
-            # Stop rigid frame gradients between iterations (both R and t)
+            # Algorithm 20: stop gradients on rotations only between iterations
             if l < self.num_layers - 1:
                 rotations = rotations.detach()
-                translations = translations.detach()
 
-            # Pre-norm residual pattern: LN on sublayer input, dropout on sublayer output
-            s = s + self.dropout_1(self.IPA(self.layer_norm_single_rep_3(s), pair_representation, rotations, translations))
+            # Post-norm pattern (Algorithm 20): residual add -> dropout -> LayerNorm
+            s = s + self.dropout_1(self.IPA(s, pair_representation, rotations, translations))
+            s = self.layer_norm_single_rep_3(s)
 
-            # Transition with pre-norm
-            s_norm = self.layer_norm_single_rep_2(s)
-            s = s + self.dropout_2(self.transition_linear_3(self.relu(self.transition_linear_2(self.relu(self.transition_linear_1(s_norm))))))
+            # Transition: residual add -> dropout -> LayerNorm
+            s = s + self.dropout_2(self.transition_linear_3(self.relu(self.transition_linear_2(self.relu(self.transition_linear_1(s))))))
+            s = self.layer_norm_single_rep_2(s)
 
             # Update backbone
             new_rotations, new_translations = self.backbone_update(s)
