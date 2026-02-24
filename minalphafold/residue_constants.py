@@ -236,8 +236,7 @@ rigid_group_atom_positions = {
         ['CB', 0, (-0.546, -0.611, -1.293)],
         ['O', 3, (0.621, 1.066, 0.000)],
         ['CG', 4, (0.382, 1.445, 0.0)],
-        # ['CD', 5, (0.427, 1.440, 0.0)],
-        ['CD', 5, (0.477, 1.424, 0.0)],  # manually made angle 2 degrees larger
+        ['CD', 5, (0.427, 1.440, 0.0)],
     ],
     'SER': [
         ['N', 0, (-0.529, 1.360, -0.000)],
@@ -405,6 +404,7 @@ restype_atom14_to_rigid_group = np.zeros([21, 14], dtype=np.int64)
 restype_atom14_mask = np.zeros([21, 14], dtype=np.float32)
 restype_atom14_rigid_group_positions = np.zeros([21, 14, 3], dtype=np.float32)
 restype_rigid_group_default_frame = np.zeros([21, 8, 4, 4], dtype=np.float32)
+restype_rigid_group_mask = np.zeros([21, 8], dtype=np.float32)
 
 
 def _make_rigid_group_constants():
@@ -466,6 +466,21 @@ def _make_rigid_group_constants():
             ey=np.array([-1., 0., 0.]),
             translation=axis_end_atom_position)
         restype_rigid_group_default_frame[restype, 4 + chi_idx, :, :] = mat
+
+  # Populate restype_rigid_group_mask
+  for restype in range(20):
+    # Backbone frames 0-3 are always present for standard residues
+    restype_rigid_group_mask[restype, :4] = 1.0
+    # Chi frames 4-7 depend on which chi angles exist
+    for chi_idx in range(4):
+      restype_rigid_group_mask[restype, 4 + chi_idx] = chi_angles_mask[restype][chi_idx]
+  # Restype 20 (UNK) stays all zeros
+
+  # Fill unused frames (mask=0) with identity to prevent NaN from degenerate matrices
+  for restype in range(21):
+    for frame_idx in range(8):
+      if restype_rigid_group_mask[restype, frame_idx] == 0.0:
+        restype_rigid_group_default_frame[restype, frame_idx, :, :] = np.eye(4)
 
 
 _make_rigid_group_constants()

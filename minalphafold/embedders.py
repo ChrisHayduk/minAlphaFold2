@@ -368,10 +368,9 @@ class MSAColumnGlobalAttention(torch.nn.Module):
         V = self.linear_v(x_ln).reshape(b, s, i, self.num_heads, self.head_dim)
         G = torch.sigmoid(self.linear_gate(x_ln)).reshape(b, s, i, self.num_heads, self.head_dim)
 
-        # Q from LN(mean_s(x_si)) — mean raw input first, then normalize, then project
-        x_mean = msa_representation.mean(dim=1)          # (b, i, c_in)
-        x_mean_ln = self.layer_norm_msa(x_mean)          # (b, i, c_in)
-        Q = self.linear_q(x_mean_ln).reshape(b, i, self.num_heads, self.head_dim)
+        # Algorithm 19: project each sequence's LN'd features, THEN average across sequences
+        Q_si = self.linear_q(x_ln).reshape(b, s, i, self.num_heads, self.head_dim)
+        Q = Q_si.mean(dim=1)  # (b, i, H, D)
 
         # Attention scores: (batch, N_seq, num_heads, N_res)
         scores = torch.einsum('bihd, bsihd -> bshi', Q, K)

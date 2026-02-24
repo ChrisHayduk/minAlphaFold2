@@ -62,6 +62,11 @@ class StructureModule(torch.nn.Module):
 
         self.relu = torch.nn.ReLU()
 
+        # Supplement: "coordinates within IPA in nanometres"
+        # Convert translation components from Å to nm for internal SM use
+        self.default_frames[..., :3, 3] *= 0.1   # translation column of 4x4 frames: Å → nm
+        self.lit_positions *= 0.1                  # atom positions: Å → nm
+
     def forward(self, single_representation: torch.Tensor, pair_representation: torch.Tensor,
                 aatype: torch.Tensor, seq_mask: Optional[torch.Tensor] = None):
         # seq_mask: (batch, N_res) — 1 for valid residues, 0 for padding
@@ -139,26 +144,28 @@ class StructureModule(torch.nn.Module):
             self.atom_mask_table,
         )
 
+        # Convert internal nm coordinates back to Å for external interface
+        # Rotations are unitless — no conversion needed
         predictions = {
             # Per-layer backbone frames for auxiliary FAPE loss
-            "traj_rotations": all_rotations,          # (num_layers, batch, N_res, 3, 3)
-            "traj_translations": all_translations,     # (num_layers, batch, N_res, 3)
+            "traj_rotations": all_rotations,               # (num_layers, batch, N_res, 3, 3)
+            "traj_translations": all_translations * 10.0,  # (num_layers, batch, N_res, 3) nm→Å
 
             # Per-layer torsion angles for torsion angle loss
-            "traj_torsion_angles": all_torsion_angles, # (num_layers, batch, N_res, 7, 2)
+            "traj_torsion_angles": all_torsion_angles,     # (num_layers, batch, N_res, 7, 2)
 
             # Final backbone frames
-            "final_rotations": rotations,              # (batch, N_res, 3, 3)
-            "final_translations": translations,        # (batch, N_res, 3)
+            "final_rotations": rotations,                  # (batch, N_res, 3, 3)
+            "final_translations": translations * 10.0,     # (batch, N_res, 3) nm→Å
 
             # Final all-atom outputs (8 rigid-group frames including backbone frame 0)
-            "all_frames_R": all_frames_R,              # (batch, N_res, 8, 3, 3)
-            "all_frames_t": all_frames_t,              # (batch, N_res, 8, 3)
-            "atom14_coords": atom_coords,            # (batch, N_res, 14, 3)
-            "atom14_mask": mask,                # (batch, N_res, 14)
+            "all_frames_R": all_frames_R,                  # (batch, N_res, 8, 3, 3)
+            "all_frames_t": all_frames_t * 10.0,           # (batch, N_res, 8, 3) nm→Å
+            "atom14_coords": atom_coords * 10.0,           # (batch, N_res, 14, 3) nm→Å
+            "atom14_mask": mask,                           # (batch, N_res, 14)
 
             # Final single representation (for distogram, pLDDT, etc.)
-            "single": s,                               # (batch, N_res, c_s)
+            "single": s,                                   # (batch, N_res, c_s)
         }
 
         return predictions

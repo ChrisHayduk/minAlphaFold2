@@ -10,6 +10,7 @@ from residue_constants import (
     restype_atom14_rigid_group_positions,
     restype_atom14_to_rigid_group,
     restype_rigid_group_default_frame,
+    restype_rigid_group_mask,
     restype_atom14_vdw_radius,
 )
 
@@ -34,6 +35,7 @@ class AlphaFoldLoss(torch.nn.Module):
         self.register_buffer("lit_positions", torch.tensor(restype_atom14_rigid_group_positions))
         self.register_buffer("atom_frame_idx_table", torch.tensor(restype_atom14_to_rigid_group))
         self.register_buffer("atom_mask_table", torch.tensor(restype_atom14_mask))
+        self.register_buffer("rigid_group_mask_table", torch.tensor(restype_rigid_group_mask))
 
         self.finetune = finetune
 
@@ -74,6 +76,8 @@ class AlphaFoldLoss(torch.nn.Module):
                 pred_all_frames_R, pred_all_frames_t, atom_coords, atom_mask,
                 true_all_frames_R, true_all_frames_t, true_atom_positions,
                 seq_mask=seq_mask,
+                rigid_group_mask=self.rigid_group_mask_table,
+                aatype=res_types,
             )
 
         # --- Derive true_torsion_angles_alt ---
@@ -296,6 +300,8 @@ class AllAtomFAPE(torch.nn.Module):
                 true_frames_t,            # (b, N_res, 8, 3)
                 true_atom_positions,      # (b, N_res, 14, 3)
                 seq_mask: Optional[torch.Tensor] = None,  # (b, N_res)
+                rigid_group_mask: Optional[torch.Tensor] = None,  # (21, 8)
+                aatype: Optional[torch.Tensor] = None,  # (b, N_res)
     ):
         b, N_res, n_frames = predicted_frames_R.shape[:3]
         n_atoms = predicted_atom_positions.shape[2]
@@ -311,15 +317,19 @@ class AllAtomFAPE(torch.nn.Module):
         true_pos = true_atom_positions.reshape(b, N_res * n_atoms, 3)
         flat_atom_mask = atom_mask.reshape(b, N_res * n_atoms)
 
-        # Combine atom_mask with seq_mask for padded residues
-        if seq_mask is not None:
-            # Expand seq_mask to per-atom: (b, N_res) -> (b, N_res, 1) -> (b, N_res*14)
-            seq_atom_mask = seq_mask.unsqueeze(-1).expand(-1, -1, n_atoms).reshape(b, N_res * n_atoms)
-            flat_atom_mask = flat_atom_mask * seq_atom_mask
-            # Frame mask: (b, N_res*8) — each residue has 8 frames
-            frame_mask = seq_mask.unsqueeze(-1).expand(-1, -1, n_frames).reshape(b, N_res * n_frames)
+        # Per-residue-type rigid group existence mask
+        if rigid_group_mask is not None and aatype is not None:
+            group_mask = rigid_group_mask[aatype.long()]  # (b, N_res, 8)
         else:
-            frame_mask = None
+            group_mask = predicted_frames_R.new_ones(b, N_res, n_frames)
+
+        # Combine atom_mask and frame mask with seq_mask for padded residues
+        if seq_mask is not None:
+            seq_atom_mask = seq_mask[:, :, None].expand(-1, -1, n_atoms).reshape(b, N_res * n_atoms)
+            flat_atom_mask = flat_atom_mask * seq_atom_mask
+            frame_mask = (seq_mask[:, :, None] * group_mask).reshape(b, N_res * n_frames)
+        else:
+            frame_mask = group_mask.reshape(b, N_res * n_frames)
 
         # Predicted inverse frames
         R_pred_inv = pred_R.transpose(-1, -2)

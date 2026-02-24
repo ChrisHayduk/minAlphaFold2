@@ -41,14 +41,20 @@ def distance_bin(positions, n_bins, d_min=2.0, d_max=22.0):
     return F.one_hot(bin_idx, n_bins).to(dtype=positions.dtype)
 
 
+def one_hot_nearest(x, vbins):
+    """Algorithm 5: assign each value to its nearest bin center."""
+    diff = (x[..., None] - vbins).abs()
+    idx = diff.argmin(dim=-1)
+    return F.one_hot(idx, vbins.numel()).to(dtype=x.dtype)
+
+
 def recycling_distance_bin(positions, n_bins=15, d_min=3.375, bin_width=1.25):
     """
     Recycling distogram embedding (Algorithm 32).
     15-bin one-hot of C-beta distances used for recycling, distinct from
-    the 64-bin distogram head.
+    the 64-bin distogram head. Uses nearest-bin assignment per Algorithm 5.
     Returns: (B, N, N, n_bins)
     """
     dists = torch.cdist(positions, positions)
-    edges = d_min + bin_width * torch.arange(1, n_bins, device=positions.device, dtype=dists.dtype)
-    idx = torch.bucketize(dists, edges)
-    return F.one_hot(idx, n_bins).to(dtype=positions.dtype)
+    vbins = d_min + bin_width * torch.arange(n_bins, device=positions.device, dtype=dists.dtype)
+    return one_hot_nearest(dists, vbins)

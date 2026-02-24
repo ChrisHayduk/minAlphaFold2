@@ -14,7 +14,7 @@ class AlphaFold2(torch.nn.Module):
 
         self.input_embedder = InputEmbedder(config)
 
-        # Recycling embedders (Algorithm 32): LayerNorm only, no learned projections
+        # Recycling embedders (Algorithm 32): LN-only for single/pair reps; distance bins use a learned linear
         self.recycle_norm_s = torch.nn.LayerNorm(config.c_m)
         self.recycle_norm_z = torch.nn.LayerNorm(config.c_z)
         self.recycle_linear_d = torch.nn.Linear(15, config.c_z)
@@ -164,7 +164,7 @@ class AlphaFold2(torch.nn.Module):
                     msa_repr = msa_representation.clone()
                     pair_repr = pair_representation.clone()
 
-                    # Algorithm 32: LayerNorm only (no learned projection)
+                    # Algorithm 32: LN-only for single/pair reps; distance bins use a learned linear
                     msa_repr[:, 0, :, :] += self.recycle_norm_s(single_rep_prev)
                     pair_repr += self.recycle_norm_z(z_prev)
                     pair_repr += self.recycle_linear_d(recycling_distance_bin(x_prev, n_bins=15))
@@ -185,9 +185,12 @@ class AlphaFold2(torch.nn.Module):
                             torch.relu(self.template_angle_linear_1(template_angle_feat))
                         )
                         msa_repr = torch.cat([msa_repr, template_angle_repr], dim=1)
-                        # Extend msa_mask for appended template rows (all valid)
+                        # Extend msa_mask for appended template rows
                         n_templ = template_angle_repr.shape[1]
-                        templ_mask = msa_mask.new_ones(batch_size, n_templ, N_res)
+                        if template_mask is not None:
+                            templ_mask = template_mask[:, :, None].to(msa_mask.dtype) * seq_mask[:, None, :]
+                        else:
+                            templ_mask = msa_mask.new_ones(batch_size, n_templ, N_res)
                         evo_msa_mask = torch.cat([msa_mask, templ_mask], dim=1)
 
                     # Extra MSA processing
