@@ -449,7 +449,7 @@ class TestAlphaFold2:
         aatype = torch.randint(0, 20, (B, N_res))
 
         with torch.no_grad():
-            structure_preds, pair_repr, msa_repr, single_reps = model(
+            outputs = model(
                 target_feat, residue_index, msa_feat,
                 extra_msa_feat, template_pair_feat, aatype,
                 template_angle_feat=template_angle_feat,
@@ -457,14 +457,23 @@ class TestAlphaFold2:
                 n_cycles=1, n_ensemble=1,
             )
 
-        assert pair_repr.shape == (B, N_res, N_res, cfg.c_z)
-        assert msa_repr.shape == (B, N_seq, N_res, cfg.c_m)
-        assert single_reps["single_pre_sm"].shape == (B, N_res, cfg.c_s)
-        assert single_reps["single_post_sm"].shape == (B, N_res, cfg.c_s)
-        assert structure_preds["atom14_coords"].shape == (B, N_res, 14, 3)
-        assert structure_preds["atom14_mask"].shape == (B, N_res, 14)
-        assert structure_preds["final_rotations"].shape == (B, N_res, 3, 3)
-        assert structure_preds["final_translations"].shape == (B, N_res, 3)
+        # Structure module outputs
+        assert outputs["atom14_coords"].shape == (B, N_res, 14, 3)
+        assert outputs["atom14_mask"].shape == (B, N_res, 14)
+        assert outputs["final_rotations"].shape == (B, N_res, 3, 3)
+        assert outputs["final_translations"].shape == (B, N_res, 3)
+
+        # Head logits
+        assert outputs["distogram_logits"].shape == (B, N_res, N_res, cfg.n_dist_bins)
+        assert outputs["masked_msa_logits"].shape == (B, N_seq, N_res, cfg.n_msa_classes)
+        assert outputs["experimentally_resolved_logits"].shape == (B, N_res, 14)
+        assert outputs["plddt_logits"].shape == (B, N_res, cfg.n_plddt_bins)
+        assert outputs["tm_logits"].shape == (B, N_res, N_res, cfg.n_pae_bins)
+
+        # Raw representations
+        assert outputs["pair_representation"].shape == (B, N_res, N_res, cfg.c_z)
+        assert outputs["msa_representation"].shape == (B, N_seq, N_res, cfg.c_m)
+        assert outputs["single_representation"].shape == (B, N_res, cfg.c_s)
 
 
 # ======================== Semantic tests ========================

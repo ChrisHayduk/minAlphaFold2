@@ -4,6 +4,7 @@ from typing import cast
 from evoformer import Evoformer
 from structure_module import StructureModule
 from embedders import InputEmbedder, TemplatePair, TemplatePointwiseAttention, ExtraMsaStack
+from heads import DistogramHead, PLDDTHead, MaskedMSAHead, TMScoreHead, ExperimentallyResolvedHead
 from utils import recycling_distance_bin
 
 class AlphaFold2(torch.nn.Module):
@@ -35,6 +36,13 @@ class AlphaFold2(torch.nn.Module):
         self.extra_msa_blocks = torch.nn.ModuleList(
             [ExtraMsaStack(config) for _ in range(config.num_extra_msa)]
         )
+
+        # Prediction heads
+        self.distogram_head = DistogramHead(config)
+        self.plddt_head = PLDDTHead(config)
+        self.masked_msa_head = MaskedMSAHead(config)
+        self.tm_score_head = TMScoreHead(config)
+        self.experimentally_resolved_head = ExperimentallyResolvedHead(config)
 
         self.config = config
         self._initialize_alphafold_parameters()
@@ -221,9 +229,22 @@ class AlphaFold2(torch.nn.Module):
                 structure_predictions = self.structure_model(single_rep, pair_repr, aatype, seq_mask=seq_mask)
 
                 if is_last:
-                    return structure_predictions, pair_repr, msa_repr, {
-                        "single_pre_sm": single_rep,
-                        "single_post_sm": structure_predictions["single"],
+                    distogram_logits = self.distogram_head(pair_repr)
+                    masked_msa_logits = self.masked_msa_head(msa_repr)
+                    experimentally_resolved_logits = self.experimentally_resolved_head(single_rep)
+                    plddt_logits = self.plddt_head(structure_predictions["single"])
+                    tm_logits = self.tm_score_head(pair_repr)
+
+                    return {
+                        **structure_predictions,
+                        "distogram_logits": distogram_logits,
+                        "masked_msa_logits": masked_msa_logits,
+                        "experimentally_resolved_logits": experimentally_resolved_logits,
+                        "plddt_logits": plddt_logits,
+                        "tm_logits": tm_logits,
+                        "pair_representation": pair_repr,
+                        "msa_representation": msa_repr,
+                        "single_representation": single_rep,
                     }
 
                 # Recycle: store pre-projection single rep (c_m) for next cycle
