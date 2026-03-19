@@ -180,6 +180,9 @@ class TemplatePointwiseAttention(torch.nn.Module):
 
         # Softmax over templates dimension
         attention = torch.nn.functional.softmax(scores, dim=1)
+        if template_mask is not None:
+            attention = attention * template_mask[:, :, None, None, None].to(attention.dtype)
+            attention = attention / attention.sum(dim=1, keepdim=True).clamp(min=1e-8)
 
         # Weighted sum over templates
         # Output shape: (batch, N_res, N_res, num_heads, head_dim)
@@ -368,9 +371,12 @@ class MSAColumnGlobalAttention(torch.nn.Module):
         V = self.linear_v(x_ln).reshape(b, s, i, self.num_heads, self.head_dim)
         G = torch.sigmoid(self.linear_gate(x_ln)).reshape(b, s, i, self.num_heads, self.head_dim)
 
-        # Algorithm 19: project each sequence's LN'd features, THEN average across sequences
         Q_si = self.linear_q(x_ln).reshape(b, s, i, self.num_heads, self.head_dim)
-        Q = Q_si.mean(dim=1)  # (b, i, H, D)
+        if msa_mask is not None:
+            query_mask = msa_mask[..., None, None].to(Q_si.dtype)
+            Q = (Q_si * query_mask).sum(dim=1) / query_mask.sum(dim=1).clamp(min=1.0)
+        else:
+            Q = Q_si.mean(dim=1)
 
         # Attention scores: (batch, N_seq, num_heads, N_res)
         scores = torch.einsum('bihd, bsihd -> bshi', Q, K)

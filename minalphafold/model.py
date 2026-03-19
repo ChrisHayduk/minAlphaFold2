@@ -28,7 +28,7 @@ class AlphaFold2(torch.nn.Module):
         self.template_pair_stack = TemplatePair(config)
         self.template_pointwise_att = TemplatePointwiseAttention(config)
 
-        self.template_angle_linear_1 = torch.nn.Linear(51, config.c_m)
+        self.template_angle_linear_1 = torch.nn.Linear(57, config.c_m)
         self.template_angle_linear_2 = torch.nn.Linear(config.c_m, config.c_m)
 
         # Extra MSA processing
@@ -178,17 +178,18 @@ class AlphaFold2(torch.nn.Module):
                     pair_repr += self.recycle_linear_d(recycling_distance_bin(x_prev, n_bins=15))
 
                     # Template processing
-                    template_pair = self.template_pair_feat_linear(template_pair_feat)
-                    template_pair = self.template_pair_stack(template_pair)
-                    pair_repr = pair_repr + self.template_pointwise_att(
-                        template_pair,
-                        pair_repr,
-                        template_mask=template_mask,
-                    )
+                    if template_pair_feat.shape[1] > 0:
+                        template_pair = self.template_pair_feat_linear(template_pair_feat)
+                        template_pair = self.template_pair_stack(template_pair)
+                        pair_repr = pair_repr + self.template_pointwise_att(
+                            template_pair,
+                            pair_repr,
+                            template_mask=template_mask,
+                        )
 
                     # Template torsion-angle features are appended as extra MSA rows.
                     evo_msa_mask = msa_mask
-                    if template_angle_feat is not None:
+                    if template_angle_feat is not None and template_angle_feat.shape[1] > 0:
                         template_angle_repr = self.template_angle_linear_2(
                             torch.relu(self.template_angle_linear_1(template_angle_feat))
                         )
@@ -202,12 +203,13 @@ class AlphaFold2(torch.nn.Module):
                         evo_msa_mask = torch.cat([msa_mask, templ_mask], dim=1)
 
                     # Extra MSA processing
-                    extra_msa_repr = self.extra_msa_feat_linear(extra_msa_feat)
-                    for extra_block in self.extra_msa_blocks:
-                        extra_msa_repr, pair_repr = extra_block(
-                            extra_msa_repr, pair_repr,
-                            extra_msa_mask=extra_msa_mask, pair_mask=pair_mask,
-                        )
+                    if extra_msa_feat.shape[1] > 0:
+                        extra_msa_repr = self.extra_msa_feat_linear(extra_msa_feat)
+                        for extra_block in self.extra_msa_blocks:
+                            extra_msa_repr, pair_repr = extra_block(
+                                extra_msa_repr, pair_repr,
+                                extra_msa_mask=extra_msa_mask, pair_mask=pair_mask,
+                            )
 
                     for block in self.evoformer_blocks:
                         msa_repr, pair_repr = block(

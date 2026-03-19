@@ -45,12 +45,14 @@ class AlphaFoldLoss(torch.nn.Module):
             true_rotations: torch.Tensor,           # (b, N_res, 3, 3)
             true_translations: torch.Tensor,        # (b, N_res, 3)
             true_atom_positions: torch.Tensor,      # (b, N_res, 14, 3)
+            true_atom_mask: torch.Tensor,           # (b, N_res, 14)
             true_torsion_angles: torch.Tensor,      # (b, N_res, 7, 2)
+            true_torsion_mask: torch.Tensor,        # (b, N_res, 7)
             experimentally_resolved_pred: torch.Tensor,
             experimentally_resolved_true: torch.Tensor,
-            msa_pred: torch.Tensor,
-            msa_true: torch.Tensor,
-            msa_mask: torch.Tensor,
+            masked_msa_pred: torch.Tensor,
+            masked_msa_target: torch.Tensor,
+            masked_msa_mask: torch.Tensor,
             plddt_pred: torch.Tensor,
             distogram_pred: torch.Tensor,
             res_types: torch.Tensor,                # (b, N_res) integer 0-20
@@ -75,6 +77,7 @@ class AlphaFoldLoss(torch.nn.Module):
         fape_loss = self.fape_loss(
                 pred_all_frames_R, pred_all_frames_t, atom_coords, atom_mask,
                 true_all_frames_R, true_all_frames_t, true_atom_positions,
+                true_atom_mask=true_atom_mask,
                 seq_mask=seq_mask,
                 rigid_group_mask=self.rigid_group_mask_table,
                 aatype=res_types,
@@ -93,9 +96,18 @@ class AlphaFoldLoss(torch.nn.Module):
         true_torsion_angles_alt[:, :, 5, :] = torch.where(
             chi3_sym, -true_torsion_angles[:, :, 5, :], true_torsion_angles[:, :, 5, :])
 
-        aux_loss = self.aux_loss(structure_model_prediction, true_rotations, true_translations,
-                                 true_torsion_angles, true_torsion_angles_alt, res_types,
-                                 seq_mask=seq_mask)
+        backbone_mask = true_atom_mask[:, :, 0] * true_atom_mask[:, :, 1] * true_atom_mask[:, :, 2]
+        aux_loss = self.aux_loss(
+            structure_model_prediction,
+            true_rotations,
+            true_translations,
+            true_torsion_angles,
+            true_torsion_angles_alt,
+            true_torsion_mask,
+            res_types,
+            backbone_mask=backbone_mask,
+            seq_mask=seq_mask,
+        )
 
         # --- Derive distogram_true ---
         # CB-CB distances (CA for GLY) binned into distance buckets
@@ -106,11 +118,18 @@ class AlphaFoldLoss(torch.nn.Module):
             cb_idx[:, :, None, None].expand(-1, -1, 1, 3),
         ).squeeze(2)  # (batch, N_res, 3)
         n_dist_bins = distogram_pred.shape[-1]
+        cb_mask = torch.gather(
+            true_atom_mask, 2,
+            cb_idx[:, :, None],
+        ).squeeze(-1)
         distogram_true = distance_bin(cb_pos, n_dist_bins)
+        dist_pair_mask = cb_mask[:, :, None] * cb_mask[:, None, :]
+        if seq_mask is not None:
+            dist_pair_mask = dist_pair_mask * (seq_mask[:, :, None] * seq_mask[:, None, :])
 
-        dist_loss = self.distogram_loss(distogram_pred, distogram_true)
+        dist_loss = self.distogram_loss(distogram_pred, distogram_true, pair_mask=dist_pair_mask)
 
-        msa_loss = self.msa_loss(msa_pred, msa_true, msa_mask)
+        msa_loss = self.msa_loss(masked_msa_pred, masked_msa_target, masked_msa_mask)
 
         # --- Derive plddt_true ---
         # Per-residue lDDT between predicted and true CA positions, then binned
@@ -118,11 +137,13 @@ class AlphaFoldLoss(torch.nn.Module):
         with torch.no_grad():
             pred_ca = atom_coords[:, :, 1, :]       # (batch, N_res, 3)
             true_ca = true_atom_positions[:, :, 1, :]
+            true_ca_mask = true_atom_mask[:, :, 1]
             true_ca_dists = torch.cdist(true_ca, true_ca)  # (batch, N_res, N_res)
             pred_ca_dists = torch.cdist(pred_ca, pred_ca)
             # Include pairs within 15 Å in the true structure, exclude self
             inclusion = (true_ca_dists < 15.0).float() * (
                 1.0 - torch.eye(N_res, device=pred_ca.device).unsqueeze(0))
+            inclusion = inclusion * (true_ca_mask[:, :, None] * true_ca_mask[:, None, :])
             # Mask out padded residues from lDDT inclusion set
             if seq_mask is not None:
                 pair_valid = seq_mask[:, :, None] * seq_mask[:, None, :]  # (batch, N_res, N_res)
@@ -134,12 +155,13 @@ class AlphaFoldLoss(torch.nn.Module):
             for thresh in [0.5, 1.0, 2.0, 4.0]:
                 lddt = lddt + ((dist_error < thresh).float() * inclusion).sum(dim=-1) / n_included
             lddt = lddt / 4.0  # (batch, N_res) in [0, 1]
+            lddt_mask = true_ca_mask if seq_mask is None else true_ca_mask * seq_mask
             n_plddt_bins = plddt_pred.shape[-1]
             plddt_edges = torch.arange(1, n_plddt_bins, device=pred_ca.device).float() / n_plddt_bins
             plddt_bin_idx = torch.bucketize(lddt, plddt_edges)
             plddt_true = torch.nn.functional.one_hot(plddt_bin_idx, n_plddt_bins).float()
 
-        plddt_loss = self.plddt_loss(plddt_pred, plddt_true, seq_mask=seq_mask)
+        plddt_loss = self.plddt_loss(plddt_pred, plddt_true, seq_mask=lddt_mask)
 
         loss = 0.5*fape_loss + 0.5*aux_loss + 0.3*dist_loss + 2.0*msa_loss + 0.01*plddt_loss
 
@@ -163,7 +185,9 @@ class AuxiliaryLoss(torch.nn.Module):
             true_translations: torch.Tensor,        # (b, N_res, 3)
             true_torsion_angles: torch.Tensor,      # (b, N_res, 7, 2)
             true_torsion_angles_alt: torch.Tensor,  # (b, N_res, 7, 2)
+            true_torsion_mask: torch.Tensor,        # (b, N_res, 7)
             res_types: torch.Tensor,                # (b, N_res)
+            backbone_mask: Optional[torch.Tensor] = None,
             seq_mask: Optional[torch.Tensor] = None,
         ):
         traj_R = structure_model_prediction["traj_rotations"]          # (L, b, N_res, 3, 3)
@@ -178,10 +202,10 @@ class AuxiliaryLoss(torch.nn.Module):
             fape = self.fape_loss(
                 traj_R[l], traj_t[l], traj_t[l],
                 true_rotations, true_translations, true_translations,
-                seq_mask=seq_mask,
+                seq_mask=backbone_mask if seq_mask is None else backbone_mask * seq_mask,
             )
             torsion = self.torsion_angle_loss(
-                traj_torsions[l], true_torsion_angles, true_torsion_angles_alt, res_types,
+                traj_torsions[l], true_torsion_angles, true_torsion_angles_alt, true_torsion_mask, res_types,
                 seq_mask=seq_mask,
             )
             total_loss = total_loss + fape + torsion
@@ -203,6 +227,7 @@ class TorsionAngleLoss(torch.nn.Module):
         torsion_angles: torch.Tensor,
         torsion_angles_true: torch.Tensor,
         torsion_angles_true_alt: torch.Tensor,
+        torsion_mask_true: torch.Tensor,
         res_types: torch.Tensor,
         seq_mask: Optional[torch.Tensor] = None,
     ):
@@ -219,6 +244,7 @@ class TorsionAngleLoss(torch.nn.Module):
         chi_mask = self.chi_mask_table[res_types.long()].to(torsion_angles.dtype)  # (batch, N_res, 4)
         backbone_mask = torch.ones_like(chi_mask[..., :3])  # (batch, N_res, 3)
         torsion_mask = torch.cat([backbone_mask, chi_mask], dim=-1)  # (batch, N_res, 7)
+        torsion_mask = torsion_mask * torsion_mask_true
 
         # Combine with seq_mask to exclude padded residues
         if seq_mask is not None:
@@ -299,6 +325,7 @@ class AllAtomFAPE(torch.nn.Module):
                 true_frames_R,            # (b, N_res, 8, 3, 3)
                 true_frames_t,            # (b, N_res, 8, 3)
                 true_atom_positions,      # (b, N_res, 14, 3)
+                true_atom_mask: Optional[torch.Tensor] = None,  # (b, N_res, 14)
                 seq_mask: Optional[torch.Tensor] = None,  # (b, N_res)
                 rigid_group_mask: Optional[torch.Tensor] = None,  # (21, 8)
                 aatype: Optional[torch.Tensor] = None,  # (b, N_res)
@@ -316,6 +343,8 @@ class AllAtomFAPE(torch.nn.Module):
         pred_pos = predicted_atom_positions.reshape(b, N_res * n_atoms, 3)
         true_pos = true_atom_positions.reshape(b, N_res * n_atoms, 3)
         flat_atom_mask = atom_mask.reshape(b, N_res * n_atoms)
+        if true_atom_mask is not None:
+            flat_atom_mask = flat_atom_mask * true_atom_mask.reshape(b, N_res * n_atoms)
 
         # Per-residue-type rigid group existence mask
         if rigid_group_mask is not None and aatype is not None:
@@ -390,14 +419,18 @@ class DistogramLoss(torch.nn.Module):
     def __init__(self):
         super().__init__()
 
-    def forward(self, pred_distograms: torch.Tensor, true_distograms: torch.Tensor):
+    def forward(self, pred_distograms: torch.Tensor, true_distograms: torch.Tensor,
+                pair_mask: Optional[torch.Tensor] = None):
         # input shapes: (batch, N_res, N_res, num_dist_buckets)
 
         log_pred = torch.log_softmax(pred_distograms, dim=-1)
 
         vals = torch.einsum('bijc, bijc -> bij', true_distograms, log_pred)
-
-        dist_loss = - torch.mean(vals, dim=(1,2))
+        if pair_mask is not None:
+            vals = vals * pair_mask
+            dist_loss = -vals.sum(dim=(1, 2)) / pair_mask.sum(dim=(1, 2)).clamp(min=1)
+        else:
+            dist_loss = - torch.mean(vals, dim=(1,2))
 
         return dist_loss
 
@@ -405,18 +438,19 @@ class MSALoss(torch.nn.Module):
     def __init__(self):
         super().__init__()
 
-    def forward(self, msa_preds: torch.Tensor, msa_true: torch.Tensor, msa_mask: torch.Tensor):
+    def forward(self, msa_preds: torch.Tensor, msa_true: torch.Tensor, masked_msa_mask: torch.Tensor):
         # msa_preds: (batch, N_seq, N_res, n_msa_classes) — raw logits
         # msa_true:  (batch, N_seq, N_res, n_msa_classes) — one-hot targets
-        # msa_mask:  (N_seq, N_res) — 1 for masked positions to predict, 0 otherwise
+        # masked_msa_mask:  (batch, N_seq, N_res) or (N_seq, N_res)
 
         log_pred = torch.log_softmax(msa_preds, dim=-1)
 
         # Per-position cross-entropy: (batch, N_seq, N_res)
         ce = -torch.einsum('bsic, bsic -> bsi', msa_true, log_pred)
 
-        # Apply mask: (N_seq, N_res) -> (1, N_seq, N_res)
-        mask = msa_mask.unsqueeze(0)
+        mask = masked_msa_mask
+        if mask.ndim == 2:
+            mask = mask.unsqueeze(0)
         ce = ce * mask
 
         # Average over masked positions only

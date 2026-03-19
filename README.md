@@ -20,6 +20,10 @@ Inspired by Andrej Karpathy's [minGPT](https://github.com/karpathy/minGPT).
 
 ```
 minalphafold/
+    a3m.py                # Minimal A3M parsing and tokenization
+    mmcif.py              # Minimal mmCIF atom-site parsing to atom14 coordinates
+    geometry.py           # Rigid frames, torsions, pseudo-beta helpers for supervision
+    data.py               # Processed OpenProteinSet dataset, crops, collation, feature builders
     model.py              # Top-level AlphaFold2 module, recycling loop, ensemble averaging
     embedders.py          # Input embedding, relative position encoding, all attention/update modules
     evoformer.py          # Evoformer block, MSA row attention with pair bias
@@ -29,15 +33,22 @@ minalphafold/
     utils.py              # Dropout (row/column-wise), distance binning, recycling distogram
     residue_constants.py  # Amino acid chemical data (frames, bond lengths, VDW radii, torsion masks)
     trainer.py            # Training loop (placeholder)
+scripts/
+    download_openproteinset.py   # Minimal OpenProteinSet downloader/setup helper
+    preprocess_openproteinset.py # Raw OpenProteinSet -> per-chain NPZ caches
 tests/
-    test_shapes.py        # 50 shape and semantic tests
+    test_shapes.py        # Core shape and semantic tests
+    test_a3m.py           # A3M parser tests
+    test_mmcif.py         # mmCIF parser tests
+    test_geometry.py      # Geometry helper tests
+    test_data_pipeline.py # Dataset, preprocessing, and end-to-end batch tests
 ```
 
 ## Supplement Algorithm Mapping
 
 | Algorithm | Description | Location |
 |-----------|-------------|----------|
-| 1 | MSA Block Deletion | **Not implemented** — data preprocessing, needed in dataloader |
+| 1 | MSA Block Deletion | `data.py: block_delete_msa` |
 | 2 | Inference | `model.py: AlphaFold2.forward` |
 | 3 | Input Embedder | `embedders.py: InputEmbedder` |
 | 4 | Relative Position Encoding | `embedders.py: RelPos` |
@@ -57,7 +68,7 @@ tests/
 | 18 | Extra MSA Stack | `embedders.py: ExtraMsaStack` |
 | 19 | MSA Column Global Attention | `embedders.py: MSAColumnGlobalAttention` |
 | 20 | Structure Module | `structure_module.py: StructureModule` |
-| 21 | Rigid Frames from Three Points | **Not implemented** — needed in dataloader to build ground-truth frames from N/CA/C coordinates |
+| 21 | Rigid Frames from Three Points | `geometry.py: backbone_frames` |
 | 22 | Invariant Point Attention (IPA) | `structure_module.py: InvariantPointAttention` |
 | 23 | Backbone Update | `structure_module.py: BackboneUpdate` |
 | 24 | Compute All Atom Coordinates | `structure_module.py: compute_all_atom_coordinates` |
@@ -86,6 +97,7 @@ tests/
 - Python 3.10+
 - PyTorch 2.0+
 - pytest (for tests)
+- `aws` CLI and `unzip` (for downloading OpenProteinSet)
 
 ### Install
 
@@ -93,13 +105,36 @@ tests/
 pip install torch pytest
 ```
 
+### Download OpenProteinSet
+
+```bash
+python scripts/download_openproteinset.py --data-root data/openproteinset
+```
+
+This downloads the minimal raw assets used by the repo and normalizes them into:
+
+```text
+data/openproteinset/roda_pdb/<chain_id>/a3m/uniref90_hits.a3m
+data/openproteinset/roda_pdb/<chain_id>/hhr/pdb70_hits.hhr
+data/openproteinset/pdb_data/mmcif_files/<pdb_id>.cif
+```
+
+### Preprocess OpenProteinSet
+
+```bash
+python scripts/preprocess_openproteinset.py \
+  --raw-root data/openproteinset \
+  --processed-features-dir data/processed_features \
+  --processed-labels-dir data/processed_labels
+```
+
 ### Run Tests
 
 ```bash
-pytest tests/test_shapes.py -v
+pytest -q
 ```
 
-The test suite includes 50 tests covering output shapes and semantic correctness for every module.
+The test suite includes 67 tests covering parsers, geometry, dataset processing, and model/loss behavior.
 
 ## Work in Progress
 
@@ -111,14 +146,15 @@ The test suite includes 50 tests covering output shapes and semantic correctness
 - Recycling loop with proper gradient detachment and pseudo-beta distance features
 - Template processing (pair stack + pointwise attention + torsion angle features)
 - Extra MSA stack with global column attention
+- Self-contained OpenProteinSet download and preprocessing scripts
+- Minimal cached dataset loader with crops, collation, MSA processing, template features, and supervision tensors
+- Geometry helpers for frames, torsions, and pseudo-beta coordinates
 - Ensemble averaging
 - Parameter initialization matching supplement 1.11.4
-- 50 shape and semantic tests
+- 67 parser, shape, semantic, and end-to-end tests
 
 ### Next steps
 
-- [ ] Define the dataloader (PDB + MSA feature pipeline)
-- [ ] Gather the training set
 - [ ] Define the training loop
 - [ ] Test training on a small set of proteins
 

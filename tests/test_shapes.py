@@ -444,7 +444,7 @@ class TestAlphaFold2:
         msa_feat = torch.randn(B, N_seq, N_res, 49)
         extra_msa_feat = torch.randn(B, N_extra, N_res, 25)
         template_pair_feat = torch.randn(B, N_templ, N_res, N_res, 88)
-        template_angle_feat = torch.randn(B, N_templ, N_res, 51)
+        template_angle_feat = torch.randn(B, N_templ, N_res, 57)
         template_mask = torch.ones(B, N_templ)
         aatype = torch.randint(0, 20, (B, N_res))
 
