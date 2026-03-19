@@ -209,3 +209,6 @@ TODO.md
 *.pml
 *.pdb
 *.json
+artifacts/autoresearch_overfit/results.jsonl
+artifacts/autoresearch_overfit/summary.md
+scripts/autoresearch_overfit.py

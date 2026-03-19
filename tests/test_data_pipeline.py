@@ -329,6 +329,71 @@ def test_build_processed_example_emits_loss_supervision_fields():
     assert processed["masked_msa_target"].shape[-1] == MSA_ALPHABET_SIZE
 
 
+def test_collate_batch_can_make_training_features_deterministic():
+    features, labels = make_feature_and_label_example("AGAGA", include_templates=True)
+    example = {
+        "chain_id": "1abc_A",
+        "aatype": torch.from_numpy(features["aatype"]).long(),
+        "msa": torch.from_numpy(features["msa"]).long(),
+        "deletions": torch.from_numpy(features["deletions"]).long(),
+        "template_aatype": torch.from_numpy(features["template_aatype"]).long(),
+        "template_atom14_positions": torch.from_numpy(features["template_atom14_positions"]).float(),
+        "template_atom14_mask": torch.from_numpy(features["template_atom14_mask"]).float(),
+        "atom14_positions": torch.from_numpy(labels["atom14_positions"]).float(),
+        "atom14_mask": torch.from_numpy(labels["atom14_mask"]).float(),
+    }
+
+    batch_1 = collate_batch(
+        [example],
+        crop_size=8,
+        msa_depth=3,
+        extra_msa_depth=2,
+        max_templates=1,
+        training=True,
+        random_seed=7,
+    )
+    batch_2 = collate_batch(
+        [example],
+        crop_size=8,
+        msa_depth=3,
+        extra_msa_depth=2,
+        max_templates=1,
+        training=True,
+        random_seed=7,
+    )
+
+    assert torch.equal(batch_1["msa_feat"], batch_2["msa_feat"])
+    assert torch.equal(batch_1["masked_msa_mask"], batch_2["masked_msa_mask"])
+
+
+def test_collate_batch_can_disable_block_deletion():
+    features, labels = make_feature_and_label_example("AGAGA", include_templates=False)
+    example = {
+        "chain_id": "1abc_A",
+        "aatype": torch.from_numpy(features["aatype"]).long(),
+        "msa": torch.from_numpy(features["msa"]).long(),
+        "deletions": torch.from_numpy(features["deletions"]).long(),
+        "template_aatype": torch.from_numpy(features["template_aatype"]).long(),
+        "template_atom14_positions": torch.from_numpy(features["template_atom14_positions"]).float(),
+        "template_atom14_mask": torch.from_numpy(features["template_atom14_mask"]).float(),
+        "atom14_positions": torch.from_numpy(labels["atom14_positions"]).float(),
+        "atom14_mask": torch.from_numpy(labels["atom14_mask"]).float(),
+    }
+
+    batch = collate_batch(
+        [example],
+        crop_size=8,
+        msa_depth=8,
+        extra_msa_depth=0,
+        max_templates=1,
+        training=True,
+        block_delete_training_msa=False,
+        random_seed=3,
+    )
+
+    assert batch["msa_feat"].shape[1] == example["msa"].shape[0]
+
+
 def test_end_to_end_processed_batch_runs_model_and_loss(tmp_path):
     feature_dir = tmp_path / "processed_features"
     label_dir = tmp_path / "processed_labels"

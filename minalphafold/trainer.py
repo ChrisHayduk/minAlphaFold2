@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import asdict, dataclass, is_dataclass
 from functools import partial
+import math
 from pathlib import Path
 import random
 from types import SimpleNamespace
@@ -21,6 +22,52 @@ def default_device() -> str:
     return "cuda" if torch.cuda.is_available() else "cpu"
 
 
+def _make_model_config(**overrides: Any) -> SimpleNamespace:
+    config = {
+        "c_m": 32,
+        "c_s": 32,
+        "c_z": 16,
+        "c_t": 16,
+        "c_e": 24,
+        "dim": 8,
+        "num_heads": 4,
+        "msa_transition_n": 2,
+        "outer_product_dim": 8,
+        "triangle_mult_c": 16,
+        "triangle_dim": 8,
+        "triangle_num_heads": 2,
+        "pair_transition_n": 2,
+        "template_pair_num_blocks": 1,
+        "template_pair_dropout": 0.0,
+        "template_pointwise_attention_dim": 8,
+        "template_pointwise_num_heads": 2,
+        "extra_msa_dim": 8,
+        "extra_msa_dropout": 0.0,
+        "extra_pair_dropout": 0.0,
+        "msa_column_global_attention_dim": 8,
+        "num_evoformer": 1,
+        "evoformer_msa_dropout": 0.0,
+        "evoformer_pair_dropout": 0.0,
+        "structure_module_c": 16,
+        "structure_module_layers": 2,
+        "structure_module_dropout_ipa": 0.0,
+        "structure_module_dropout_transition": 0.0,
+        "ipa_num_heads": 4,
+        "ipa_c": 8,
+        "ipa_n_query_points": 4,
+        "ipa_n_value_points": 4,
+        "n_dist_bins": 64,
+        "plddt_hidden_dim": 32,
+        "n_plddt_bins": 50,
+        "n_msa_classes": 23,
+        "n_pae_bins": 64,
+        "num_extra_msa": 1,
+        "model_profile": "tiny",
+    }
+    config.update(overrides)
+    return SimpleNamespace(**config)
+
+
 @dataclass
 class DataConfig:
     processed_features_dir: str | Path = "data/processed_features"
@@ -30,6 +77,9 @@ class DataConfig:
     msa_depth: int = 64
     extra_msa_depth: int = 128
     max_templates: int = 1
+    block_delete_training_msa: bool = True
+    masked_msa_probability: float = 0.15
+    fixed_feature_seed: int | None = None
 
 
 @dataclass
@@ -37,7 +87,13 @@ class TrainingConfig:
     epochs: int = 1
     batch_size: int = 1
     learning_rate: float = 1e-4
+    min_learning_rate: float = 0.0
     weight_decay: float = 0.0
+    adam_beta1: float = 0.9
+    adam_beta2: float = 0.999
+    adam_eps: float = 1e-8
+    lr_schedule: str = "constant"
+    warmup_steps: int = 0
     grad_clip_norm: float | None = 1.0
     device: str = default_device()
     seed: int = 0
@@ -45,50 +101,120 @@ class TrainingConfig:
     n_cycles: int = 1
     n_ensemble: int = 1
     finetune: bool = False
+    finetune_start_step: int | None = None
     latest_checkpoint_path: str | Path | None = None
     best_checkpoint_path: str | Path | None = None
 
 
 def default_model_config() -> SimpleNamespace:
-    return SimpleNamespace(
-        c_m=32,
-        c_s=32,
-        c_z=16,
-        c_t=16,
-        c_e=24,
-        dim=8,
-        num_heads=4,
-        msa_transition_n=2,
-        outer_product_dim=8,
-        triangle_mult_c=16,
-        triangle_dim=8,
-        triangle_num_heads=2,
-        pair_transition_n=2,
-        template_pair_num_blocks=1,
-        template_pair_dropout=0.0,
-        template_pointwise_attention_dim=8,
-        template_pointwise_num_heads=2,
+    return _make_model_config()
+
+
+def medium_model_config() -> SimpleNamespace:
+    """A larger pedagogical profile for local experiments and overfitting tests."""
+
+    return _make_model_config(
+        c_m=128,
+        c_s=192,
+        c_z=64,
+        c_t=64,
+        c_e=64,
+        dim=16,
+        num_heads=8,
+        msa_transition_n=4,
+        outer_product_dim=16,
+        triangle_mult_c=64,
+        triangle_dim=16,
+        triangle_num_heads=4,
+        pair_transition_n=4,
+        template_pair_num_blocks=2,
+        template_pointwise_attention_dim=16,
+        template_pointwise_num_heads=4,
         extra_msa_dim=8,
+        msa_column_global_attention_dim=8,
+        num_evoformer=4,
+        structure_module_c=64,
+        structure_module_layers=4,
+        ipa_num_heads=8,
+        ipa_c=16,
+        ipa_n_query_points=4,
+        ipa_n_value_points=8,
+        plddt_hidden_dim=64,
+        num_extra_msa=2,
+        model_profile="medium",
+    )
+
+
+def alphafold2_model_config() -> SimpleNamespace:
+    """Match the official AlphaFold2 monomer model hyperparameters as closely as this repo's schema allows."""
+
+    return _make_model_config(
+        c_m=256,
+        c_s=384,
+        c_z=128,
+        c_t=64,
+        c_e=64,
+        dim=32,
+        num_heads=8,
+        msa_transition_n=4,
+        outer_product_dim=32,
+        triangle_mult_c=128,
+        triangle_dim=32,
+        triangle_num_heads=4,
+        pair_transition_n=4,
+        template_pair_num_blocks=2,
+        template_pair_dropout=0.25,
+        template_pointwise_attention_dim=64,
+        template_pointwise_num_heads=4,
+        extra_msa_dim=8,
+        extra_msa_dropout=0.15,
+        extra_pair_dropout=0.25,
+        msa_column_global_attention_dim=8,
+        num_evoformer=48,
+        evoformer_msa_dropout=0.15,
+        evoformer_pair_dropout=0.25,
+        structure_module_c=128,
+        structure_module_layers=8,
+        structure_module_dropout_ipa=0.1,
+        structure_module_dropout_transition=0.1,
+        ipa_num_heads=12,
+        ipa_c=16,
+        ipa_n_query_points=4,
+        ipa_n_value_points=8,
+        plddt_hidden_dim=128,
+        num_extra_msa=4,
+        model_profile="alphafold2",
+    )
+
+
+def model_config_from_name(name: str) -> SimpleNamespace:
+    if name == "tiny":
+        return default_model_config()
+    if name == "medium":
+        return medium_model_config()
+    if name == "alphafold2":
+        return alphafold2_model_config()
+    raise ValueError(f"Unknown model config profile: {name}")
+
+
+def copy_model_config(model_config: Any, **overrides: Any) -> SimpleNamespace:
+    data = dict(vars(model_config))
+    data.update(overrides)
+    return SimpleNamespace(**data)
+
+
+def zero_dropout_model_config(model_config: Any) -> SimpleNamespace:
+    profile_name = getattr(model_config, "model_profile", "custom")
+    return copy_model_config(
+        model_config,
+        template_pair_dropout=0.0,
         extra_msa_dropout=0.0,
         extra_pair_dropout=0.0,
-        msa_column_global_attention_dim=8,
-        num_evoformer=1,
         evoformer_msa_dropout=0.0,
         evoformer_pair_dropout=0.0,
-        structure_module_c=16,
-        structure_module_layers=2,
         structure_module_dropout_ipa=0.0,
         structure_module_dropout_transition=0.0,
-        ipa_num_heads=4,
-        ipa_c=8,
-        ipa_n_query_points=4,
-        ipa_n_value_points=4,
-        n_dist_bins=64,
-        plddt_hidden_dim=32,
-        n_plddt_bins=50,
-        n_msa_classes=23,
-        n_pae_bins=64,
-        num_extra_msa=1,
+        model_profile=f"{profile_name}_no_dropout",
     )
 
 
@@ -131,6 +257,9 @@ def build_dataloader(
         extra_msa_depth=data_config.extra_msa_depth,
         max_templates=data_config.max_templates,
         training=training,
+        block_delete_training_msa=data_config.block_delete_training_msa,
+        masked_msa_probability=data_config.masked_msa_probability,
+        random_seed=data_config.fixed_feature_seed,
     )
     generator = torch.Generator()
     generator.manual_seed(seed)
@@ -155,6 +284,46 @@ def move_to_device(value: Any, device: torch.device) -> Any:
     if isinstance(value, tuple):
         return tuple(move_to_device(item, device) for item in value)
     return value
+
+
+def learning_rate_for_step(training_config: TrainingConfig, step: int, total_steps: int) -> float:
+    base_lr = training_config.learning_rate
+    if training_config.lr_schedule == "constant":
+        return base_lr
+
+    if training_config.lr_schedule != "warmup_cosine":
+        raise ValueError(f"Unsupported learning-rate schedule: {training_config.lr_schedule}")
+
+    warmup_steps = max(training_config.warmup_steps, 0)
+    min_lr = training_config.min_learning_rate
+    if step < warmup_steps:
+        return base_lr * float(step + 1) / float(max(warmup_steps, 1))
+
+    decay_steps = max(total_steps - warmup_steps, 1)
+    progress = min(max((step - warmup_steps + 1) / decay_steps, 0.0), 1.0)
+    cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+    return min_lr + (base_lr - min_lr) * cosine
+
+
+def set_optimizer_learning_rate(optimizer: torch.optim.Optimizer, learning_rate: float) -> None:
+    for param_group in optimizer.param_groups:
+        param_group["lr"] = learning_rate
+
+
+def build_optimizer(model: AlphaFold2, training_config: TrainingConfig) -> torch.optim.Optimizer:
+    return torch.optim.Adam(
+        model.parameters(),
+        lr=training_config.learning_rate,
+        betas=(training_config.adam_beta1, training_config.adam_beta2),
+        eps=training_config.adam_eps,
+        weight_decay=training_config.weight_decay,
+    )
+
+
+def use_finetune_loss(training_config: TrainingConfig, global_step: int) -> bool:
+    if training_config.finetune_start_step is not None:
+        return global_step >= training_config.finetune_start_step
+    return training_config.finetune
 
 
 def model_inputs_from_batch(batch: dict[str, Any], training_config: TrainingConfig) -> dict[str, torch.Tensor | int]:
@@ -320,33 +489,38 @@ def fit(
     has_validation = data_config.val_fraction > 0.0 and len(val_loader.dataset) > 0
 
     model = AlphaFold2(model_config).to(device)
-    loss_fn = AlphaFoldLoss(finetune=training_config.finetune).to(device)
-    optimizer = torch.optim.Adam(
-        model.parameters(),
-        lr=training_config.learning_rate,
-        weight_decay=training_config.weight_decay,
-    )
+    pretrain_loss_fn = AlphaFoldLoss(finetune=False).to(device)
+    finetune_loss_fn = AlphaFoldLoss(finetune=True).to(device)
+    optimizer = build_optimizer(model, training_config)
 
     history: list[dict[str, float | int]] = []
     best_val_loss: float | None = None
+    total_steps = training_config.epochs * len(train_loader)
+    global_step = 0
 
     for epoch in range(1, training_config.epochs + 1):
         total_train_loss = 0.0
         total_train_examples = 0
 
         for batch in train_loader:
+            current_lr = learning_rate_for_step(training_config, global_step, total_steps)
+            set_optimizer_learning_rate(optimizer, current_lr)
+            loss_fn = finetune_loss_fn if use_finetune_loss(training_config, global_step) else pretrain_loss_fn
             metrics = train_step(model, loss_fn, optimizer, batch, training_config)
             batch_size = int(batch["aatype"].shape[0])
             total_train_loss += metrics["loss"] * batch_size
             total_train_examples += batch_size
+            global_step += 1
 
         epoch_metrics: dict[str, float | int] = {
             "epoch": epoch,
             "train_loss": total_train_loss / max(total_train_examples, 1),
+            "learning_rate": current_lr,
         }
 
         if has_validation:
-            val_metrics = evaluate(model, loss_fn, val_loader, training_config)
+            val_loss_fn = finetune_loss_fn if use_finetune_loss(training_config, global_step) else pretrain_loss_fn
+            val_metrics = evaluate(model, val_loss_fn, val_loader, training_config)
             epoch_metrics["val_loss"] = val_metrics["loss"]
 
         history.append(epoch_metrics)
@@ -394,6 +568,7 @@ def fit(
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train the pedagogical AlphaFold2 model on processed OpenProteinSet caches.")
+    parser.add_argument("--model-config", choices=["tiny", "medium", "alphafold2"], default="tiny")
     parser.add_argument("--processed-features-dir", type=str, default="data/processed_features")
     parser.add_argument("--processed-labels-dir", type=str, default="data/processed_labels")
     parser.add_argument("--val-fraction", type=float, default=0.1)
@@ -401,10 +576,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--msa-depth", type=int, default=64)
     parser.add_argument("--extra-msa-depth", type=int, default=128)
     parser.add_argument("--max-templates", type=int, default=1)
+    parser.add_argument("--disable-block-delete-training-msa", action="store_true")
+    parser.add_argument("--masked-msa-probability", type=float, default=0.15)
+    parser.add_argument("--fixed-feature-seed", type=int, default=None)
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
+    parser.add_argument("--min-learning-rate", type=float, default=0.0)
     parser.add_argument("--weight-decay", type=float, default=0.0)
+    parser.add_argument("--adam-beta1", type=float, default=0.9)
+    parser.add_argument("--adam-beta2", type=float, default=0.999)
+    parser.add_argument("--adam-eps", type=float, default=1e-8)
+    parser.add_argument("--lr-schedule", choices=["constant", "warmup_cosine"], default="constant")
+    parser.add_argument("--warmup-steps", type=int, default=0)
     parser.add_argument("--grad-clip-norm", type=float, default=1.0)
     parser.add_argument("--device", type=str, default=default_device())
     parser.add_argument("--seed", type=int, default=0)
@@ -412,6 +596,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--n-cycles", type=int, default=1)
     parser.add_argument("--n-ensemble", type=int, default=1)
     parser.add_argument("--finetune", action="store_true")
+    parser.add_argument("--finetune-start-step", type=int, default=None)
     parser.add_argument("--latest-checkpoint-path", type=str, default=None)
     parser.add_argument("--best-checkpoint-path", type=str, default=None)
     return parser.parse_args(argv)
@@ -428,13 +613,22 @@ def main(argv: list[str] | None = None) -> tuple[AlphaFold2, list[dict[str, floa
         msa_depth=args.msa_depth,
         extra_msa_depth=args.extra_msa_depth,
         max_templates=args.max_templates,
+        block_delete_training_msa=not args.disable_block_delete_training_msa,
+        masked_msa_probability=args.masked_msa_probability,
+        fixed_feature_seed=args.fixed_feature_seed,
     )
     grad_clip_norm = None if args.grad_clip_norm is not None and args.grad_clip_norm <= 0 else args.grad_clip_norm
     training_config = TrainingConfig(
         epochs=args.epochs,
         batch_size=args.batch_size,
         learning_rate=args.learning_rate,
+        min_learning_rate=args.min_learning_rate,
         weight_decay=args.weight_decay,
+        adam_beta1=args.adam_beta1,
+        adam_beta2=args.adam_beta2,
+        adam_eps=args.adam_eps,
+        lr_schedule=args.lr_schedule,
+        warmup_steps=args.warmup_steps,
         grad_clip_norm=grad_clip_norm,
         device=args.device,
         seed=args.seed,
@@ -442,12 +636,13 @@ def main(argv: list[str] | None = None) -> tuple[AlphaFold2, list[dict[str, floa
         n_cycles=args.n_cycles,
         n_ensemble=args.n_ensemble,
         finetune=args.finetune,
+        finetune_start_step=args.finetune_start_step,
         latest_checkpoint_path=args.latest_checkpoint_path,
         best_checkpoint_path=args.best_checkpoint_path,
     )
 
     return fit(
-        model_config=default_model_config(),
+        model_config=model_config_from_name(args.model_config),
         data_config=data_config,
         training_config=training_config,
     )

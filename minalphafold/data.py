@@ -19,6 +19,36 @@ TEMPLATE_PAIR_DIM = 88
 TEMPLATE_ANGLE_DIM = 57
 
 
+def _example_seed(base_seed: int, example_index: int) -> int:
+    return base_seed + example_index
+
+
+def _make_torch_generator(seed: int | None) -> torch.Generator | None:
+    if seed is None:
+        return None
+    generator = torch.Generator()
+    generator.manual_seed(seed)
+    return generator
+
+
+def _torch_randint(low: int, high: int, shape: Sequence[int], generator: torch.Generator | None) -> torch.Tensor:
+    if generator is None:
+        return torch.randint(low, high, tuple(shape))
+    return torch.randint(low, high, tuple(shape), generator=generator)
+
+
+def _torch_randperm(length: int, generator: torch.Generator | None) -> torch.Tensor:
+    if generator is None:
+        return torch.randperm(length)
+    return torch.randperm(length, generator=generator)
+
+
+def _torch_rand(shape: Sequence[int], generator: torch.Generator | None, device: torch.device) -> torch.Tensor:
+    if generator is None:
+        return torch.rand(tuple(shape), device=device)
+    return torch.rand(tuple(shape), generator=generator, device=device)
+
+
 def transformed_deletions(deletions: torch.Tensor) -> torch.Tensor:
     return torch.atan(deletions.float() / 3.0) * (2.0 / math.pi)
 
@@ -98,22 +128,34 @@ class ProcessedOpenProteinSetDataset(Dataset):
         }
 
 
-def _crop_start(length: int, crop_size: int, training: bool) -> int:
+def _crop_start(
+    length: int,
+    crop_size: int,
+    training: bool,
+    *,
+    torch_generator: torch.Generator | None = None,
+) -> int:
     if length <= crop_size:
         return 0
     if training:
-        return int(torch.randint(0, length - crop_size + 1, (1,)).item())
+        return int(_torch_randint(0, length - crop_size + 1, (1,), torch_generator).item())
     return (length - crop_size) // 2
 
 
-def crop_example(example: Dict[str, Any], crop_size: int, training: bool) -> Dict[str, Any]:
+def crop_example(
+    example: Dict[str, Any],
+    crop_size: int,
+    training: bool,
+    *,
+    torch_generator: torch.Generator | None = None,
+) -> Dict[str, Any]:
     length = int(example["aatype"].shape[0])
     if length <= crop_size:
         cropped = dict(example)
         cropped["crop_start"] = 0
         return cropped
 
-    start = _crop_start(length, crop_size=crop_size, training=training)
+    start = _crop_start(length, crop_size=crop_size, training=training, torch_generator=torch_generator)
     end = start + crop_size
 
     cropped = dict(example)
@@ -129,8 +171,15 @@ def crop_example(example: Dict[str, Any], crop_size: int, training: bool) -> Dic
     return cropped
 
 
-def block_delete_msa(msa: torch.Tensor, deletions: torch.Tensor, training: bool) -> tuple[torch.Tensor, torch.Tensor]:
-    if not training or msa.shape[0] <= 2:
+def block_delete_msa(
+    msa: torch.Tensor,
+    deletions: torch.Tensor,
+    training: bool,
+    *,
+    enabled: bool = True,
+    torch_generator: torch.Generator | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if not training or not enabled or msa.shape[0] <= 2:
         return msa, deletions
 
     non_query = msa.shape[0] - 1
@@ -139,7 +188,7 @@ def block_delete_msa(msa: torch.Tensor, deletions: torch.Tensor, training: bool)
 
     keep_mask = torch.ones(msa.shape[0], dtype=torch.bool)
     for _ in range(num_blocks):
-        block_start = int(torch.randint(1, msa.shape[0], (1,)).item())
+        block_start = int(_torch_randint(1, msa.shape[0], (1,), torch_generator).item())
         block_end = min(msa.shape[0], block_start + block_size)
         keep_mask[block_start:block_end] = False
 
@@ -153,6 +202,9 @@ def sample_cluster_and_extra(
     msa_depth: int,
     extra_msa_depth: int,
     training: bool,
+    *,
+    torch_generator: torch.Generator | None = None,
+    python_random: random.Random | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     total_rows = msa.shape[0]
     if total_rows == 0:
@@ -160,7 +212,7 @@ def sample_cluster_and_extra(
 
     remaining = torch.arange(1, total_rows, dtype=torch.long)
     if training and remaining.numel() > 0:
-        remaining = remaining[torch.randperm(remaining.numel())]
+        remaining = remaining[_torch_randperm(remaining.numel(), torch_generator)]
 
     n_cluster_other = max(0, min(msa_depth - 1, remaining.numel()))
     cluster_indices = torch.cat([torch.zeros(1, dtype=torch.long), remaining[:n_cluster_other]])
@@ -172,7 +224,10 @@ def sample_cluster_and_extra(
     chosen = set(cluster_indices.tolist())
     extra_candidates = [index for index in range(total_rows) if index not in chosen]
     if training:
-        random.shuffle(extra_candidates)
+        if python_random is None:
+            random.shuffle(extra_candidates)
+        else:
+            python_random.shuffle(extra_candidates)
     extra_candidates = extra_candidates[:extra_msa_depth]
 
     if extra_candidates:
@@ -215,12 +270,18 @@ def cluster_statistics(
     return cluster_profile, cluster_deletion_mean
 
 
-def masked_msa_inputs(cluster_msa: torch.Tensor, training: bool, mask_probability: float = 0.15) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def masked_msa_inputs(
+    cluster_msa: torch.Tensor,
+    training: bool,
+    mask_probability: float = 0.15,
+    *,
+    torch_generator: torch.Generator | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     target = F.one_hot(cluster_msa.clamp(min=0, max=MSA_ALPHABET_SIZE - 1), num_classes=MSA_ALPHABET_SIZE).float()
     if not training:
         return cluster_msa.clone(), target, torch.zeros_like(cluster_msa, dtype=torch.float32)
 
-    mask = (torch.rand(cluster_msa.shape, device=cluster_msa.device) < mask_probability).float()
+    mask = (_torch_rand(cluster_msa.shape, torch_generator, cluster_msa.device) < mask_probability).float()
     corrupted = cluster_msa.clone()
     corrupted[mask.bool()] = MASK_ID
     return corrupted, target, mask
@@ -371,15 +432,29 @@ def build_processed_example(
     extra_msa_depth: int,
     max_templates: int,
     training: bool,
+    block_delete_training_msa: bool = True,
+    masked_msa_probability: float = 0.15,
+    random_seed: int | None = None,
 ) -> Dict[str, Any]:
-    cropped = crop_example(example, crop_size=crop_size, training=training)
-    msa, deletions = block_delete_msa(cropped["msa"], cropped["deletions"], training=training)
+    torch_generator = _make_torch_generator(random_seed)
+    python_random = random.Random(random_seed) if random_seed is not None else None
+
+    cropped = crop_example(example, crop_size=crop_size, training=training, torch_generator=torch_generator)
+    msa, deletions = block_delete_msa(
+        cropped["msa"],
+        cropped["deletions"],
+        training=training,
+        enabled=block_delete_training_msa,
+        torch_generator=torch_generator,
+    )
     cluster_msa, cluster_deletions, extra_msa, extra_deletions = sample_cluster_and_extra(
         msa,
         deletions,
         msa_depth=msa_depth,
         extra_msa_depth=extra_msa_depth,
         training=training,
+        torch_generator=torch_generator,
+        python_random=python_random,
     )
 
     cluster_profile, cluster_deletion_mean = cluster_statistics(
@@ -388,7 +463,12 @@ def build_processed_example(
         extra_msa,
         extra_deletions,
     )
-    masked_cluster_msa, masked_msa_target, masked_msa_mask = masked_msa_inputs(cluster_msa, training=training)
+    masked_cluster_msa, masked_msa_target, masked_msa_mask = masked_msa_inputs(
+        cluster_msa,
+        training=training,
+        mask_probability=masked_msa_probability,
+        torch_generator=torch_generator,
+    )
 
     template_aatype = cropped["template_aatype"][:max_templates]
     template_positions = cropped["template_atom14_positions"][:max_templates]
@@ -426,6 +506,9 @@ def collate_batch(
     extra_msa_depth: int,
     max_templates: int,
     training: bool,
+    block_delete_training_msa: bool = True,
+    masked_msa_probability: float = 0.15,
+    random_seed: int | None = None,
 ) -> Dict[str, Any]:
     processed = [
         build_processed_example(
@@ -435,8 +518,11 @@ def collate_batch(
             extra_msa_depth=extra_msa_depth,
             max_templates=max_templates,
             training=training,
+            block_delete_training_msa=block_delete_training_msa,
+            masked_msa_probability=masked_msa_probability,
+            random_seed=None if random_seed is None else _example_seed(random_seed, index),
         )
-        for example in examples
+        for index, example in enumerate(examples)
     ]
 
     max_length = max(item["aatype"].shape[0] for item in processed)
