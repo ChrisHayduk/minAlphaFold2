@@ -206,3 +206,6 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 TODO.md
+*.pml
+*.pdb
+*.json
