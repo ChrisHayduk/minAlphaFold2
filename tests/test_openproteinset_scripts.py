@@ -9,8 +9,11 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 from download_openproteinset import (
     build_alignment_sync_command,
+    read_chain_ids,
     expand_duplicate_alignments,
     normalize_alignment_layout,
+    subset_alignment_urls,
+    subset_structure_url,
 )
 from preprocess_openproteinset import alignment_pairs_with_offsets, parse_hhr_hits
 
@@ -56,6 +59,29 @@ def test_expand_duplicate_alignments_creates_missing_symlink(tmp_path):
     duplicate_dir = roda_root / "2xyz_B"
     assert duplicate_dir.is_symlink()
     assert duplicate_dir.resolve() == representative.resolve()
+
+
+def test_read_chain_ids_respects_comments_and_limit(tmp_path):
+    chain_file = tmp_path / "chains.txt"
+    chain_file.write_text("# comment\n1abc_A\n\n2xyz_B\n3def_C\n")
+
+    chain_ids = read_chain_ids(str(chain_file), limit=2)
+
+    assert chain_ids == ["1abc_A", "2xyz_B"]
+
+
+def test_subset_urls_use_openfold_for_alignments_and_rcsb_for_structures():
+    alignment_urls = subset_alignment_urls(
+        "1abc_A",
+        "uniref90_hits.a3m",
+        "pdb70_hits.hhr",
+        skip_templates=False,
+    )
+    structure_url = subset_structure_url("1abc_A")
+
+    assert alignment_urls[0][0] == "https://openfold.s3.amazonaws.com/pdb/1abc_A/a3m/uniref90_hits.a3m"
+    assert alignment_urls[1][0] == "https://openfold.s3.amazonaws.com/pdb/1abc_A/hhr/pdb70_hits.hhr"
+    assert structure_url[0] == "https://files.rcsb.org/download/1ABC.cif"
 
 
 def test_alignment_pairs_with_offsets_keep_absolute_positions():
