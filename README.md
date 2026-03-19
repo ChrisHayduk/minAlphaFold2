@@ -32,7 +32,7 @@ minalphafold/
     losses.py             # FAPE (backbone + all-atom), torsion angle, pLDDT, distogram, MSA, structural violation losses
     utils.py              # Dropout (row/column-wise), distance binning, recycling distogram
     residue_constants.py  # Amino acid chemical data (frames, bond lengths, VDW radii, torsion masks)
-    trainer.py            # Training loop (placeholder)
+    trainer.py            # Minimal training loop, dataloader wiring, and checkpoint helpers
 scripts/
     download_openproteinset.py   # Minimal OpenProteinSet downloader/setup helper
     preprocess_openproteinset.py # Raw OpenProteinSet -> per-chain NPZ caches
@@ -128,6 +128,16 @@ python scripts/preprocess_openproteinset.py \
   --processed-labels-dir data/processed_labels
 ```
 
+### Train
+
+```bash
+python minalphafold/trainer.py \
+  --processed-features-dir data/processed_features \
+  --processed-labels-dir data/processed_labels \
+  --epochs 1 \
+  --batch-size 1
+```
+
 ### Run Tests
 
 ```bash
@@ -148,6 +158,7 @@ The test suite includes 67 tests covering parsers, geometry, dataset processing,
 - Extra MSA stack with global column attention
 - Self-contained OpenProteinSet download and preprocessing scripts
 - Minimal cached dataset loader with crops, collation, MSA processing, template features, and supervision tensors
+- Minimal training loop with direct data -> model -> loss wiring and optional checkpoints
 - Geometry helpers for frames, torsions, and pseudo-beta coordinates
 - Ensemble averaging
 - Parameter initialization matching supplement 1.11.4
@@ -155,8 +166,8 @@ The test suite includes 67 tests covering parsers, geometry, dataset processing,
 
 ### Next steps
 
-- [ ] Define the training loop
 - [ ] Test training on a small set of proteins
+- [ ] Iterate on default training hyperparameters once real runs exist
 
 ## License
 
