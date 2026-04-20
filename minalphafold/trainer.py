@@ -705,7 +705,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help=(
             "Model profile to train. Either a shipped profile name "
             f"({', '.join(list_available_profiles())}) resolved under "
-            f"{CONFIGS_DIR}, or a path to any JSON file with the same schema."
+            f"{CONFIGS_DIR}, or a path to any TOML file with the same schema."
         ),
     )
     parser.add_argument("--processed-features-dir", type=str, default="data/processed_features")

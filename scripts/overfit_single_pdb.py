@@ -305,7 +305,7 @@ def main(argv: list[str] | None = None) -> dict:
         help=(
             "Profile name resolved under configs/ (available: "
             f"{', '.join(list_available_profiles())}) or a path to any "
-            "JSON with the same schema. tiny = fast smoke test, "
+            "TOML file with the same schema. tiny = fast smoke test, "
             "medium = default for <50-residue CPU overfit, alphafold2 = "
             "full paper-spec model."
         ),

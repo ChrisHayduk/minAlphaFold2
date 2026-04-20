@@ -34,11 +34,17 @@ minalphafold/
     heads.py              # Distogram, pLDDT, masked MSA, PAE/TM-score, experimentally-resolved
     losses.py             # FAPE (backbone + all-atom), torsion, pLDDT, distogram, MSA, violations
     model.py              # Top-level AlphaFold2, recycling loop, ensemble averaging
-    trainer.py            # Training loop, dataloader wiring, checkpoint helpers
+    model_config.py       # Typed ModelConfig dataclass — schema for configs/*.toml
+    trainer.py            # Training loop, dataloader wiring, checkpoint helpers, load_model_config
+configs/
+    tiny.toml                    # Shrunk-to-CPU profile (default for tests / smoke runs)
+    medium.toml                  # Mid-sized profile for local overfit experiments
+    alphafold2.toml              # Paper-spec monomer config (supplement 1.5–1.8 exact)
 scripts/
     download_openproteinset.py   # OpenProteinSet downloader
     preprocess_openproteinset.py # Raw OpenProteinSet → per-chain NPZ caches
     overfit_single_pdb.py        # Self-contained single-PDB overfit driver (no MSAs/templates)
+    overfit_processed_chain.py   # Full-pipeline overfit on one preprocessed chain
 tests/
     conftest.py                  # Adds repo root + scripts/ to sys.path for pytest
     test_shapes.py               # Shape + semantic tests for every module

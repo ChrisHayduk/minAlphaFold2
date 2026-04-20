@@ -500,7 +500,7 @@ def main(argv: list[str] | None = None) -> dict:
         help=(
             "Profile name resolved under configs/ (available: "
             f"{', '.join(list_available_profiles())}) or a path to any "
-            "JSON with the same schema."
+            "TOML file with the same schema."
         ),
     )
     parser.add_argument("--seed", type=int, default=0)
