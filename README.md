@@ -39,7 +39,6 @@ scripts/
     download_openproteinset.py   # OpenProteinSet downloader
     preprocess_openproteinset.py # Raw OpenProteinSet → per-chain NPZ caches
     overfit_single_pdb.py        # Self-contained single-PDB overfit driver (no MSAs/templates)
-    autoresearch_overfit.py      # Multi-experiment overfit research loop
 tests/
     conftest.py                  # Adds repo root + scripts/ to sys.path for pytest
     test_shapes.py               # Shape + semantic tests for every module
