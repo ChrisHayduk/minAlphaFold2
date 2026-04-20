@@ -59,6 +59,11 @@ class SmallConfig:
     template_pair_dropout = 0.0
     template_pointwise_attention_dim = 8
     template_pointwise_num_heads = 2
+    # Supplement 1.7.1 / Algorithm 16: template-pair-stack-specific triangle dims.
+    template_triangle_mult_c = 16
+    template_triangle_attn_c = 8
+    template_triangle_attn_num_heads = 2
+    template_pair_transition_n = 2
 
     extra_msa_dim = 8
     extra_msa_dropout = 0.0

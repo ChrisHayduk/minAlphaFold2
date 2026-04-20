@@ -1,0 +1,79 @@
+# Full AlphaFold2 monomer profile — matches supplement Section 1.5 / 1.6 /
+# 1.7 / 1.8 and Algorithms 3-24 exactly. Every value here is paper-spec;
+# the supplement reference is in the inline comment.
+
+model_profile = "alphafold2"
+
+# Channel dimensions (supplement 1.5).
+c_m = 256      # §1.5
+c_s = 384      # §1.6 "s_i ∈ R^{c_s} and c_s = 384"
+c_z = 128      # §1.5
+c_t = 64       # §1.7.1
+c_e = 64       # §1.7.2
+
+# Main MSA row / column attention (Algorithm 7 / 8: c=32, N_head=8).
+dim = 32
+num_heads = 8
+
+# MSA transition widening factor (Algorithm 9: n=4).
+msa_transition_n = 4
+
+# Outer product mean hidden dim (Algorithm 10: c=32).
+outer_product_dim = 32
+
+# Triangle multiplicative updates (Algorithms 11, 12: c=128).
+triangle_mult_c = 128
+
+# Triangle self-attention (Algorithms 13, 14: c=32, N_head=4).
+triangle_dim = 32
+triangle_num_heads = 4
+
+# Pair transition widening factor (Algorithm 15: n=4).
+pair_transition_n = 4
+
+# Template pair stack (supplement 1.7.1, Algorithm 16). The template variants
+# override the main-Evoformer defaults: c=64 for BOTH mult and attn, n=2 on
+# the pair transition.
+template_pair_num_blocks = 2        # Algorithm 16: N_block=2
+template_pair_dropout = 0.25        # Algorithm 16 lines 2-5
+template_pointwise_attention_dim = 64   # Algorithm 17: c=64
+template_pointwise_num_heads = 4        # Algorithm 17: N_head=4
+template_triangle_mult_c = 64        # Algorithm 16 lines 4-5
+template_triangle_attn_c = 64        # Algorithm 16 lines 2-3
+template_triangle_attn_num_heads = 4    # Algorithm 16 lines 2-3
+template_pair_transition_n = 2       # Algorithm 16 line 6
+
+# Extra MSA stack (supplement 1.7.2, Algorithms 18, 19).
+extra_msa_dim = 8                     # Algorithm 18 line 2: row-attn c=8
+extra_msa_dropout = 0.15              # Algorithm 18 line 2
+extra_pair_dropout = 0.25             # Algorithm 18 lines 6-9
+msa_column_global_attention_dim = 8   # Algorithm 19: c=8
+num_extra_msa = 4                     # Algorithm 18: N_block=4
+
+# Main Evoformer (Algorithm 6: N_block=48).
+num_evoformer = 48
+evoformer_msa_dropout = 0.15          # Algorithm 6 line 2 / supplement 1.11.6
+evoformer_pair_dropout = 0.25         # Algorithm 6 lines 6-9 / supplement 1.11.6
+
+# Structure Module (supplement 1.8, Algorithm 20: N_layer=8, c=128).
+structure_module_c = 128
+structure_module_layers = 8
+structure_module_dropout_ipa = 0.1         # Algorithm 20 line 7
+structure_module_dropout_transition = 0.1  # Algorithm 20 line 9
+sidechain_num_channel = 128                # AngleResnet width == c
+sidechain_num_residual_block = 2           # Algorithm 20 lines 12-13
+position_scale = 10.0                      # supplement 1.8.3 "s = 10"
+zero_init = true                           # supplement 1.11.4
+
+# Invariant Point Attention (supplement 1.8.2, Algorithm 22).
+ipa_num_heads = 12       # N_head=12
+ipa_c = 16               # c=16
+ipa_n_query_points = 4   # N_query_points=4
+ipa_n_value_points = 8   # N_point_values=8
+
+# Auxiliary heads.
+n_dist_bins = 64         # distogram (supplement 1.9.8 eq 41)
+plddt_hidden_dim = 128   # pLDDT MLP hidden (supplement 1.9.6)
+n_plddt_bins = 50        # pLDDT output bins (supplement 1.9.6)
+n_msa_classes = 23       # masked MSA classes (supplement 1.9.9)
+n_pae_bins = 64          # PAE / pTM bins (supplement 1.9.7)

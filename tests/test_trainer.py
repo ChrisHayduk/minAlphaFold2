@@ -1,6 +1,7 @@
 import os
 from pathlib import Path
 
+import pytest
 import torch
 
 from minalphafold.losses import AlphaFoldLoss
@@ -23,19 +24,18 @@ def _linear(module: object) -> torch.nn.Linear:
 
 
 from minalphafold.trainer import (
-    alphafold2_model_config,
+    CONFIGS_DIR,
     build_optimizer,
     DataConfig,
     TrainingConfig,
     build_dataloader,
-    default_model_config,
     evaluate,
     fit,
     learning_rate_at_step,
     learning_rate_for_step,
+    list_available_profiles,
+    load_model_config,
     main,
-    medium_model_config,
-    model_config_from_name,
     train_step,
     use_finetune_loss,
     zero_dropout_model_config,
@@ -83,7 +83,7 @@ def test_train_step_updates_model_parameters(tmp_path):
     )
     batch = next(iter(dataloader))
 
-    model = AlphaFold2(default_model_config())
+    model = AlphaFold2(load_model_config("tiny"))
     loss_fn = AlphaFoldLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
     before = [parameter.detach().clone() for parameter in model.parameters()]
@@ -101,7 +101,7 @@ def test_alphafold2_uses_canonical_constructor_initialization():
     # ``get_submodule`` returns ``nn.Module`` directly — bypasses the
     # ``Tensor | Module`` ambiguity of chained ``__getattr__`` on a
     # ``ModuleList`` — so the helper ``_linear`` narrows the leaf cleanly.
-    model = AlphaFold2(default_model_config())
+    model = AlphaFold2(load_model_config("tiny"))
 
     row_output = _linear(model.get_submodule("evoformer_blocks.0.msa_row_att.linear_output"))
     assert torch.allclose(row_output.weight, torch.zeros_like(row_output.weight))
@@ -152,7 +152,7 @@ def test_evaluate_returns_finite_mean_loss_without_gradients(tmp_path):
         seed=training_config.seed,
     )
 
-    model = AlphaFold2(default_model_config())
+    model = AlphaFold2(load_model_config("tiny"))
     loss_fn = AlphaFoldLoss()
     metrics = evaluate(model, loss_fn, dataloader, training_config)
 
@@ -166,7 +166,7 @@ def test_fit_runs_and_writes_checkpoints(tmp_path):
     best_path = tmp_path / "best.pt"
 
     model, history = fit(
-        model_config=default_model_config(),
+        model_config=load_model_config("tiny"),
         data_config=DataConfig(
             processed_features_dir=feature_dir,
             processed_labels_dir=label_dir,
@@ -238,16 +238,39 @@ def test_main_runs_one_epoch_from_cli_args(tmp_path):
     assert latest_path.exists()
 
 
-def test_named_model_configs_have_expected_scales():
-    tiny = default_model_config()
-    medium = medium_model_config()
-    alphafold2 = alphafold2_model_config()
+def test_load_model_config_selects_requested_profile():
+    assert load_model_config("tiny").model_profile == "tiny"
+    assert load_model_config("medium").model_profile == "medium"
+    assert load_model_config("alphafold2").model_profile == "alphafold2"
+
+
+def test_load_model_config_accepts_an_explicit_toml_path():
+    path = CONFIGS_DIR / "tiny.toml"
+    assert load_model_config(path).model_profile == "tiny"
+    assert load_model_config(str(path)).model_profile == "tiny"
+
+
+def test_load_model_config_raises_for_missing_profile():
+    with pytest.raises(FileNotFoundError):
+        load_model_config("does_not_exist")
+
+
+def test_list_available_profiles_includes_shipped_json_configs():
+    profiles = list_available_profiles()
+    assert {"tiny", "medium", "alphafold2"}.issubset(set(profiles))
+
+
+def test_shipped_profiles_have_expected_scales():
+    tiny = load_model_config("tiny")
+    medium = load_model_config("medium")
+    alphafold2 = load_model_config("alphafold2")
 
     assert medium.model_profile == "medium"
     assert alphafold2.model_profile == "alphafold2"
     assert medium.c_m > tiny.c_m
     assert medium.c_z > tiny.c_z
     assert medium.num_evoformer > tiny.num_evoformer
+    # alphafold2 profile locked to the paper (supplement 1.5 / 1.6 / Algorithm 22).
     assert alphafold2.c_m == 256
     assert alphafold2.c_s == 384
     assert alphafold2.c_z == 128
@@ -255,16 +278,14 @@ def test_named_model_configs_have_expected_scales():
     assert alphafold2.structure_module_layers == 8
     assert alphafold2.ipa_num_heads == 12
     assert alphafold2.ipa_c == 16
-
-
-def test_model_config_from_name_selects_requested_profile():
-    assert model_config_from_name("tiny").model_profile == "tiny"
-    assert model_config_from_name("medium").model_profile == "medium"
-    assert model_config_from_name("alphafold2").model_profile == "alphafold2"
+    # Supplement 1.7.1 / Algorithm 16: TemplatePair overrides.
+    assert alphafold2.template_triangle_mult_c == 64
+    assert alphafold2.template_triangle_attn_c == 64
+    assert alphafold2.template_pair_transition_n == 2
 
 
 def test_zero_dropout_model_config_preserves_dimensions_and_clears_dropout():
-    config = alphafold2_model_config()
+    config = load_model_config("alphafold2")
     overfit_config = zero_dropout_model_config(config)
 
     assert overfit_config.model_profile == "alphafold2_no_dropout"
@@ -300,7 +321,7 @@ def test_learning_rate_for_step_supports_warmup_cosine():
 
 
 def test_build_optimizer_uses_configured_adam_hyperparameters():
-    model = AlphaFold2(default_model_config())
+    model = AlphaFold2(load_model_config("tiny"))
     training_config = TrainingConfig(
         learning_rate=2e-4,
         adam_beta1=0.8,

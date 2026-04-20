@@ -28,8 +28,9 @@ Deviations from the paper for pedagogical reasons are called out inline:
 from __future__ import annotations
 
 import argparse
+import tomllib
 from collections.abc import Sized
-from dataclasses import asdict, dataclass, is_dataclass
+from dataclasses import asdict, dataclass, fields, is_dataclass, replace
 from functools import partial
 import math
 from pathlib import Path
@@ -44,68 +45,49 @@ from torch.utils.data import DataLoader
 from .data import ProcessedOpenProteinSetDataset, collate_batch
 from .losses import AlphaFoldLoss
 from .model import AlphaFold2
+from .model_config import ModelConfig
+
+
+# Model profiles live in ``configs/<name>.toml`` at the repo root; see
+# :func:`load_model_config`. Keeping them as data (not code) means
+# experimenters can edit or ``cp`` a profile without touching this module.
+CONFIGS_DIR: Path = Path(__file__).resolve().parents[1] / "configs"
 
 
 def default_device() -> str:
     return "cuda" if torch.cuda.is_available() else "cpu"
 
 
-def _make_model_config(**overrides: Any) -> SimpleNamespace:
-    """Build a ``SimpleNamespace`` model config from the "tiny" baseline.
+def load_model_config(name_or_path: str | Path) -> ModelConfig:
+    """Load a model profile from ``configs/<name>.toml`` or a direct path.
 
-    The baseline dict is a shrunk-to-CPU version of the AlphaFold2 monomer
-    config (supplement 1.6 and Table 4): every channel dim, head count, and
-    block count is reduced so ``test_shapes`` runs in seconds. ``overrides``
-    swaps in larger values to produce the ``medium`` and ``alphafold2``
-    profiles below.
+    ``name_or_path`` may be a bare profile name (``"tiny"``, ``"medium"``,
+    ``"alphafold2"`` — looked up in :data:`CONFIGS_DIR`) or a path to any
+    TOML file with the same schema. The TOML is parsed with :mod:`tomllib`
+    (stdlib, read-only in Python 3.11+) and the top-level table is passed
+    straight to :class:`ModelConfig`, so a typo'd key in either the file
+    or the schema surfaces immediately as a ``TypeError`` instead of
+    later as an ``AttributeError`` during a forward pass.
+
+    Tiny is a shrunk-to-CPU version of the AlphaFold2 monomer config
+    (supplement 1.6 / Table 4); medium is a mid-sized profile for local
+    experiments; alphafold2 matches the paper exactly (see
+    ``configs/alphafold2.toml``).
     """
-    config = {
-        "c_m": 32,
-        "c_s": 32,
-        "c_z": 16,
-        "c_t": 16,
-        "c_e": 24,
-        "dim": 8,
-        "num_heads": 4,
-        "msa_transition_n": 2,
-        "outer_product_dim": 8,
-        "triangle_mult_c": 16,
-        "triangle_dim": 8,
-        "triangle_num_heads": 2,
-        "pair_transition_n": 2,
-        "template_pair_num_blocks": 1,
-        "template_pair_dropout": 0.0,
-        "template_pointwise_attention_dim": 8,
-        "template_pointwise_num_heads": 2,
-        "extra_msa_dim": 8,
-        "extra_msa_dropout": 0.0,
-        "extra_pair_dropout": 0.0,
-        "msa_column_global_attention_dim": 8,
-        "num_evoformer": 1,
-        "evoformer_msa_dropout": 0.0,
-        "evoformer_pair_dropout": 0.0,
-        "structure_module_c": 16,
-        "structure_module_layers": 2,
-        "structure_module_dropout_ipa": 0.0,
-        "structure_module_dropout_transition": 0.0,
-        "sidechain_num_channel": 16,
-        "sidechain_num_residual_block": 2,
-        "position_scale": 10.0,
-        "zero_init": True,
-        "ipa_num_heads": 4,
-        "ipa_c": 8,
-        "ipa_n_query_points": 4,
-        "ipa_n_value_points": 4,
-        "n_dist_bins": 64,
-        "plddt_hidden_dim": 32,
-        "n_plddt_bins": 50,
-        "n_msa_classes": 23,
-        "n_pae_bins": 64,
-        "num_extra_msa": 1,
-        "model_profile": "tiny",
-    }
-    config.update(overrides)
-    return SimpleNamespace(**config)
+    path = Path(name_or_path)
+    if not path.exists():
+        candidate = CONFIGS_DIR / f"{name_or_path}.toml"
+        if candidate.exists():
+            path = candidate
+        else:
+            raise FileNotFoundError(
+                f"No model config found at '{name_or_path}' or "
+                f"'{candidate}'. Available profiles in {CONFIGS_DIR}: "
+                f"{list_available_profiles()}"
+            )
+    with path.open("rb") as f:
+        data = tomllib.load(f)
+    return ModelConfig(**data)
 
 
 @dataclass
@@ -186,126 +168,24 @@ class TrainingConfig:
     best_checkpoint_path: str | Path | None = None
 
 
-def default_model_config() -> SimpleNamespace:
-    """Tiny CPU-friendly profile (used as the default model config for tests)."""
-    return _make_model_config()
+def list_available_profiles() -> list[str]:
+    """Return the profile names shipped in :data:`CONFIGS_DIR` (sans ``.toml``)."""
+    return sorted(p.stem for p in CONFIGS_DIR.glob("*.toml"))
 
 
-def medium_model_config() -> SimpleNamespace:
-    """A larger pedagogical profile for local experiments and overfitting tests."""
-
-    return _make_model_config(
-        c_m=128,
-        c_s=192,
-        c_z=64,
-        c_t=64,
-        c_e=64,
-        dim=16,
-        num_heads=8,
-        msa_transition_n=4,
-        outer_product_dim=16,
-        triangle_mult_c=64,
-        triangle_dim=16,
-        triangle_num_heads=4,
-        pair_transition_n=4,
-        template_pair_num_blocks=2,
-        template_pointwise_attention_dim=16,
-        template_pointwise_num_heads=4,
-        extra_msa_dim=8,
-        msa_column_global_attention_dim=8,
-        num_evoformer=4,
-        structure_module_c=64,
-        structure_module_layers=4,
-        sidechain_num_channel=64,
-        sidechain_num_residual_block=2,
-        ipa_num_heads=8,
-        ipa_c=16,
-        ipa_n_query_points=4,
-        ipa_n_value_points=8,
-        plddt_hidden_dim=64,
-        num_extra_msa=2,
-        model_profile="medium",
-    )
+def copy_model_config(model_config: ModelConfig, **overrides: Any) -> ModelConfig:
+    """Return a copy of ``model_config`` with the given fields overridden."""
+    return replace(model_config, **overrides)
 
 
-def alphafold2_model_config() -> SimpleNamespace:
-    """Match the official AlphaFold2 monomer hyperparameters (supplement 1.6).
-
-    Key dims (supplement 1.5 / 1.6): ``c_m = 256``, ``c_z = 128``, ``c_s =
-    384``, ``c_t = 64``, ``c_e = 64``; ``N_block = 48`` Evoformer blocks
-    (Algorithm 6), ``structure_module_layers = 8`` (Algorithm 20),
-    ``ipa_num_heads = 12`` / ``ipa_c = 16`` (Algorithm 22). Dropout rates
-    come from supplement 1.11.6.
-    """
-
-    return _make_model_config(
-        c_m=256,
-        c_s=384,
-        c_z=128,
-        c_t=64,
-        c_e=64,
-        dim=32,
-        num_heads=8,
-        msa_transition_n=4,
-        outer_product_dim=32,
-        triangle_mult_c=128,
-        triangle_dim=32,
-        triangle_num_heads=4,
-        pair_transition_n=4,
-        template_pair_num_blocks=2,
-        template_pair_dropout=0.25,
-        template_pointwise_attention_dim=64,
-        template_pointwise_num_heads=4,
-        extra_msa_dim=8,
-        extra_msa_dropout=0.15,
-        extra_pair_dropout=0.25,
-        msa_column_global_attention_dim=8,
-        num_evoformer=48,
-        evoformer_msa_dropout=0.15,
-        evoformer_pair_dropout=0.25,
-        structure_module_c=128,
-        structure_module_layers=8,
-        structure_module_dropout_ipa=0.1,
-        structure_module_dropout_transition=0.1,
-        sidechain_num_channel=128,
-        sidechain_num_residual_block=2,
-        ipa_num_heads=12,
-        ipa_c=16,
-        ipa_n_query_points=4,
-        ipa_n_value_points=8,
-        plddt_hidden_dim=128,
-        num_extra_msa=4,
-        model_profile="alphafold2",
-    )
-
-
-def model_config_from_name(name: str) -> SimpleNamespace:
-    """Dispatch ``"tiny" / "medium" / "alphafold2"`` to the matching profile."""
-    if name == "tiny":
-        return default_model_config()
-    if name == "medium":
-        return medium_model_config()
-    if name == "alphafold2":
-        return alphafold2_model_config()
-    raise ValueError(f"Unknown model config profile: {name}")
-
-
-def copy_model_config(model_config: Any, **overrides: Any) -> SimpleNamespace:
-    """Return a shallow copy of ``model_config`` with the given fields overridden."""
-    data = dict(vars(model_config))
-    data.update(overrides)
-    return SimpleNamespace(**data)
-
-
-def zero_dropout_model_config(model_config: Any) -> SimpleNamespace:
+def zero_dropout_model_config(model_config: ModelConfig) -> ModelConfig:
     """Clone a config with every dropout rate set to 0.
 
-    Used for overfit / memorisation experiments (``scripts/run_*_overfit.py``)
+    Used for overfit / memorisation experiments (``scripts/overfit_*.py``)
     where the stochastic regularisation from supplement 1.11.6 would prevent
     the model from fitting a single example.
     """
-    profile_name = getattr(model_config, "model_profile", "custom")
-    return copy_model_config(
+    return replace(
         model_config,
         template_pair_dropout=0.0,
         extra_msa_dropout=0.0,
@@ -314,7 +194,7 @@ def zero_dropout_model_config(model_config: Any) -> SimpleNamespace:
         evoformer_pair_dropout=0.0,
         structure_module_dropout_ipa=0.0,
         structure_module_dropout_transition=0.0,
-        model_profile=f"{profile_name}_no_dropout",
+        model_profile=f"{model_config.model_profile}_no_dropout",
     )
 
 
@@ -690,7 +570,7 @@ def fit(
     caller's responsibility: swap ``DataConfig``/``TrainingConfig`` and
     start a new ``fit`` run for the fine-tuning phase.
     """
-    model_config = default_model_config() if model_config is None else model_config
+    model_config = load_model_config("tiny") if model_config is None else model_config
     data_config = DataConfig() if data_config is None else data_config
     training_config = TrainingConfig() if training_config is None else training_config
 
@@ -818,7 +698,16 @@ def fit(
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train the pedagogical AlphaFold2 model on processed OpenProteinSet caches.")
-    parser.add_argument("--model-config", choices=["tiny", "medium", "alphafold2"], default="tiny")
+    parser.add_argument(
+        "--model-config",
+        type=str,
+        default="tiny",
+        help=(
+            "Model profile to train. Either a shipped profile name "
+            f"({', '.join(list_available_profiles())}) resolved under "
+            f"{CONFIGS_DIR}, or a path to any JSON file with the same schema."
+        ),
+    )
     parser.add_argument("--processed-features-dir", type=str, default="data/processed_features")
     parser.add_argument("--processed-labels-dir", type=str, default="data/processed_labels")
     parser.add_argument("--val-fraction", type=float, default=0.1)
@@ -902,7 +791,7 @@ def main(argv: list[str] | None = None) -> tuple[AlphaFold2, list[dict[str, floa
     )
 
     return fit(
-        model_config=model_config_from_name(args.model_config),
+        model_config=load_model_config(args.model_config),
         data_config=data_config,
         training_config=training_config,
     )

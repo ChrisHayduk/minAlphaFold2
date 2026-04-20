@@ -137,24 +137,39 @@ class TemplatePair(torch.nn.Module):
         self.num_blocks = config.template_pair_num_blocks
         self.dropout_p = config.template_pair_dropout
 
+        # Supplement 1.7.1 / Algorithm 16: the template pair stack overrides
+        # the main-Evoformer triangle dims (paper default c=64 for both the
+        # multiplicative and attention updates, and n=2 on the pair transition)
+        # instead of inheriting triangle_mult_c / triangle_dim / pair_transition_n.
+        template_tri_mult_c = config.template_triangle_mult_c
+        template_tri_attn_c = config.template_triangle_attn_c
+        template_tri_attn_heads = config.template_triangle_attn_num_heads
+        template_pair_trans_n = config.template_pair_transition_n
+
         self.layer_norm = torch.nn.LayerNorm(config.c_t)
         self.linear_in = torch.nn.Linear(in_features=config.c_t, out_features=config.c_z)
         init_linear(self.linear_in, init="default")
 
         self.triangle_mult_out = torch.nn.ModuleList(
-            [TriangleMultiplicationOutgoing(config) for _ in range(self.num_blocks)]
+            [TriangleMultiplicationOutgoing(config, c=template_tri_mult_c) for _ in range(self.num_blocks)]
         )
         self.triangle_mult_in = torch.nn.ModuleList(
-            [TriangleMultiplicationIncoming(config) for _ in range(self.num_blocks)]
+            [TriangleMultiplicationIncoming(config, c=template_tri_mult_c) for _ in range(self.num_blocks)]
         )
         self.triangle_att_start = torch.nn.ModuleList(
-            [TriangleAttentionStartingNode(config) for _ in range(self.num_blocks)]
+            [
+                TriangleAttentionStartingNode(config, c=template_tri_attn_c, num_heads=template_tri_attn_heads)
+                for _ in range(self.num_blocks)
+            ]
         )
         self.triangle_att_end = torch.nn.ModuleList(
-            [TriangleAttentionEndingNode(config) for _ in range(self.num_blocks)]
+            [
+                TriangleAttentionEndingNode(config, c=template_tri_attn_c, num_heads=template_tri_attn_heads)
+                for _ in range(self.num_blocks)
+            ]
         )
         self.pair_transition = torch.nn.ModuleList(
-            [PairTransition(config) for _ in range(self.num_blocks)]
+            [PairTransition(config, n=template_pair_trans_n) for _ in range(self.num_blocks)]
         )
         self.final_layer_norm = torch.nn.LayerNorm(config.c_z)
 
@@ -739,20 +754,21 @@ class TriangleMultiplicationOutgoing(torch.nn.Module):
     counterpart is :class:`TriangleMultiplicationIncoming`.
     """
 
-    def __init__(self, config):
+    def __init__(self, config, c: Optional[int] = None):
         super().__init__()
+        mult_c = config.triangle_mult_c if c is None else c
         self.layer_norm_pair = torch.nn.LayerNorm(config.c_z)
-        self.layer_norm_out = torch.nn.LayerNorm(config.triangle_mult_c)
+        self.layer_norm_out = torch.nn.LayerNorm(mult_c)
 
-        self.gate1 = torch.nn.Linear(in_features=config.c_z, out_features=config.triangle_mult_c)
-        self.gate2 = torch.nn.Linear(in_features=config.c_z, out_features=config.triangle_mult_c)
+        self.gate1 = torch.nn.Linear(in_features=config.c_z, out_features=mult_c)
+        self.gate2 = torch.nn.Linear(in_features=config.c_z, out_features=mult_c)
 
-        self.linear1 = torch.nn.Linear(in_features=config.c_z, out_features=config.triangle_mult_c)
-        self.linear2 = torch.nn.Linear(in_features=config.c_z, out_features=config.triangle_mult_c)
+        self.linear1 = torch.nn.Linear(in_features=config.c_z, out_features=mult_c)
+        self.linear2 = torch.nn.Linear(in_features=config.c_z, out_features=mult_c)
 
         self.gate = torch.nn.Linear(in_features=config.c_z, out_features=config.c_z)
 
-        self.out_linear = torch.nn.Linear(in_features=config.triangle_mult_c, out_features=config.c_z)
+        self.out_linear = torch.nn.Linear(in_features=mult_c, out_features=config.c_z)
         init_gate_linear(self.gate1)
         init_gate_linear(self.gate2)
         init_linear(self.linear1, init="default")
@@ -763,7 +779,7 @@ class TriangleMultiplicationOutgoing(torch.nn.Module):
     def forward(self, pair_representation: torch.Tensor, pair_mask: Optional[torch.Tensor] = None):
         pair_representation = self.layer_norm_pair(pair_representation)
 
-        # Shape (batch, N_res, N_res, config.triangle_mult_c)
+        # Shape (batch, N_res, N_res, c)
         A = torch.sigmoid(self.gate1(pair_representation)) * self.linear1(pair_representation)
         B = torch.sigmoid(self.gate2(pair_representation)) * self.linear2(pair_representation)
 
@@ -799,20 +815,21 @@ class TriangleMultiplicationIncoming(torch.nn.Module):
     pair rep sees both triangle orientations per iteration.
     """
 
-    def __init__(self, config):
+    def __init__(self, config, c: Optional[int] = None):
         super().__init__()
+        mult_c = config.triangle_mult_c if c is None else c
         self.layer_norm_pair = torch.nn.LayerNorm(config.c_z)
-        self.layer_norm_out = torch.nn.LayerNorm(config.triangle_mult_c)
+        self.layer_norm_out = torch.nn.LayerNorm(mult_c)
 
-        self.gate1 = torch.nn.Linear(in_features=config.c_z, out_features=config.triangle_mult_c)
-        self.gate2 = torch.nn.Linear(in_features=config.c_z, out_features=config.triangle_mult_c)
+        self.gate1 = torch.nn.Linear(in_features=config.c_z, out_features=mult_c)
+        self.gate2 = torch.nn.Linear(in_features=config.c_z, out_features=mult_c)
 
-        self.linear1 = torch.nn.Linear(in_features=config.c_z, out_features=config.triangle_mult_c)
-        self.linear2 = torch.nn.Linear(in_features=config.c_z, out_features=config.triangle_mult_c)
+        self.linear1 = torch.nn.Linear(in_features=config.c_z, out_features=mult_c)
+        self.linear2 = torch.nn.Linear(in_features=config.c_z, out_features=mult_c)
 
         self.gate = torch.nn.Linear(in_features=config.c_z, out_features=config.c_z)
 
-        self.out_linear = torch.nn.Linear(in_features=config.triangle_mult_c, out_features=config.c_z)
+        self.out_linear = torch.nn.Linear(in_features=mult_c, out_features=config.c_z)
         init_gate_linear(self.gate1)
         init_gate_linear(self.gate2)
         init_linear(self.linear1, init="default")
@@ -823,7 +840,7 @@ class TriangleMultiplicationIncoming(torch.nn.Module):
     def forward(self, pair_representation: torch.Tensor, pair_mask: Optional[torch.Tensor] = None):
         pair_representation = self.layer_norm_pair(pair_representation)
 
-        # Shape (batch, N_res, N_res, config.triangle_mult_c)
+        # Shape (batch, N_res, N_res, c)
         A = torch.sigmoid(self.gate1(pair_representation)) * self.linear1(pair_representation)
         B = torch.sigmoid(self.gate2(pair_representation)) * self.linear2(pair_representation)
 
@@ -858,12 +875,12 @@ class TriangleAttentionStartingNode(torch.nn.Module):
     z_{jk}))``. Row-wise dropout (supplement 1.11.6) matches Algorithm 6.
     """
 
-    def __init__(self, config):
+    def __init__(self, config, c: Optional[int] = None, num_heads: Optional[int] = None):
         super().__init__()
         self.layer_norm = torch.nn.LayerNorm(config.c_z)
 
-        self.head_dim = config.triangle_dim
-        self.num_heads = config.triangle_num_heads
+        self.head_dim = config.triangle_dim if c is None else c
+        self.num_heads = config.triangle_num_heads if num_heads is None else num_heads
 
         self.total_dim = self.head_dim * self.num_heads
 
@@ -945,12 +962,12 @@ class TriangleAttentionEndingNode(torch.nn.Module):
     Evoformer block applies it accordingly.
     """
 
-    def __init__(self, config):
+    def __init__(self, config, c: Optional[int] = None, num_heads: Optional[int] = None):
         super().__init__()
         self.layer_norm = torch.nn.LayerNorm(config.c_z)
 
-        self.head_dim = config.triangle_dim
-        self.num_heads = config.triangle_num_heads
+        self.head_dim = config.triangle_dim if c is None else c
+        self.num_heads = config.triangle_num_heads if num_heads is None else num_heads
 
         self.total_dim = self.head_dim * self.num_heads
 
@@ -1044,9 +1061,9 @@ class PairTransition(torch.nn.Module):
     rep. No dropout per Algorithm 6.
     """
 
-    def __init__(self, config):
+    def __init__(self, config, n: Optional[int] = None):
         super().__init__()
-        self.n = config.pair_transition_n
+        self.n = config.pair_transition_n if n is None else n
 
         self.layer_norm = torch.nn.LayerNorm(config.c_z)
 

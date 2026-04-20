@@ -29,9 +29,11 @@ from __future__ import annotations
 import argparse
 import itertools
 import json
+import random
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
@@ -42,19 +44,33 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 
+from minalphafold.data import (
+    ProcessedOpenProteinSetDataset,
+    block_delete_msa,
+    build_extra_msa_feat,
+    build_msa_feat,
+    build_supervision,
+    build_target_feat,
+    build_template_angle_feat,
+    build_template_pair_feat,
+    cluster_statistics,
+    crop_example,
+    hhblits_profile,
+    masked_msa_inputs,
+    sample_cluster_and_extra,
+)
 from minalphafold.losses import AlphaFoldLoss, select_best_atom14_ground_truth
 from minalphafold.model import AlphaFold2
 from minalphafold.pdbio import write_atom14_pdb, write_model_output_pdb
 from minalphafold.trainer import (
     DataConfig,
     TrainingConfig,
-    alphafold2_model_config,
     build_dataloader,
     build_optimizer,
     collapse_sampled_batch_tensor,
-    default_model_config,
+    list_available_profiles,
+    load_model_config,
     loss_inputs_from_batch,
-    medium_model_config,
     model_inputs_from_batch,
     move_to_device,
     set_optimizer_learning_rate,
@@ -189,22 +205,283 @@ def _cycle(iterable):
     return itertools.chain.from_iterable(itertools.repeat(iterable))
 
 
+# ---------------------------------------------------------------------------
+# Frozen-context path (--freeze-crop-and-cluster): compose the data.py
+# primitives directly so the crop + cluster selection are fixed once at
+# startup, while block-delete + MSA masking still fire fresh per step. The
+# production pipeline (``collate_batch`` → ``build_msa_features``) is left
+# untouched — this code is overfit-test-only scaffolding.
+# ---------------------------------------------------------------------------
+
+
+def _build_frozen_context(args, device: torch.device) -> dict[str, Any]:
+    """Run the deterministic parts of the data pipeline once.
+
+    Produces the cropped example (no crop, since we set ``crop_size >= N_res``),
+    pre-sampled cluster / extra MSA (fixed seed), the MSA profile (over the
+    full raw MSA per supplement 1.9.9), the template + target + supervision
+    tensors, and every other field the batch needs that doesn't depend on
+    block-delete / masking. Returned as a CPU-side dict; ``_assemble_step_batch``
+    moves per-step tensors to ``device``.
+    """
+    dataset = ProcessedOpenProteinSetDataset(
+        args.processed_features_dir,
+        args.processed_labels_dir,
+        split="train",
+        val_fraction=0.0,
+        seed=args.seed,
+    )
+    if len(dataset) == 0:
+        raise FileNotFoundError(
+            "ProcessedOpenProteinSetDataset is empty — check --processed-features-dir."
+        )
+    chain_index = next(
+        (i for i, cid in enumerate(dataset.chain_ids) if cid == args.chain_id),
+        None,
+    )
+    if chain_index is None:
+        raise FileNotFoundError(
+            f"chain_id '{args.chain_id}' not found in {args.processed_features_dir}"
+        )
+    raw = dataset[chain_index]
+
+    n_res = int(raw["aatype"].shape[0])
+    # crop_size >= N_res → ``_crop_start`` returns 0 (no crop) regardless of
+    # training flag, so this is deterministic.
+    cropped = crop_example(
+        raw,
+        crop_size=max(args.crop_size, n_res),
+        training=False,
+        torch_generator=None,
+    )
+
+    # Fixed-seed cluster / extra sampling.
+    cluster_generator = torch.Generator()
+    cluster_generator.manual_seed(args.seed)
+    cluster_msa, cluster_deletions, extra_msa, extra_deletions = sample_cluster_and_extra(
+        cropped["msa"],
+        cropped["deletions"],
+        msa_depth=args.msa_depth,
+        extra_msa_depth=args.extra_msa_depth,
+        training=True,
+        torch_generator=cluster_generator,
+        python_random=random.Random(args.seed),
+    )
+
+    # MSA profile computed from the raw (pre-sampling) MSA — matches what
+    # build_msa_features does in production and keeps the masked-MSA
+    # replacement distribution consistent.
+    msa_profile = hhblits_profile(cropped["msa"])
+
+    # Templates (capped at ``max_templates``) — shapes ``(T, N_res, ...)``.
+    template_aatype = cropped["template_aatype"][: args.max_templates]
+    template_positions = cropped["template_atom14_positions"][: args.max_templates]
+    template_atom14_mask = cropped["template_atom14_mask"][: args.max_templates]
+    template_residue_mask = template_atom14_mask.amax(dim=-1)
+    template_mask = (template_residue_mask.sum(dim=-1) > 0).float()
+
+    # Static residue / target / supervision features.
+    target_feat = build_target_feat(
+        cropped["aatype"],
+        cropped.get("between_segment_residues"),
+    )
+    template_pair_feat = build_template_pair_feat(
+        template_aatype, template_positions, template_atom14_mask,
+    )
+    template_angle_feat = build_template_angle_feat(
+        template_aatype, template_positions, template_atom14_mask,
+    )
+    supervision = build_supervision(
+        cropped["aatype"],
+        cropped["atom14_positions"],
+        cropped["atom14_mask"],
+    )
+
+    residue_index = cropped.get("residue_index")
+    if residue_index is None:
+        residue_index = torch.arange(n_res, dtype=torch.long)
+    else:
+        residue_index = residue_index.long()
+
+    resolution = cropped.get("resolution", torch.tensor(0.0))
+    if not torch.is_tensor(resolution):
+        resolution = torch.as_tensor(resolution)
+    resolution = resolution.float()
+
+    return {
+        "chain_id": cropped["chain_id"],
+        "aatype": cropped["aatype"],
+        "residue_index": residue_index,
+        "target_feat": target_feat,
+        "template_pair_feat": template_pair_feat,
+        "template_angle_feat": template_angle_feat,
+        "template_mask": template_mask,
+        "template_residue_mask": template_residue_mask,
+        "seq_mask": torch.ones(n_res, dtype=torch.float32),
+        "resolution": resolution,
+        # Per-step inputs (frozen cluster / extra MSA and profile).
+        "cluster_msa_frozen": cluster_msa,
+        "cluster_deletions_frozen": cluster_deletions,
+        "extra_msa_frozen": extra_msa,
+        "extra_deletions_frozen": extra_deletions,
+        "msa_profile": msa_profile,
+        "n_res": n_res,
+        **supervision,
+    }
+
+
+_SUPERVISION_KEYS = (
+    "true_rotations",
+    "true_translations",
+    "true_atom_positions",
+    "true_atom_mask",
+    "true_atom_positions_alt",
+    "true_atom_mask_alt",
+    "true_atom_is_ambiguous",
+    "true_torsion_angles",
+    "true_torsion_angles_alt",
+    "true_torsion_mask",
+    "true_rigid_group_frames_R",
+    "true_rigid_group_frames_t",
+    "true_rigid_group_frames_R_alt",
+    "true_rigid_group_frames_t_alt",
+    "true_rigid_group_exists",
+    "atom37_exists",
+    "experimentally_resolved_true",
+    "res_types",
+    "backbone_mask",
+    "pseudo_beta_mask",
+    "pseudo_beta_positions",
+)
+
+
+def _assemble_step_batch(frozen: dict[str, Any], args, device: torch.device) -> dict[str, Any]:
+    """Compose a training batch from the frozen context + fresh per-step noise.
+
+    Per step we apply block-delete to the frozen cluster MSA and BERT-masking
+    to the survivors, using Python's system random state (``torch_generator=
+    None`` / no seed) so the noise varies every call. Everything else — crop,
+    which rows are cluster vs extra, template features, supervision — is
+    pulled from ``frozen`` unchanged.
+    """
+    cluster_msa, cluster_deletions = block_delete_msa(
+        frozen["cluster_msa_frozen"],
+        frozen["cluster_deletions_frozen"],
+        training=True,
+        enabled=not args.disable_msa_augmentation,
+        msa_fraction_per_block=args.block_delete_msa_fraction,
+        randomize_num_blocks=False,
+        num_blocks=args.block_delete_msa_num_blocks,
+        torch_generator=None,
+    )
+
+    mask_prob = 0.0 if args.disable_msa_augmentation else args.masked_msa_probability
+    masked_cluster_msa, masked_msa_target, masked_msa_mask = masked_msa_inputs(
+        cluster_msa,
+        frozen["msa_profile"],
+        training=True,
+        mask_probability=mask_prob,
+        torch_generator=None,
+    )
+
+    cluster_profile, cluster_deletion_mean = cluster_statistics(
+        masked_cluster_msa,
+        cluster_deletions,
+        frozen["extra_msa_frozen"],
+        frozen["extra_deletions_frozen"],
+    )
+    msa_feat = build_msa_feat(
+        masked_cluster_msa, cluster_deletions, cluster_profile, cluster_deletion_mean,
+    )
+    extra_msa_feat = build_extra_msa_feat(
+        frozen["extra_msa_frozen"], frozen["extra_deletions_frozen"],
+    )
+
+    def _b(x: torch.Tensor) -> torch.Tensor:
+        return x.unsqueeze(0).to(device)
+
+    batch: dict[str, Any] = {
+        "chain_id": [frozen["chain_id"]],
+        "aatype": _b(frozen["aatype"]),
+        "residue_index": _b(frozen["residue_index"]),
+        "target_feat": _b(frozen["target_feat"]),
+        "template_aatype": _b(torch.zeros(
+            (0, frozen["n_res"]), dtype=torch.long,
+        )) if frozen["template_pair_feat"].shape[0] == 0
+        else _b(torch.zeros(
+            (frozen["template_pair_feat"].shape[0], frozen["n_res"]), dtype=torch.long,
+        )),
+        "template_pair_feat": _b(frozen["template_pair_feat"]),
+        "template_angle_feat": _b(frozen["template_angle_feat"]),
+        "template_mask": _b(frozen["template_mask"]),
+        "template_residue_mask": _b(frozen["template_residue_mask"]),
+        "seq_mask": _b(frozen["seq_mask"]),
+        "resolution": _b(frozen["resolution"]),
+        "msa_feat": _b(msa_feat),
+        "extra_msa_feat": _b(extra_msa_feat),
+        "msa_mask": _b(torch.ones(masked_cluster_msa.shape, dtype=torch.float32)),
+        "extra_msa_mask": _b(torch.ones(frozen["extra_msa_frozen"].shape, dtype=torch.float32)),
+        "masked_msa_target": _b(masked_msa_target),
+        "masked_msa_mask": _b(masked_msa_mask.float()),
+    }
+    for key in _SUPERVISION_KEYS:
+        batch[key] = _b(frozen[key])
+    return batch
+
+
 def _evaluate_with_known_ground_truth(
     model: AlphaFold2,
     batch: dict,
     training_config: TrainingConfig,
     loss_fn: AlphaFoldLoss,
-) -> tuple[dict, dict, float]:
-    """Single forward pass (train mode off) — for periodic metrics."""
+) -> tuple[dict, dict, dict[str, float]]:
+    """Single forward pass (train mode off) — returns outputs, RMSDs, per-term losses."""
     was_training = model.training
     model.eval()
     with torch.no_grad():
         outputs = model(**model_inputs_from_batch(batch, training_config))
-        per_example_loss = loss_fn(**loss_inputs_from_batch(batch, outputs))
+        per_example_total, loss_terms = loss_fn(
+            return_breakdown=True, **loss_inputs_from_batch(batch, outputs),
+        )
     if was_training:
         model.train()
     metrics = structure_metrics(outputs, batch)
-    return outputs, metrics, float(per_example_loss.mean().item())
+    term_values = {
+        key: float(value.mean().item()) if torch.is_tensor(value) else float(value)
+        for key, value in loss_terms.items()
+    }
+    term_values["loss"] = float(per_example_total.mean().item())
+    return outputs, metrics, term_values
+
+
+# Ordered (key, label) so the console table has a stable column layout.
+_LOSS_BREAKDOWN_LAYOUT: tuple[tuple[str, str], ...] = (
+    ("loss", "total"),
+    ("fape_loss", "fape"),
+    ("backbone_loss", "bb_fape"),
+    ("sidechain_fape_loss", "sc_fape"),
+    ("torsion_loss", "tors"),
+    ("distogram_loss", "dist"),
+    ("msa_loss", "msa"),
+    ("plddt_loss", "plddt"),
+)
+_VIOLATION_KEYS: tuple[tuple[str, str], ...] = (
+    ("structural_violation_loss", "viol"),
+    ("experimentally_resolved_loss", "exp"),
+    ("tm_score_loss", "tm"),
+)
+
+
+def _format_loss_breakdown(term_values: dict[str, float]) -> str:
+    """One-line loss breakdown for the console log — unweighted per-term values."""
+    parts = []
+    for key, label in _LOSS_BREAKDOWN_LAYOUT:
+        if key in term_values:
+            parts.append(f"{label}={term_values[key]:6.3f}")
+    for key, label in _VIOLATION_KEYS:
+        if key in term_values:
+            parts.append(f"{label}={term_values[key]:6.3f}")
+    return "  ".join(parts)
 
 
 def main(argv: list[str] | None = None) -> dict:
@@ -218,8 +495,13 @@ def main(argv: list[str] | None = None) -> dict:
     parser.add_argument("--grad-clip-norm", type=float, default=0.1)
     parser.add_argument(
         "--model-profile",
-        choices=["tiny", "medium", "alphafold2"],
+        type=str,
         default="medium",
+        help=(
+            "Profile name resolved under configs/ (available: "
+            f"{', '.join(list_available_profiles())}) or a path to any "
+            "JSON with the same schema."
+        ),
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--n-cycles", type=int, default=1,
@@ -238,6 +520,23 @@ def main(argv: list[str] | None = None) -> dict:
                         help="Templates per step (paper: 4).")
     parser.add_argument("--disable-msa-augmentation", action="store_true",
                         help="Turn off block-deletion + BERT masking (keeps crops + clustering).")
+    parser.add_argument(
+        "--freeze-crop-and-cluster",
+        action="store_true",
+        help="Compose the data-pipeline primitives at the overfit-script "
+             "level so the crop and MSA cluster/extra split are fixed once "
+             "at startup (same rows every step), while block-deletion and "
+             "BERT MSA masking still run fresh per step. Use this for "
+             "single-protein overfit; leave off for production-faithful "
+             "training. The core pipeline (collate_batch / build_msa_features) "
+             "is untouched regardless of this flag.",
+    )
+    parser.add_argument("--block-delete-msa-fraction", type=float, default=0.3,
+                        help="Fraction of the MSA removed per block (supplement 1.2.6 default).")
+    parser.add_argument("--block-delete-msa-num-blocks", type=int, default=5,
+                        help="Number of deleted blocks per call (supplement 1.2.6 default).")
+    parser.add_argument("--masked-msa-probability", type=float, default=0.15,
+                        help="BERT-style MSA masking rate (supplement 1.2.7).")
     parser.add_argument("--log-every", type=int, default=10)
     parser.add_argument("--eval-every", type=int, default=25,
                         help="Run a no-augmentation forward + compute RMSD every N steps.")
@@ -279,7 +578,11 @@ def main(argv: list[str] | None = None) -> dict:
         extra_msa_depth=args.extra_msa_depth,
         max_templates=args.max_templates,
         block_delete_training_msa=not args.disable_msa_augmentation,
-        masked_msa_probability=0.0 if args.disable_msa_augmentation else 0.15,
+        masked_msa_probability=(
+            0.0 if args.disable_msa_augmentation else args.masked_msa_probability
+        ),
+        block_delete_msa_fraction=args.block_delete_msa_fraction,
+        block_delete_msa_num_blocks=args.block_delete_msa_num_blocks,
     )
 
     training_config = TrainingConfig(
@@ -292,15 +595,10 @@ def main(argv: list[str] | None = None) -> dict:
     )
 
     # ------------------------------------------------------------
-    # Model: dropout off so overfitting is possible; same config
-    # profiles as the trainer.
+    # Model: dropout off so overfitting is possible; profile loaded
+    # from configs/ (same JSON files the trainer uses).
     # ------------------------------------------------------------
-    profile_builders = {
-        "tiny": default_model_config,
-        "medium": medium_model_config,
-        "alphafold2": alphafold2_model_config,
-    }
-    model_config = zero_dropout_model_config(profile_builders[args.model_profile]())
+    model_config = zero_dropout_model_config(load_model_config(args.model_profile))
     model = AlphaFold2(model_config).to(device)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"[overfit] chain       : {args.chain_id}")
@@ -314,51 +612,67 @@ def main(argv: list[str] | None = None) -> dict:
     # ------------------------------------------------------------
     # Training infrastructure.
     # ------------------------------------------------------------
-    train_loader = build_dataloader(
-        "train",
-        data_config,
-        training=True,
-        batch_size=1,
-        num_workers=0,
-        device=str(device),
-        seed=args.seed,
-        n_cycles=args.n_cycles,
-        n_ensemble=args.n_ensemble,
-    )
+    if args.freeze_crop_and_cluster:
+        frozen = _build_frozen_context(args, device)
+        print(f"[overfit] frozen clusters: {frozen['cluster_msa_frozen'].shape[0]} rows")
+        print(f"[overfit] frozen extras  : {frozen['extra_msa_frozen'].shape[0]} rows")
+        print(f"[overfit] frozen crop    : full {frozen['n_res']} residues (no random crop)")
 
-    # Separate deterministic loader — no augmentation, fixed crop — for
-    # periodic RMSD eval so metrics aren't swamped by MSA-sampling noise.
-    eval_data_config = DataConfig(
-        processed_features_dir=str(features_dir),
-        processed_labels_dir=str(labels_dir),
-        val_fraction=0.0,
-        crop_size=args.crop_size,
-        msa_depth=args.msa_depth,
-        extra_msa_depth=args.extra_msa_depth,
-        max_templates=args.max_templates,
-        block_delete_training_msa=False,
-        masked_msa_probability=0.0,
-        fixed_feature_seed=args.seed,
-    )
-    eval_loader = build_dataloader(
-        "train",
-        eval_data_config,
-        training=False,
-        batch_size=1,
-        num_workers=0,
-        device=str(device),
-        seed=args.seed,
-        n_cycles=args.n_cycles,
-        n_ensemble=args.n_ensemble,
-    )
+        def _next_batch() -> dict:
+            return _assemble_step_batch(frozen, args, device)
+
+        eval_batch = _assemble_step_batch(frozen, argparse.Namespace(**{
+            **vars(args), "disable_msa_augmentation": True,
+        }), device)
+    else:
+        train_loader = build_dataloader(
+            "train",
+            data_config,
+            training=True,
+            batch_size=1,
+            num_workers=0,
+            device=str(device),
+            seed=args.seed,
+            n_cycles=args.n_cycles,
+            n_ensemble=args.n_ensemble,
+        )
+
+        # Separate deterministic loader — no augmentation, fixed crop — for
+        # periodic RMSD eval so metrics aren't swamped by MSA-sampling noise.
+        eval_data_config = DataConfig(
+            processed_features_dir=str(features_dir),
+            processed_labels_dir=str(labels_dir),
+            val_fraction=0.0,
+            crop_size=args.crop_size,
+            msa_depth=args.msa_depth,
+            extra_msa_depth=args.extra_msa_depth,
+            max_templates=args.max_templates,
+            block_delete_training_msa=False,
+            masked_msa_probability=0.0,
+            fixed_feature_seed=args.seed,
+        )
+        eval_loader = build_dataloader(
+            "train",
+            eval_data_config,
+            training=False,
+            batch_size=1,
+            num_workers=0,
+            device=str(device),
+            seed=args.seed,
+            n_cycles=args.n_cycles,
+            n_ensemble=args.n_ensemble,
+        )
+        batch_iter = _cycle(train_loader)
+
+        def _next_batch() -> dict:
+            return move_to_device(next(batch_iter), device)
+
+        eval_batch = move_to_device(next(iter(eval_loader)), device)
 
     optimizer = build_optimizer(model, training_config)
     loss_fn = AlphaFoldLoss(finetune=False, use_clamped_fape=args.use_clamped_fape).to(device)
     set_optimizer_learning_rate(optimizer, args.learning_rate)
     model.train()
-
-    batch_iter = _cycle(train_loader)
-    eval_batch = move_to_device(next(iter(eval_loader)), device)
 
     history: list[dict] = []
     best = {"ca_rmsd_after_alignment": float("inf")}
@@ -366,7 +680,7 @@ def main(argv: list[str] | None = None) -> dict:
     start_time = time.time()
 
     for step in range(1, args.steps + 1):
-        batch = move_to_device(next(batch_iter), device)
+        batch = _next_batch()
 
         optimizer.zero_grad(set_to_none=True)
         outputs = model(**model_inputs_from_batch(batch, training_config))
@@ -385,20 +699,22 @@ def main(argv: list[str] | None = None) -> dict:
                   f"({time.time() - start_time:.0f}s)")
 
         if step % args.eval_every == 0 or step == args.steps or step == 1:
-            _, metrics, eval_loss = _evaluate_with_known_ground_truth(
+            _, metrics, term_values = _evaluate_with_known_ground_truth(
                 model, eval_batch, training_config, loss_fn,
             )
+            eval_loss = term_values["loss"]
             entry["eval_loss"] = eval_loss
             entry.update(metrics)
+            entry["eval_loss_terms"] = term_values
             print(
                 f"[overfit] eval {step:5d}/{args.steps}  "
-                f"eval_loss={eval_loss:.4f}  "
                 f"bb_rmsd={metrics['backbone_rmsd_after_alignment']:.3f}  "
                 f"ca_rmsd={metrics['ca_rmsd_after_alignment']:.3f}  "
                 f"aa_rmsd={metrics['all_atom_rmsd_after_alignment']:.3f}  "
                 f"pep={metrics['peptide_bond_mean']:.2f}"
                 f"[{metrics['peptide_bond_min']:.2f},{metrics['peptide_bond_max']:.2f}]"
             )
+            print(f"[overfit] losses {step:4d}/{args.steps}  {_format_loss_breakdown(term_values)}")
             ca_rmsd = metrics["ca_rmsd_after_alignment"]
             if not np.isnan(ca_rmsd) and ca_rmsd < best["ca_rmsd_after_alignment"]:
                 best = {"step": step, "loss": loss_value, "eval_loss": eval_loss, **metrics}
@@ -411,11 +727,14 @@ def main(argv: list[str] | None = None) -> dict:
         model.load_state_dict(best_state)
         print(f"[overfit] restoring best-by-ca-rmsd checkpoint: step {best['step']}")
 
-    model.eval()
+    _, final_metrics, final_loss_terms = _evaluate_with_known_ground_truth(
+        model, eval_batch, training_config, loss_fn,
+    )
     with torch.no_grad():
+        model.eval()
         final_outputs = model(**model_inputs_from_batch(eval_batch, training_config))
-    final_metrics = structure_metrics(final_outputs, eval_batch)
     aligned = apply_kabsch_to_outputs(final_outputs, eval_batch)
+    print(f"[overfit] final losses: {_format_loss_breakdown(final_loss_terms)}")
 
     predicted_pdb = out_dir / f"predicted_{args.chain_id}.pdb"
     truth_pdb = out_dir / f"ground_truth_{args.chain_id}.pdb"
@@ -438,7 +757,9 @@ def main(argv: list[str] | None = None) -> dict:
         "extra_msa_depth": args.extra_msa_depth,
         "max_templates": args.max_templates,
         "msa_augmentation": not args.disable_msa_augmentation,
+        "freeze_crop_and_cluster": args.freeze_crop_and_cluster,
         "final_metrics": final_metrics,
+        "final_loss_terms": final_loss_terms,
         "best": best,
         "predicted_pdb": str(predicted_pdb),
         "ground_truth_pdb": str(truth_pdb),

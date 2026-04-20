@@ -47,10 +47,9 @@ from minalphafold.model import AlphaFold2
 from minalphafold.pdbio import write_atom14_pdb, write_model_output_pdb
 from minalphafold.residue_constants import restype_1to3, restype_name_to_atom14_names, restypes
 from minalphafold.trainer import (
-    alphafold2_model_config,
     build_optimizer,
-    default_model_config,
-    medium_model_config,
+    list_available_profiles,
+    load_model_config,
     model_inputs_from_batch,
     move_to_device,
     set_seed,
@@ -301,9 +300,15 @@ def main(argv: list[str] | None = None) -> dict:
     parser.add_argument("--grad-clip-norm", type=float, default=0.1)
     parser.add_argument(
         "--model-profile",
-        choices=["tiny", "medium", "alphafold2"],
+        type=str,
         default="medium",
-        help="tiny (fast smoke test) / medium (good default for <50 residues on CPU) / alphafold2 (full-size)",
+        help=(
+            "Profile name resolved under configs/ (available: "
+            f"{', '.join(list_available_profiles())}) or a path to any "
+            "JSON with the same schema. tiny = fast smoke test, "
+            "medium = default for <50-residue CPU overfit, alphafold2 = "
+            "full paper-spec model."
+        ),
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--n-cycles", type=int, default=1)
@@ -359,13 +364,8 @@ def main(argv: list[str] | None = None) -> dict:
     )
     batch = move_to_device(batch, device)
 
-    profile_builders = {
-        "tiny": default_model_config,
-        "medium": medium_model_config,
-        "alphafold2": alphafold2_model_config,
-    }
-    model_config = profile_builders[args.model_profile]()
-    model_config = zero_dropout_model_config(model_config)
+    # Profile loaded from ``configs/<name>.json`` (or an explicit JSON path).
+    model_config = zero_dropout_model_config(load_model_config(args.model_profile))
     model = AlphaFold2(model_config).to(device)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"[overfit] model profile: {args.model_profile} ({n_params / 1e6:.1f}M params)")
