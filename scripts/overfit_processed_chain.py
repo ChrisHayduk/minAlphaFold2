@@ -245,15 +245,21 @@ def _build_frozen_context(args, device: torch.device) -> dict[str, Any]:
         )
     raw = dataset[chain_index]
 
-    n_res = int(raw["aatype"].shape[0])
-    # crop_size >= N_res → ``_crop_start`` returns 0 (no crop) regardless of
-    # training flag, so this is deterministic.
+    # ``training=False`` picks a deterministic centre crop (see
+    # ``_crop_start``), so a fixed window is used every step — no per-step
+    # randomness, but the crop is honoured when ``crop_size < n_res`` so
+    # memory scales with ``args.crop_size`` instead of the raw chain length.
     cropped = crop_example(
         raw,
-        crop_size=max(args.crop_size, n_res),
+        crop_size=args.crop_size,
         training=False,
         torch_generator=None,
     )
+    # Downstream features (``seq_mask``, ``residue_index`` fallback, reported
+    # ``n_res``) must be built against the *cropped* length — otherwise masks
+    # and indices retain the raw chain's shape and blow up at the first
+    # ``pair_mask`` broadcast in the model.
+    n_res = int(cropped["aatype"].shape[0])
 
     # Fixed-seed cluster / extra sampling.
     cluster_generator = torch.Generator()
@@ -544,6 +550,23 @@ def main(argv: list[str] | None = None) -> dict:
     parser.add_argument("--out-dir", type=Path, default=None)
     parser.add_argument("--use-clamped-fape", type=float, default=None,
                         help="Mix-weight of clamped FAPE; None = fully clamped (supplement 1.11.5).")
+    parser.add_argument("--violations-after-step", type=int, default=None,
+                        help=(
+                            "Step after which to enable the fine-tuning loss terms "
+                            "(structural-violation loss, weight 1.0, supplement 1.9.11 eq 44-47; "
+                            "experimentally-resolved loss, weight 0.01, supplement 1.9.10). "
+                            "OFF by default — supplement 1.9.11 is explicit: 'We apply this violation "
+                            "loss only during the fine-tuning training phase. Switching it on in the "
+                            "early training leads to strong instabilities in the training dynamics.' "
+                            "Paper's Table 4 starts fine-tuning at ~87%% of total samples "
+                            "(10M initial / 11.5M total); for an N-step overfit, ~0.8*N is a "
+                            "reasonable paper-faithful default if you opt in."
+                        ))
+    parser.add_argument("--fine-tune-lr-scale", type=float, default=0.5,
+                        help=(
+                            "LR multiplier applied when `--violations-after-step` fires. "
+                            "Default 0.5 mirrors Table 4: initial LR 1e-3 -> fine-tune LR 5e-4."
+                        ))
     args = parser.parse_args(argv)
 
     out_dir = args.out_dir or (ARTIFACT_ROOT / args.chain_id)
@@ -616,7 +639,7 @@ def main(argv: list[str] | None = None) -> dict:
         frozen = _build_frozen_context(args, device)
         print(f"[overfit] frozen clusters: {frozen['cluster_msa_frozen'].shape[0]} rows")
         print(f"[overfit] frozen extras  : {frozen['extra_msa_frozen'].shape[0]} rows")
-        print(f"[overfit] frozen crop    : full {frozen['n_res']} residues (no random crop)")
+        print(f"[overfit] frozen crop    : {frozen['n_res']} residues (deterministic centre crop, no per-step randomness)")
 
         def _next_batch() -> dict:
             return _assemble_step_batch(frozen, args, device)
@@ -670,6 +693,10 @@ def main(argv: list[str] | None = None) -> dict:
         eval_batch = move_to_device(next(iter(eval_loader)), device)
 
     optimizer = build_optimizer(model, training_config)
+    # Two-stage training mirroring supplement 1.11.1 / Table 4: `finetune=False`
+    # during initial training (violation weight 0.0, exp-resolved weight 0.0),
+    # flipped to True at `--violations-after-step` to enable the fine-tuning
+    # loss terms and halve the LR (Table 4: 1e-3 -> 5e-4).
     loss_fn = AlphaFoldLoss(finetune=False, use_clamped_fape=args.use_clamped_fape).to(device)
     set_optimizer_learning_rate(optimizer, args.learning_rate)
     model.train()
@@ -680,6 +707,20 @@ def main(argv: list[str] | None = None) -> dict:
     start_time = time.time()
 
     for step in range(1, args.steps + 1):
+        if (
+            args.violations_after_step is not None
+            and not loss_fn.finetune
+            and step > args.violations_after_step
+        ):
+            loss_fn.finetune = True
+            new_lr = args.learning_rate * args.fine_tune_lr_scale
+            set_optimizer_learning_rate(optimizer, new_lr)
+            print(
+                f"[overfit] step {step}: entering fine-tuning stage "
+                f"(supplement 1.11.1) — enabling structural-violation + "
+                f"experimentally-resolved losses, LR {args.learning_rate:.2e} -> {new_lr:.2e}"
+            )
+
         batch = _next_batch()
 
         optimizer.zero_grad(set_to_none=True)

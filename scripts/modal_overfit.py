@@ -64,7 +64,7 @@ artifacts = modal.Volume.from_name("minalphafold-artifacts", create_if_missing=T
 
 @app.function(
     image=image,
-    gpu="A100-40GB",
+    gpu="A100-80GB",  # 40GB OOMs on crop=256 + 48 Evoformer blocks (triangle attn stores (B,H,N,N,N) across all blocks for backward); 80GB has headroom
     volumes={"/root/artifacts": artifacts},
     timeout=60 * 60 * 12,  # up to 12 hours — 10k steps of alphafold2 fits comfortably
 )
@@ -101,6 +101,9 @@ def main(
     extra_msa_depth: int = 1024,
     max_templates: int = 4,
     freeze_crop_and_cluster: bool = True,
+    use_clamped_fape: float | None = None,
+    violations_after_step: int | None = None,
+    fine_tune_lr_scale: float = 0.5,
     seed: int = 0,
 ) -> None:
     """Translate these Modal-CLI kwargs into the overfit script's argv and ship it."""
@@ -119,6 +122,13 @@ def main(
     ]
     if freeze_crop_and_cluster:
         argv.append("--freeze-crop-and-cluster")
+    if use_clamped_fape is not None:
+        argv += ["--use-clamped-fape", str(use_clamped_fape)]
+    if violations_after_step is not None:
+        argv += [
+            "--violations-after-step", str(violations_after_step),
+            "--fine-tune-lr-scale", str(fine_tune_lr_scale),
+        ]
 
     print(f"[modal] remote argv:\n  {' '.join(argv)}")
     run_overfit.remote(argv)
