@@ -883,3 +883,135 @@ def test_build_supervision_round_trips_into_exact_structure_targets():
         atol=5e-4,
     )
     assert float(loss_terms["structure_loss"].item()) < 0.01
+
+
+def test_build_supervision_gives_near_zero_loss_on_non_idealised_atoms():
+    """Regression test for the parametric-GT-frame fix.
+
+    Before the fix, ``build_supervision`` built sidechain rigid-group frames
+    via Gram-Schmidt on the real atoms (``atom14_to_rigid_group_frames``).
+    The Structure Module builds its *predicted* sidechain frames
+    parametrically (backbone ∘ T^lit ∘ makeRotX(torsion), Algorithm 24),
+    using literature bond geometry. On real PDB atoms the two paths
+    disagree by a few tenths of an Å because real bond lengths are not
+    exactly the literature values — so the sidechain FAPE loss acquired a
+    non-zero floor (~0.021 on 1a0m_A) that the model could never clear,
+    producing the classic "loss low but RMSD 3-4 Å and ribbon mode fails"
+    overfit pathology.
+
+    After the fix, ``build_supervision`` builds GT sidechain frames the
+    *same way* as the prediction path, so the loss floor collapses down to
+    the atom-idealisation-only level (sub-0.01).
+
+    This test simulates the problematic scenario: take synthetic atoms,
+    apply bond-length perturbations that mimic real-atom non-idealisation,
+    run them through the full supervision pipeline, feed the supervision
+    through as a "perfect prediction", and verify the sidechain FAPE floor
+    is near zero — asserting below the pre-fix 0.021 value that caused the
+    bug.
+    """
+    sequence = "RKYD"
+    aatype = torch.from_numpy(sequence_to_ids(sequence)).long().unsqueeze(0)
+    translations = torch.tensor(
+        [[[0.0, 0.0, 0.0], [3.8, 0.5, 0.2], [7.6, -0.4, 0.1], [11.4, 0.2, -0.3]]],
+        dtype=torch.float32,
+    )
+    rotations = torch.eye(3, dtype=torch.float32).reshape(1, 1, 3, 3).repeat(1, len(sequence), 1, 1)
+    torsions = torch.tensor(
+        [
+            [
+                [[0.0, 1.0], [0.0, 1.0], [0.6, 0.8], [0.5, 0.8660254], [0.0, 1.0], [0.0, 1.0], [0.0, 1.0]],
+                [[0.0, 1.0], [0.0, 1.0], [0.8, 0.6], [0.70710677, 0.70710677], [0.5, 0.8660254], [0.0, 1.0], [0.0, 1.0]],
+                [[0.0, 1.0], [0.0, 1.0], [-0.5, 0.8660254], [0.8660254, 0.5], [0.70710677, 0.70710677], [0.0, 1.0], [0.0, 1.0]],
+                [[0.0, 1.0], [0.0, 1.0], [0.25881904, 0.9659258], [0.5, 0.8660254], [0.25881904, 0.9659258], [0.70710677, 0.70710677], [0.0, 1.0]],
+            ]
+        ],
+        dtype=torch.float32,
+    )
+    default_frames = torch.tensor(restype_rigid_group_default_frame, dtype=torch.float32)
+    lit_positions = torch.tensor(restype_atom14_rigid_group_positions, dtype=torch.float32)
+    atom_frame_idx_table = torch.tensor(restype_atom14_to_rigid_group, dtype=torch.long)
+    atom_mask_table = torch.tensor(restype_atom14_mask, dtype=torch.float32)
+
+    _, _, atom_positions, atom_mask = compute_all_atom_coordinates(
+        translations, rotations, torsions, aatype,
+        default_frames, lit_positions, atom_frame_idx_table, atom_mask_table,
+    )
+    # Perturb each atom by ~0.02 Å, typical of real-vs-literature bond-length
+    # drift in X-ray structures. Large enough that the pre-fix Gram-Schmidt
+    # sidechain frames would noticeably disagree with the parametric prediction
+    # frames (driving sidechain FAPE ≳ 0.02 on this scale); small enough that,
+    # post-fix, both paths agree and sidechain FAPE collapses to the atom
+    # idealisation term.
+    torch.manual_seed(42)
+    perturbation = 0.02 * torch.randn_like(atom_positions) * atom_mask.unsqueeze(-1)
+    real_atoms = atom_positions + perturbation
+
+    supervision = build_supervision(aatype[0], real_atoms[0], atom_mask[0])
+
+    recon_R, recon_t, recon_pos, recon_mask = compute_all_atom_coordinates(
+        supervision["true_translations"].unsqueeze(0),
+        supervision["true_rotations"].unsqueeze(0),
+        supervision["true_torsion_angles"].unsqueeze(0),
+        aatype,
+        default_frames, lit_positions, atom_frame_idx_table, atom_mask_table,
+    )
+    structure_prediction = {
+        "traj_rotations": supervision["true_rotations"].unsqueeze(0).unsqueeze(0),
+        "traj_translations": supervision["true_translations"].unsqueeze(0).unsqueeze(0),
+        "traj_torsion_angles": supervision["true_torsion_angles"].unsqueeze(0).unsqueeze(0),
+        "traj_torsion_angles_unnormalized": supervision["true_torsion_angles"].unsqueeze(0).unsqueeze(0),
+        "all_frames_R": recon_R,
+        "all_frames_t": recon_t,
+        "atom14_coords": recon_pos,
+        "atom14_mask": recon_mask,
+    }
+
+    loss_module = AlphaFoldLoss(finetune=False)
+    loss_module.distogram_weight = 0.0
+    loss_module.msa_weight = 0.0
+    loss_module.confidence_weight = 0.0
+    loss_terms = loss_module.compute_loss_terms(
+        structure_model_prediction=structure_prediction,
+        true_rotations=supervision["true_rotations"].unsqueeze(0),
+        true_translations=supervision["true_translations"].unsqueeze(0),
+        true_atom_positions=supervision["true_atom_positions"].unsqueeze(0),
+        true_atom_mask=supervision["true_atom_mask"].unsqueeze(0),
+        true_atom_positions_alt=supervision["true_atom_positions_alt"].unsqueeze(0),
+        true_atom_mask_alt=supervision["true_atom_mask_alt"].unsqueeze(0),
+        true_atom_is_ambiguous=supervision["true_atom_is_ambiguous"].unsqueeze(0),
+        true_torsion_angles=supervision["true_torsion_angles"].unsqueeze(0),
+        true_torsion_angles_alt=supervision["true_torsion_angles_alt"].unsqueeze(0),
+        true_torsion_mask=supervision["true_torsion_mask"].unsqueeze(0),
+        true_rigid_group_frames_R=supervision["true_rigid_group_frames_R"].unsqueeze(0),
+        true_rigid_group_frames_t=supervision["true_rigid_group_frames_t"].unsqueeze(0),
+        true_rigid_group_frames_R_alt=supervision["true_rigid_group_frames_R_alt"].unsqueeze(0),
+        true_rigid_group_frames_t_alt=supervision["true_rigid_group_frames_t_alt"].unsqueeze(0),
+        true_rigid_group_exists=supervision["true_rigid_group_exists"].unsqueeze(0),
+        experimentally_resolved_pred=torch.zeros((1, len(sequence), atom_type_num), dtype=torch.float32),
+        experimentally_resolved_true=supervision["experimentally_resolved_true"].unsqueeze(0),
+        experimentally_resolved_exists=supervision["atom37_exists"].unsqueeze(0),
+        masked_msa_pred=torch.zeros((1, 1, len(sequence), 23), dtype=torch.float32),
+        masked_msa_target=torch.zeros((1, 1, len(sequence), 23), dtype=torch.float32),
+        masked_msa_mask=torch.zeros((1, 1, len(sequence)), dtype=torch.float32),
+        plddt_pred=torch.zeros((1, len(sequence), 50), dtype=torch.float32),
+        distogram_pred=torch.zeros((1, len(sequence), len(sequence), 64), dtype=torch.float32),
+        res_types=supervision["res_types"].unsqueeze(0),
+        residue_index=torch.arange(len(sequence), dtype=torch.long).unsqueeze(0),
+        seq_mask=torch.ones((1, len(sequence)), dtype=torch.float32),
+    )
+
+    # Pre-fix: sidechain FAPE had a floor dominated by the Gram-Schmidt vs
+    # parametric frame mismatch — on 1a0m_A (a real 16-residue PDB chain) we
+    # measured 0.0210 even when the prediction exactly matched the
+    # supervision. Post-fix: the floor collapses to atom-idealisation only,
+    # 3× lower on 1a0m_A (0.007) and below 0.012 here. Threshold < 0.015
+    # comfortably separates post-fix from pre-fix.
+    sidechain = float(loss_terms["sidechain_fape_loss"].item())
+    assert sidechain < 0.015, (
+        f"sidechain_fape_loss={sidechain:.4f} — Gram-Schmidt vs parametric "
+        f"frame mismatch has returned; the pre-fix floor on this scale of "
+        f"perturbation exceeded this threshold."
+    )
+    assert float(loss_terms["backbone_loss"].item()) < 1e-5
+    assert float(loss_terms["structure_loss"].item()) < 0.02

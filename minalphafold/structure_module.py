@@ -605,36 +605,48 @@ def compose_transforms(R1, t1, R2, t2):
     return R, t
 
 
-def compute_all_atom_coordinates(
+def rigid_group_frames_from_torsions(
     translations: torch.Tensor,   # (batch, N_res, 3)
     rotations: torch.Tensor,      # (batch, N_res, 3, 3)
     torsion_angles: torch.Tensor, # (batch, N_res, 7, 2) — [ω, φ, ψ, χ1, χ2, χ3, χ4]
-    aatype: torch.Tensor,         # (batch, N_res) — integer residue type indices
-    default_frames: torch.Tensor, # (21, 8, 4, 4) — registered buffer
-    lit_positions: torch.Tensor,  # (21, 14, 3) — registered buffer
-    atom_frame_idx_table: torch.Tensor,  # (21, 14) — registered buffer
-    atom_mask_table: torch.Tensor,       # (21, 14) — registered buffer
-):
+    aatype: torch.Tensor,         # (batch, N_res)
+    default_frames: torch.Tensor, # (21, 8, 4, 4)
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build the 8 per-residue rigid-group frames parametrically (Algorithm 24).
+
+    This is the frame-construction half of ``compute_all_atom_coordinates``,
+    factored out so ``data.build_supervision`` can build **ground-truth**
+    rigid-group frames the same way the Structure Module builds its
+    **predicted** frames. If the two paths diverge (e.g. GT frames built
+    via Gram-Schmidt on real atoms), the sidechain FAPE loss acquires a
+    non-zero floor equal to the bond-length-idealisation mismatch between
+    literature geometry and real atoms — even when the prediction exactly
+    matches the ground truth. Building both paths parametrically makes that
+    floor vanish (down to atom-level idealisation only, which is tiny).
+
+    Returns ``(all_frames_R, all_frames_t)`` of shapes ``(batch, N_res, 8,
+    3, 3)`` and ``(batch, N_res, 8, 3)``. Group order matches Algorithm 24:
+    ``[backbone, ω, φ, ψ, χ1, χ2, χ3, χ4]``.
+    """
     dtype = translations.dtype
     device = translations.device
 
-    # --- Step 1: Normalize torsion angles to unit vectors ---
+    # Normalize torsion angles to unit vectors (Algorithm 24 line 1).
     torsion_angles = torsion_angles / (torch.norm(torsion_angles, dim=-1, keepdim=True) + 1e-8)
 
-    # --- Step 2: Get literature constants, indexed by residue type ---
+    # Per-residue-type literature transforms (Algorithm 24 line 2): T^lit_{r,*→bb}.
     lit_all = default_frames.to(device=device, dtype=dtype)[aatype]  # (batch, N_res, 8, 4, 4)
     lit_R = lit_all[..., :3, :3]              # (batch, N_res, 8, 3, 3)
     lit_t = lit_all[..., :3, 3]               # (batch, N_res, 8, 3)
 
-    # --- Step 3: Build torsion rotations via makeRotX ---
+    # Torsion rotations via makeRotX (Algorithm 25).
     torsion_R, torsion_t = make_rot_x(torsion_angles)  # (batch, N_res, 7, 3, 3), (batch, N_res, 7, 3)
 
-    # --- Step 4: Build all 8 frames ---
     frames_R = [rotations]   # Frame 0: backbone
     frames_t = [translations]
 
-    # Frames 1–4: T_i ∘ T_lit[f] ∘ makeRotX(angle_f)
-    # Each branches independently from the backbone frame
+    # Frames 1-4: Algorithm 24 lines 4-7 — ω, φ, ψ, χ1 each branch off the
+    # backbone frame via its own literature transform + torsion rotation.
     for f in range(4):
         mid_R, mid_t = compose_transforms(
             lit_R[:, :, f + 1], lit_t[:, :, f + 1],
@@ -644,10 +656,7 @@ def compute_all_atom_coordinates(
         frames_R.append(frame_R)
         frames_t.append(frame_t)
 
-    # Frames 5–7: chain sequentially from previous sidechain frame
-    # Frame 5 = T_i4 ∘ T_lit[5] ∘ makeRotX(χ2)
-    # Frame 6 = T_i5 ∘ T_lit[6] ∘ makeRotX(χ3)
-    # Frame 7 = T_i6 ∘ T_lit[7] ∘ makeRotX(χ4)
+    # Frames 5-7: Algorithm 24 lines 8-10 — χ2 chains off χ1, χ3 off χ2, χ4 off χ3.
     for f in range(3):
         prev_R = frames_R[f + 4]
         prev_t = frames_t[f + 4]
@@ -661,6 +670,26 @@ def compute_all_atom_coordinates(
 
     all_frames_R = torch.stack(frames_R, dim=2)  # (batch, N_res, 8, 3, 3)
     all_frames_t = torch.stack(frames_t, dim=2)  # (batch, N_res, 8, 3)
+    return all_frames_R, all_frames_t
+
+
+def compute_all_atom_coordinates(
+    translations: torch.Tensor,   # (batch, N_res, 3)
+    rotations: torch.Tensor,      # (batch, N_res, 3, 3)
+    torsion_angles: torch.Tensor, # (batch, N_res, 7, 2) — [ω, φ, ψ, χ1, χ2, χ3, χ4]
+    aatype: torch.Tensor,         # (batch, N_res) — integer residue type indices
+    default_frames: torch.Tensor, # (21, 8, 4, 4) — registered buffer
+    lit_positions: torch.Tensor,  # (21, 14, 3) — registered buffer
+    atom_frame_idx_table: torch.Tensor,  # (21, 14) — registered buffer
+    atom_mask_table: torch.Tensor,       # (21, 14) — registered buffer
+):
+    dtype = translations.dtype
+    device = translations.device
+
+    # Steps 1-4: build the 8 rigid-group frames (Algorithm 24 lines 1-10).
+    all_frames_R, all_frames_t = rigid_group_frames_from_torsions(
+        translations, rotations, torsion_angles, aatype, default_frames,
+    )
 
     # --- Step 5: Place atoms using their frame assignments ---
     lit_pos = lit_positions.to(device=device, dtype=dtype)[aatype]          # (batch, N_res, 14, 3)

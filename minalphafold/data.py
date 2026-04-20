@@ -54,7 +54,13 @@ try:
         pseudo_beta_positions,
         torsion_angles,
     )
-    from .residue_constants import STANDARD_ATOM_MASK, atom_type_num, restype_atom14_to_atom37
+    from .residue_constants import (
+        STANDARD_ATOM_MASK,
+        atom_type_num,
+        restype_atom14_to_atom37,
+        restype_rigid_group_default_frame,
+    )
+    from .structure_module import rigid_group_frames_from_torsions
 except ImportError:  # pragma: no cover - compatibility for direct module imports in tests/scripts.
     from a3m import GAP_ID, MASK_ID, MSA_ALPHABET_SIZE, SEQ_ALPHABET_SIZE
     from geometry import (
@@ -65,7 +71,13 @@ except ImportError:  # pragma: no cover - compatibility for direct module import
         pseudo_beta_positions,
         torsion_angles,
     )
-    from residue_constants import STANDARD_ATOM_MASK, atom_type_num, restype_atom14_to_atom37
+    from residue_constants import (
+        STANDARD_ATOM_MASK,
+        atom_type_num,
+        restype_atom14_to_atom37,
+        restype_rigid_group_default_frame,
+    )
+    from structure_module import rigid_group_frames_from_torsions
 
 # Table 1 feature dimensions.
 TEMPLATE_PAIR_BINS = 39              # distogram: 38 equal-width + 1 catch-all
@@ -785,18 +797,57 @@ def build_supervision(
     * ``res_types``, ``backbone_mask``, ``pseudo_beta_{positions,mask}``:
       miscellanea consumed by distogram, recycling, and violation losses.
     """
+    # Backbone (group 0) and group-existence mask come from Gram-Schmidt on real atoms
+    # — the backbone adaptation inside ``atom14_to_rigid_group_frames`` puts this
+    # frame in the paper's +x = Cα→C convention, matching the Structure Module's
+    # output. We discard the Gram-Schmidt sidechain frames: they are built from
+    # real-atom geometry (non-idealised bond lengths), so if we fed them to the
+    # loss the sidechain FAPE could never reach zero — even when the prediction
+    # exactly matches the ground truth — because the Structure Module's
+    # predicted sidechain frames are parametric (backbone ∘ T^lit ∘ makeRotX).
+    # We rebuild them below via ``rigid_group_frames_from_torsions`` so ground
+    # truth and prediction agree on the sidechain frame construction.
     (
-        true_rigid_group_frames_R,
-        true_rigid_group_frames_t,
+        _gs_frames_R,
+        _gs_frames_t,
         true_rigid_group_exists,
-        true_rigid_group_frames_R_alt,
-        true_rigid_group_frames_t_alt,
+        _gs_frames_R_alt,
+        _gs_frames_t_alt,
     ) = atom14_to_rigid_group_frames(atom14_positions, atom14_mask, aatype)
-    true_rotations = true_rigid_group_frames_R[:, 0]
-    true_translations = true_rigid_group_frames_t[:, 0]
+    true_rotations = _gs_frames_R[:, 0]
+    true_translations = _gs_frames_t[:, 0]
     backbone_mask = true_rigid_group_exists[:, 0]
     true_torsion_angles, true_torsion_mask = torsion_angles(atom14_positions, atom14_mask, aatype)
     true_torsion_angles_alt = alternative_torsion_angles(true_torsion_angles, aatype)
+
+    # Parametric ground-truth rigid-group frames: backbone ∘ T^lit ∘ makeRotX(torsion)
+    # (Algorithm 24 lines 1-10), matching the Structure Module prediction path.
+    # ``_alt`` uses the π-periodic alt torsions from Algorithm 26 / 1.8.5. Any
+    # residue without a valid backbone has garbage parametric frames, so mask
+    # those slots too by AND-ing with the backbone existence flag.
+    _param_default_frames = torch.as_tensor(
+        restype_rigid_group_default_frame, device=atom14_positions.device, dtype=atom14_positions.dtype,
+    )
+    _param_R, _param_t = rigid_group_frames_from_torsions(
+        true_translations.unsqueeze(0),
+        true_rotations.unsqueeze(0),
+        true_torsion_angles.unsqueeze(0),
+        aatype.unsqueeze(0),
+        _param_default_frames,
+    )
+    _param_R_alt, _param_t_alt = rigid_group_frames_from_torsions(
+        true_translations.unsqueeze(0),
+        true_rotations.unsqueeze(0),
+        true_torsion_angles_alt.unsqueeze(0),
+        aatype.unsqueeze(0),
+        _param_default_frames,
+    )
+    true_rigid_group_frames_R = _param_R[0]
+    true_rigid_group_frames_t = _param_t[0]
+    true_rigid_group_frames_R_alt = _param_R_alt[0]
+    true_rigid_group_frames_t_alt = _param_t_alt[0]
+    true_rigid_group_exists = true_rigid_group_exists * backbone_mask[:, None]
+
     pseudo_beta, pseudo_beta_mask = pseudo_beta_positions(atom14_positions, atom14_mask, aatype)
     true_atom_positions_alt, true_atom_mask_alt, true_atom_is_ambiguous = alternative_atom14_ground_truth(
         aatype,
