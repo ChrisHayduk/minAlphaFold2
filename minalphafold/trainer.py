@@ -28,13 +28,14 @@ Deviations from the paper for pedagogical reasons are called out inline:
 from __future__ import annotations
 
 import argparse
+from collections.abc import Sized
 from dataclasses import asdict, dataclass, is_dataclass
 from functools import partial
 import math
 from pathlib import Path
 import random
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import torch
@@ -512,8 +513,14 @@ def collapse_sampled_batch_tensor(
     return tensor
 
 
-def loss_inputs_from_batch(batch: dict[str, Any], outputs: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-    """Assemble the kwargs ``AlphaFoldLoss`` expects from a batch + model outputs."""
+def loss_inputs_from_batch(batch: dict[str, Any], outputs: dict[str, Any]) -> dict[str, Any]:
+    """Assemble the kwargs ``AlphaFoldLoss`` expects from a batch + model outputs.
+
+    The returned dict intentionally mixes tensors with the raw
+    ``structure_model_prediction`` sub-dict and an optional ``resolution``
+    scalar, so we type it as ``dict[str, Any]`` rather than forcing a
+    narrower promise we don't keep.
+    """
     recycle_index = max(int(outputs.get("sampled_n_cycles", 1)) - 1, 0)
     ensemble_index = 0
     return {
@@ -615,7 +622,14 @@ def evaluate(
 
 
 def config_to_dict(config: Any) -> Any:
-    if is_dataclass(config):
+    """Serialise a config to a plain dict for checkpointing.
+
+    Accepts dataclass instances (but not dataclass *classes* — hence the
+    ``not isinstance(config, type)`` guard that keeps ``asdict`` happy),
+    plain dicts, or anything with ``__dict__`` (e.g. ``SimpleNamespace``
+    model configs).
+    """
+    if is_dataclass(config) and not isinstance(config, type):
         return asdict(config)
     if isinstance(config, dict):
         return dict(config)
@@ -694,7 +708,10 @@ def fit(
         n_cycles=training_config.n_cycles,
         n_ensemble=training_config.n_ensemble,
     )
-    if len(train_loader.dataset) == 0:
+    # ``DataLoader.dataset`` is typed as the non-Sized base ``Dataset``; our
+    # concrete ``ProcessedOpenProteinSetDataset`` (and the fallback in tests)
+    # all define ``__len__`` so the cast is safe.
+    if len(cast(Sized, train_loader.dataset)) == 0:
         raise ValueError("Training split is empty. Check the processed cache paths and val_fraction.")
 
     val_loader = build_dataloader(
@@ -708,7 +725,7 @@ def fit(
         n_cycles=training_config.n_cycles,
         n_ensemble=training_config.n_ensemble,
     )
-    has_validation = data_config.val_fraction > 0.0 and len(val_loader.dataset) > 0
+    has_validation = data_config.val_fraction > 0.0 and len(cast(Sized, val_loader.dataset)) > 0
 
     model = AlphaFold2(model_config).to(device)
     pretrain_loss_fn = AlphaFoldLoss(finetune=False).to(device)
@@ -723,6 +740,14 @@ def fit(
     for epoch in range(1, training_config.epochs + 1):
         total_train_loss = 0.0
         total_train_examples = 0
+        # Initialised before the inner loop so an empty ``train_loader``
+        # still leaves ``current_lr`` bound when we build ``epoch_metrics``.
+        current_lr = learning_rate_at_step(
+            training_config,
+            global_step,
+            total_steps,
+            is_finetune=use_finetune_loss(training_config, global_step),
+        )
 
         for batch in train_loader:
             is_finetune = use_finetune_loss(training_config, global_step)

@@ -6,6 +6,22 @@ import torch
 from minalphafold.losses import AlphaFoldLoss
 from minalphafold.model import AlphaFold2
 from tests.test_data_pipeline import write_processed_cache
+
+
+def _linear(module: object) -> torch.nn.Linear:
+    """Narrow ``nn.Module.__getattr__`` → ``Tensor | Module`` down to ``nn.Linear``.
+
+    PyTorch's ``Module.__getattr__`` is typed as ``Tensor | Module`` so
+    chained attribute access like ``model.evoformer_blocks[0].msa_row_att
+    .linear_output`` comes out as a bare ``Module`` with no ``.weight`` /
+    ``.bias`` visible to the type checker. This helper asserts at runtime
+    that the target is an ``nn.Linear`` and returns the narrowed type —
+    stricter than a bare ``cast`` and no less compact.
+    """
+    assert isinstance(module, torch.nn.Linear), f"expected nn.Linear, got {type(module).__name__}"
+    return module
+
+
 from minalphafold.trainer import (
     alphafold2_model_config,
     build_optimizer,
@@ -82,36 +98,29 @@ def test_train_step_updates_model_parameters(tmp_path):
 
 
 def test_alphafold2_uses_canonical_constructor_initialization():
+    # ``get_submodule`` returns ``nn.Module`` directly — bypasses the
+    # ``Tensor | Module`` ambiguity of chained ``__getattr__`` on a
+    # ``ModuleList`` — so the helper ``_linear`` narrows the leaf cleanly.
     model = AlphaFold2(default_model_config())
 
-    assert torch.allclose(
-        model.evoformer_blocks[0].msa_row_att.linear_output.weight,
-        torch.zeros_like(model.evoformer_blocks[0].msa_row_att.linear_output.weight),
-    )
-    assert torch.allclose(
-        model.evoformer_blocks[0].msa_row_att.linear_gate.bias,
-        torch.ones_like(model.evoformer_blocks[0].msa_row_att.linear_gate.bias),
-    )
-    assert torch.allclose(
-        model.evoformer_blocks[0].triangle_mult_out.out_linear.weight,
-        torch.zeros_like(model.evoformer_blocks[0].triangle_mult_out.out_linear.weight),
-    )
-    assert torch.allclose(
-        model.evoformer_blocks[0].triangle_mult_out.gate.bias,
-        torch.ones_like(model.evoformer_blocks[0].triangle_mult_out.gate.bias),
-    )
-    assert torch.allclose(
-        model.input_embedder.linear_msa.bias,
-        torch.zeros_like(model.input_embedder.linear_msa.bias),
-    )
-    assert not torch.allclose(
-        model.input_embedder.linear_msa.weight,
-        torch.zeros_like(model.input_embedder.linear_msa.weight),
-    )
-    assert torch.allclose(
-        model.tm_score_head.linear.weight,
-        torch.zeros_like(model.tm_score_head.linear.weight),
-    )
+    row_output = _linear(model.get_submodule("evoformer_blocks.0.msa_row_att.linear_output"))
+    assert torch.allclose(row_output.weight, torch.zeros_like(row_output.weight))
+
+    row_gate = _linear(model.get_submodule("evoformer_blocks.0.msa_row_att.linear_gate"))
+    assert torch.allclose(row_gate.bias, torch.ones_like(row_gate.bias))
+
+    tmo_out = _linear(model.get_submodule("evoformer_blocks.0.triangle_mult_out.out_linear"))
+    assert torch.allclose(tmo_out.weight, torch.zeros_like(tmo_out.weight))
+
+    tmo_gate = _linear(model.get_submodule("evoformer_blocks.0.triangle_mult_out.gate"))
+    assert torch.allclose(tmo_gate.bias, torch.ones_like(tmo_gate.bias))
+
+    input_msa = _linear(model.get_submodule("input_embedder.linear_msa"))
+    assert torch.allclose(input_msa.bias, torch.zeros_like(input_msa.bias))
+    assert not torch.allclose(input_msa.weight, torch.zeros_like(input_msa.weight))
+
+    tm_head = _linear(model.get_submodule("tm_score_head.linear"))
+    assert torch.allclose(tm_head.weight, torch.zeros_like(tm_head.weight))
 
 
 def test_evaluate_returns_finite_mean_loss_without_gradients(tmp_path):

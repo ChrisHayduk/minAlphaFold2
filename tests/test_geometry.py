@@ -121,8 +121,11 @@ def test_atom14_to_rigid_group_frames_keep_masked_alternative_frames_canonical()
     _, _, group_exists, alt_rotations, alt_translations = atom14_to_rigid_group_frames(positions, mask, aatype)
 
     masked_groups = group_exists == 0
-    expected_rotations = torch.eye(3, dtype=alt_rotations.dtype).expand(masked_groups.sum().item(), -1, -1)
-    expected_translations = torch.zeros(masked_groups.sum().item(), 3, dtype=alt_translations.dtype)
+    # `.item()` is `Number`; `expand`/`zeros` need `int` — cast once so pyright
+    # sees a concrete int size.
+    num_masked_groups = int(masked_groups.sum().item())
+    expected_rotations = torch.eye(3, dtype=alt_rotations.dtype).expand(num_masked_groups, -1, -1)
+    expected_translations = torch.zeros(num_masked_groups, 3, dtype=alt_translations.dtype)
 
     assert torch.allclose(alt_rotations[masked_groups], expected_rotations, atol=1e-6)
     assert torch.allclose(alt_translations[masked_groups], expected_translations, atol=1e-6)

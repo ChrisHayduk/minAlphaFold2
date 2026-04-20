@@ -360,7 +360,7 @@ def _parse_resolution(
         "_reflns.d_resolution_high",
     ):
         raw_value = _first_tag_value(tag, scalars, loops)
-        if raw_value in {None, ".", "?"}:
+        if raw_value is None or raw_value in {".", "?"}:
             continue
         try:
             return float(raw_value)

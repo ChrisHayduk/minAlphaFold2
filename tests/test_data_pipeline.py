@@ -642,7 +642,8 @@ def test_alphafold_loss_uses_per_example_mask_normalization():
     mask = torch.tensor([[[1.0, 1.0]], [[1.0, 0.0]]], dtype=torch.float32)
 
     loss = loss_fn.msa_loss(logits, target, mask)
-    expected = torch.full((2,), torch.log(torch.tensor(23.0)))
+    # `torch.full(fill_value=...)` wants a Python scalar, not a 0-d tensor.
+    expected = torch.full((2,), float(torch.log(torch.tensor(23.0)).item()))
 
     assert torch.allclose(loss, expected, atol=1e-6)
 

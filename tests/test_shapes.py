@@ -5,6 +5,17 @@ import pytest
 import torch
 
 
+def _linear(module: object) -> torch.nn.Linear:
+    """Narrow ``nn.Module.__getattr__`` → ``Tensor | Module`` down to ``nn.Linear``.
+
+    Mirrors the helper in ``test_trainer`` — chained ``model.X.Y.linear``
+    accesses come out as bare ``Module`` to type checkers; this asserts
+    the concrete class and returns the narrowed type.
+    """
+    assert isinstance(module, torch.nn.Linear), f"expected nn.Linear, got {type(module).__name__}"
+    return module
+
+
 # ---------------------------------------------------------------------------
 # Mock config — small dims for fast CPU tests.
 # ---------------------------------------------------------------------------
@@ -804,8 +815,9 @@ class TestFrameComposition:
         angle_resnet = model.structure_model.sidechain_module.angle_resnet
 
         for block in angle_resnet.blocks:
-            assert torch.allclose(block.linear_2.weight, torch.zeros_like(block.linear_2.weight))
-            assert torch.allclose(block.linear_2.bias, torch.zeros_like(block.linear_2.bias))
+            linear_2 = _linear(block.linear_2)
+            assert torch.allclose(linear_2.weight, torch.zeros_like(linear_2.weight))
+            assert torch.allclose(linear_2.bias, torch.zeros_like(linear_2.bias))
 
     def test_structure_module_uses_configurable_position_scale(self, cfg):
         from minalphafold.residue_constants import restype_atom14_rigid_group_positions, restype_rigid_group_default_frame
@@ -832,7 +844,7 @@ class TestHeadZeroInit:
     def test_plddt_head_zero_init(self, cfg):
         from minalphafold.heads import PLDDTHead
         head = PLDDTHead(cfg)
-        final_linear = head.net[-1]
+        final_linear = _linear(head.net[-1])
         assert torch.allclose(final_linear.weight, torch.zeros_like(final_linear.weight))
 
     def test_masked_msa_head_zero_init(self, cfg):

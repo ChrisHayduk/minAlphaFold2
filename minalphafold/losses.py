@@ -520,7 +520,12 @@ class BackboneTrajectoryLoss(torch.nn.Module):
 
         num_layers = traj_R.shape[0]
         total_loss = torch.zeros(traj_R.shape[1], device=traj_R.device, dtype=traj_R.dtype)
-        valid_mask = backbone_mask if seq_mask is None else backbone_mask * seq_mask
+        if backbone_mask is None:
+            valid_mask = seq_mask
+        elif seq_mask is None:
+            valid_mask = backbone_mask
+        else:
+            valid_mask = backbone_mask * seq_mask
 
         for l in range(num_layers):
             clamped_fape = self.fape_loss(
@@ -1130,7 +1135,11 @@ class StructuralViolationLoss(torch.nn.Module):
     Used only during fine-tuning (eq 7 fine-tuning row).
     """
 
+    # Declaring registered buffers as class-level Tensor annotations lets type
+    # checkers see them as tensors rather than the parent ``Module``.
     vdw_table: torch.Tensor
+    distance_lower_bound_table: torch.Tensor
+    distance_upper_bound_table: torch.Tensor
 
     def __init__(
         self,

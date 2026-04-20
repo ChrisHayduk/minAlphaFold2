@@ -1,4 +1,12 @@
 {
+    "include": ["minalphafold", "scripts", "tests"],
+    "exclude": [
+        "**/__pycache__",
+        "**/.pytest_cache",
+        "artifacts",
+        "data"
+    ],
+    "extraPaths": ["scripts"],
     "pythonVersion": "3.13",
-    "extraPaths": ["minalphafold"]
+    "typeCheckingMode": "standard"
 }
