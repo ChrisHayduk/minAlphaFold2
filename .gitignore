@@ -222,3 +222,6 @@ scripts/autoresearch_overfit.py
 CLAUDE.md
 .DS_Store
 /.claude
+/data/openproteinset
+/data/processed_features
+/data/processed_labels
