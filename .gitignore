@@ -221,3 +221,4 @@ scripts/autoresearch_overfit.py
 *.pt
 CLAUDE.md
 .DS_Store
+/.claude
