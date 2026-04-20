@@ -379,6 +379,15 @@ class ExtraMsaStack(torch.nn.Module):
         return extra_msa_representation, pair_representation
 
 class MSAColumnGlobalAttention(torch.nn.Module):
+    """MSA global column-wise gated self-attention (Algorithm 19).
+
+    Per the supplement, only the query is per-head (q^h_si); the key and value
+    projections produce a single c-dim vector that is shared across heads
+    (k_si, v_si ∈ R^c, no h superscript). Sharing k/v across heads is what
+    makes this module "global" — sequences contribute the same K/V to every
+    head, and each head only differs in the mean-pooled query direction.
+    """
+
     def __init__(self, config, c_in: Optional[int] = None):
         super().__init__()
         self.c_in = config.c_s if c_in is None else c_in
@@ -389,9 +398,10 @@ class MSAColumnGlobalAttention(torch.nn.Module):
 
         self.total_dim = self.head_dim * self.num_heads
 
+        # q is per-head (total = num_heads * c); k and v are shared (total = c).
         self.linear_q = torch.nn.Linear(in_features=self.c_in, out_features=self.total_dim, bias=False)
-        self.linear_k = torch.nn.Linear(in_features=self.c_in, out_features=self.total_dim, bias=False)
-        self.linear_v = torch.nn.Linear(in_features=self.c_in, out_features=self.total_dim, bias=False)
+        self.linear_k = torch.nn.Linear(in_features=self.c_in, out_features=self.head_dim, bias=False)
+        self.linear_v = torch.nn.Linear(in_features=self.c_in, out_features=self.head_dim, bias=False)
 
         self.linear_gate = torch.nn.Linear(in_features=self.c_in, out_features=self.total_dim)
 
@@ -407,42 +417,50 @@ class MSAColumnGlobalAttention(torch.nn.Module):
         # msa_mask: (batch, N_seq, N_res) — 1 for valid, 0 for padding
         b, s, i, _ = msa_representation.shape
 
-        # K, V, G from per-sequence LN(x_si) (Algorithm 19)
+        # Alg 19 line 1: LayerNorm the MSA, then all downstream projections read from x_ln.
         x_ln = self.layer_norm_msa(msa_representation)  # (b, s, i, c_in)
-        K = self.linear_k(x_ln).reshape(b, s, i, self.num_heads, self.head_dim)
-        V = self.linear_v(x_ln).reshape(b, s, i, self.num_heads, self.head_dim)
-        G = torch.sigmoid(self.linear_gate(x_ln)).reshape(b, s, i, self.num_heads, self.head_dim)
 
+        # Alg 19 line 2: k_si, v_si ∈ R^c (shared across heads — no num_heads dim).
+        K = self.linear_k(x_ln)  # (b, s, i, c)
+        V = self.linear_v(x_ln)  # (b, s, i, c)
+
+        # Alg 19 line 3: q^h_si then q^h_i = mean_s q^h_si. Use a mask-aware
+        # mean so padded sequences don't dilute the query.
         Q_si = self.linear_q(x_ln).reshape(b, s, i, self.num_heads, self.head_dim)
         if msa_mask is not None:
             query_mask = msa_mask[..., None, None].to(Q_si.dtype)
             Q = (Q_si * query_mask).sum(dim=1) / query_mask.sum(dim=1).clamp(min=1.0)
         else:
-            Q = Q_si.mean(dim=1)
+            Q = Q_si.mean(dim=1)  # (b, i, h, c)
 
-        # Attention scores: (batch, N_seq, num_heads, N_res)
-        scores = torch.einsum('bihd, bsihd -> bshi', Q, K)
+        # Alg 19 line 4: g^h_si ∈ R^c (per-head gate).
+        G = torch.sigmoid(self.linear_gate(x_ln)).reshape(b, s, i, self.num_heads, self.head_dim)
+
+        # Alg 19 line 5: a^h_ti = softmax_t(1/sqrt(c) q^h_i^T k_ti). Since k is
+        # shared across heads, the einsum contracts only the channel dim.
+        # scores: (b, t, i, h) with t indexing sequences.
+        scores = torch.einsum('bihc, btic -> btih', Q, K)
         scores = scores / math.sqrt(self.head_dim)
 
-        # Mask key positions (sequence dim)
+        # Mask key positions (sequence dim t).
         if msa_mask is not None:
-            # msa_mask: (batch, N_seq, N_res) -> (batch, N_seq, 1, N_res)
-            mask_bias = (1.0 - msa_mask[:, :, None, :]) * (-1e9)
+            # msa_mask: (batch, N_seq, N_res) -> (batch, N_seq, N_res, 1)
+            mask_bias = (1.0 - msa_mask[:, :, :, None]) * (-1e9)
             scores = scores + mask_bias
 
-        # Softmax over sequences (dim=1)
+        # Softmax over sequences (dim=1).
         attention = torch.nn.functional.softmax(scores, dim=1)
 
-        # Weighted sum over sequences: (batch, N_res, num_heads, head_dim)
-        weighted = torch.einsum('bshi, bsihd -> bihd', attention, V)
+        # Alg 19 line 6: o^h_si = g^h_si ⊙ sum_t a^h_ti * v_ti. The weighted sum
+        # over t is the same for every s (it doesn't depend on s), so we compute
+        # it once and broadcast.
+        weighted = torch.einsum('btih, btic -> bihc', attention, V)  # (b, i, h, c)
+        weighted = weighted.unsqueeze(1)                              # (b, 1, i, h, c)
 
-        # Broadcast to all sequences: (batch, 1, N_res, num_heads, head_dim)
-        weighted = weighted.unsqueeze(1)
-
-        # Gate and project: G is (batch, N_seq, N_res, num_heads, head_dim)
+        # Apply the gate (broadcasting weighted across the sequence dim).
         output = self.linear_output((G * weighted).reshape(b, s, i, -1))
 
-        # Zero out padded positions
+        # Zero out padded positions.
         if msa_mask is not None:
             output = output * msa_mask[..., None]
 
@@ -811,19 +829,29 @@ class TriangleAttentionEndingNode(torch.nn.Module):
         # Shape (batch, N_res, N_res, self.num_heads)
         B = self.linear_bias(pair_representation)
 
-        # Q shape (batch, N_res_i, N_res_j, self.num_heads, self.head_dim)
-        # K shape (batch, N_res_k, N_res_j, self.num_heads, self.head_dim)
-        # B shape (batch, N_res, N_res, self.num_heads) — Algorithm 14 requires b_{k,i}
-        # Output shape (batch, N_res_i, N_res_j, N_res_k, self.num_heads)
+        # Algorithm 14 line 5: a_ijk^h = softmax_k(1/sqrt(c) q_ij^h . k_kj^h + b_ki^h).
+        # The highlighted differences from the starting-node version (Algorithm 13)
+        # are that keys/values are indexed (k, j) instead of (i, k), and the bias
+        # is b_{k,i} instead of b_{j,k}.
+        #
+        # Q shape (batch, N_res_i, N_res_j, num_heads, head_dim)
+        # K shape (batch, N_res_k, N_res_j, num_heads, head_dim)
+        # B shape (batch, N_res, N_res, num_heads), with B[b, i, j, h] coming from z_{ij}.
+        # Output shape (batch, N_res_i, N_res_j, N_res_k, num_heads)
 
         scores = torch.einsum('bijhd, bkjhd -> bijkh', Q, K)
-        # B.transpose(1,2): (b, k, i, h) -> unsqueeze(2): (b, k, 1, i, h) -> broadcasts to (b, i, j, k, h)
+        # We need B indexed as b^h_{k,i} at score position (b, i, j, k, h), i.e.
+        # B[b, k, i, h]. Swapping axes 1 and 2 of B yields a view whose indexing
+        # is B_t[b, x, y, h] = B[b, y, x, h], so B_t[b, i, k, h] = B[b, k, i, h].
+        # Inserting a new j-axis with unsqueeze(2) broadcasts that bias to every
+        # (i, j, k, h) score.
         scores = scores / math.sqrt(self.head_dim) + B.transpose(1, 2).unsqueeze(2)
 
-        # Apply pair mask to key positions (k dimension, for a given j)
+        # Apply pair mask to key positions: an attention score at (b, i, j, k, h)
+        # should be masked when the *key* pair z_{k,j} is padding, i.e. when
+        # pair_mask[b, k, j] == 0. Permute swaps the k/j axes so the view exposes
+        # [b, j, k], then broadcast over i and h.
         if pair_mask is not None:
-            # pair_mask: (batch, N_res, N_res) -> (batch, 1, N_res_j, N_res_k, 1)
-            # pair_mask[b,k,j] = valid -> permute to (batch, j, k) then reshape
             mask_bias = (1.0 - pair_mask.permute(0, 2, 1)[:, None, :, :, None]) * (-1e9)
             scores = scores + mask_bias
 

@@ -124,16 +124,17 @@ class MSARowAttentionWithPairBias(torch.nn.Module):
 
         pair_representation = self.layer_norm_pair(pair_representation)
 
+        # Algorithm 7 line 3: b_ij^h = LinearNoBias(LayerNorm(z_ij)).
         # Shape (batch, N_res, N_res, self.num_heads)
         B = self.linear_pair(pair_representation)
 
-        # Shape (batch, self.num_heads, N_res, N_res)
-        B = B.permute(0, 3, 1, 2)
+        # Align B's axes with the score tensor below: (batch, num_heads, i, j),
+        # then broadcast across the MSA sequence dim.
+        B = B.permute(0, 3, 1, 2)            # (batch, num_heads, N_res_i, N_res_j)
+        B = B.unsqueeze(1)                    # (batch, 1, num_heads, N_res_i, N_res_j)
 
-        # Shape (batch, 1, N_res, N_res, self.num_heads)
-        B = B.unsqueeze(1)
-
-        # Shape (batch, N_seq, self.num_heads, N_res, N_res)
+        # Algorithm 7 line 5: a_sij^h = softmax_j(1/sqrt(c) q_si^h . k_sj^h + b_ij^h)
+        # scores shape: (batch, N_seq, num_heads, N_res_i, N_res_j)
         scores = torch.einsum('bsihd, bsjhd -> bshij', Q, K)
         scores = scores / math.sqrt(self.head_dim) + B
 

@@ -752,8 +752,10 @@ class TestGradientFlow:
 
         preds = module(s, pair, aatype)
 
-        # Verify that the rotation trajectory has gradients only through
-        # the last layer (rotation.detach() is called for l < num_layers - 1)
+        # Algorithm 20 lines 19-21: rotations are detached at the end of
+        # every non-final iteration. Gradients from the final-layer rotation
+        # trajectory should still reach the input single representation via
+        # the scalar IPA/transition path, so s.grad must be populated.
         loss = preds["traj_rotations"][-1].sum()
         loss.backward()
         assert s.grad is not None

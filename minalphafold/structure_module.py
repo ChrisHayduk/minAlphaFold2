@@ -153,10 +153,13 @@ class StructureModule(torch.nn.Module):
                 aatype: torch.Tensor, seq_mask: Optional[torch.Tensor] = None,
                 detach_rotations: bool = True):
         # seq_mask: (batch, N_res) — 1 for valid residues, 0 for padding
-        # detach_rotations: if True (default, AF2 standard), stop gradients on
-        #   rotations between SM layers to prevent gradient explosion through
-        #   deep rotation composition. Set to False for memorization/debugging
-        #   to allow full gradient flow.
+        # detach_rotations: if True (default, AF2 standard), apply stopgrad to
+        #   the rotation component of T_i between iterations (Algorithm 20
+        #   lines 19-21). The detach is placed at the *end* of each non-final
+        #   iteration so that the next iteration's IPA sees T_i with no
+        #   rotation-gradient path, preventing lever effects through the
+        #   chained composition of frames. Set to False to allow full gradient
+        #   flow (useful for memorization/debugging).
         assert single_representation.ndim == 3, \
             f"single_representation must be (batch, N_res, c_s), got {single_representation.shape}"
         assert pair_representation.ndim == 4, \
@@ -185,10 +188,6 @@ class StructureModule(torch.nn.Module):
         sidechain_outputs = None
 
         for l in range(self.num_layers):
-            # Algorithm 20: stop gradients on rotations only between iterations
-            if detach_rotations and l < self.num_layers - 1:
-                rotations = rotations.detach()
-
             # Algorithm 20, line 6-7: s += IPA(s); s = LN(Dropout(s))
             s = s + self.IPA(s, pair_representation, rotations, translations, seq_mask)
             s = self.layer_norm_single_rep_3(self.dropout_1(s))
@@ -197,12 +196,13 @@ class StructureModule(torch.nn.Module):
             s = s + self.transition_linear_3(self.relu(self.transition_linear_2(self.relu(self.transition_linear_1(s)))))
             s = self.layer_norm_single_rep_2(self.dropout_2(s))
 
-            # Update backbone
+            # Algorithm 20, line 10: T_i ← T_i ∘ BackboneUpdate(s_i)
             new_rotations, new_translations = self.backbone_update(s)
-
             translations = torch.einsum('bsij, bsj -> bsi', rotations, new_translations) + translations
             rotations = torch.einsum('bsij, bsjk -> bsik', rotations, new_rotations)
 
+            # Algorithm 20, lines 11-18: side-chain torsions and auxiliary losses use
+            # the updated (un-detached) T_i so gradients reach this iteration's s.
             sidechain_outputs = self.sidechain_module(
                 s,
                 initial_single_representation,
@@ -219,6 +219,13 @@ class StructureModule(torch.nn.Module):
             all_translations.append(translations)
             all_torsion_angles.append(sidechain_outputs["angles_sin_cos"])
             all_torsion_angles_unnormalized.append(sidechain_outputs["unnormalized_angles_sin_cos"])
+
+            # Algorithm 20, lines 19-21: stopgrad on rotations between iterations
+            # (but not after the final one). Detaching *after* the backbone update
+            # means iteration l+1 receives the rotation without a gradient path,
+            # exactly as the supplement prescribes.
+            if detach_rotations and l < self.num_layers - 1:
+                rotations = rotations.detach()
 
         all_rotations = torch.stack(all_rotations)
         all_translations = torch.stack(all_translations)

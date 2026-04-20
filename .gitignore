@@ -220,3 +220,4 @@ scripts/autoresearch_overfit.py
 .tmp_openfold_loss.py
 *.pt
 CLAUDE.md
+.DS_Store

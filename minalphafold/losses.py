@@ -6,7 +6,6 @@ try:
     from .residue_constants import (
         between_res_bond_length_c_n, between_res_bond_length_stddev_c_n,
         between_res_cos_angles_c_n_ca, between_res_cos_angles_ca_c_n,
-        chi_angles_mask,
         make_atom14_dists_bounds,
         restype_atom14_vdw_radius,
     )
@@ -15,7 +14,6 @@ except ImportError:  # pragma: no cover - compatibility for direct module import
     from residue_constants import (
         between_res_bond_length_c_n, between_res_bond_length_stddev_c_n,
         between_res_cos_angles_c_n_ca, between_res_cos_angles_ca_c_n,
-        chi_angles_mask,
         make_atom14_dists_bounds,
         restype_atom14_vdw_radius,
     )
@@ -34,9 +32,28 @@ def frame_aligned_point_error(
     length_scale: float,
     pair_mask: Optional[torch.Tensor] = None,
     l1_clamp_distance: Optional[float] = None,
-    eps: float = 1e-8,
+    eps: float,
 ) -> torch.Tensor:
-    """AF2/OpenFold-style frame aligned point error."""
+    """Frame aligned point error (Algorithm 28, supplement 1.9.2).
+
+    Computes `L_FAPE = (1/Z) mean_{i,j}(min(d_clamp, d_ij))` where
+    `d_ij = sqrt(||T_i^{-1} ∘ x_j - T_i^{true -1} ∘ x_j^{true}||^2 + eps)`.
+
+    ε is a caller-supplied smoothing constant. Algorithm 20 uses ε = 10⁻¹²
+    for the per-layer auxiliary FAPE on Cα atoms (line 17) and ε = 10⁻⁴ for
+    the final all-atom FAPE (line 28); the paper notes the exact value does
+    not matter as long as it is small enough. `length_scale` is Z = 10 Å
+    (supplement 1.9.2). `l1_clamp_distance` is d_clamp = 10 Å when clamping
+    is requested (supplement 1.11.5).
+
+    Masks extend the paper to accommodate padded/variable-length batches:
+    `frames_mask` and `positions_mask` mark valid frames i and atoms j; the
+    optional `pair_mask` also masks specific (i, j) pairs. The denominator
+    is the number of valid (i, j) pairs — equal to `N_res^2` when nothing
+    is masked, matching the supplement's `mean_{i,j}`.
+    """
+
+    # Algorithm 28 lines 1-2: x_ij = T_i^{-1} ∘ x_j, with (R, t)^{-1} = (R^T, -R^T t).
     predicted_rotations_inv = predicted_rotations.transpose(-1, -2)
     predicted_translations_inv = -torch.einsum(
         "...ij,...j->...i",
@@ -59,30 +76,63 @@ def frame_aligned_point_error(
         + true_translations_inv[..., :, None, :]
     )
 
+    # Algorithm 28 line 3: d_ij = sqrt(||Δx||^2 + ε).
     error_distance = torch.sqrt(
         torch.sum((local_predicted_positions - local_true_positions) ** 2, dim=-1) + eps
     )
+
+    # Algorithm 28 line 4: min(d_clamp, d_ij) is equivalent to clamp(max=d_clamp)
+    # since d_ij ≥ 0 by construction.
     if l1_clamp_distance is not None:
-        error_distance = torch.clamp(error_distance, min=0.0, max=l1_clamp_distance)
+        error_distance = error_distance.clamp(max=l1_clamp_distance)
 
-    normalized_error = error_distance / length_scale
-    normalized_error = normalized_error * frames_mask[..., :, None]
-    normalized_error = normalized_error * positions_mask[..., None, :]
-
+    # mean_{i,j}(...) divided by length_scale Z. The mask zeros out (i, j)
+    # pairs where either the frame or atom is invalid (or the caller-provided
+    # pair_mask rejects the pair); the denominator counts just the surviving
+    # pairs, so un-masked inputs recover the paper's 1/N_res^2 normalisation.
+    mask = frames_mask[..., :, None] * positions_mask[..., None, :]
     if pair_mask is not None:
-        normalized_error = normalized_error * pair_mask
-        mask = frames_mask[..., :, None] * positions_mask[..., None, :] * pair_mask
-        return torch.sum(normalized_error, dim=(-1, -2)) / (eps + torch.sum(mask, dim=(-1, -2)))
+        mask = mask * pair_mask
 
-    normalized_error = torch.sum(normalized_error, dim=-1)
-    normalized_error = normalized_error / (eps + torch.sum(frames_mask, dim=-1))[..., None]
-    normalized_error = torch.sum(normalized_error, dim=-1)
-    normalized_error = normalized_error / (eps + torch.sum(positions_mask, dim=-1))
-    return normalized_error
+    numerator = (error_distance * mask).sum(dim=(-1, -2))
+    denominator = mask.sum(dim=(-1, -2)).clamp(min=1.0)
+    return numerator / (denominator * length_scale)
 
 
 class AlphaFoldLoss(torch.nn.Module):
-    def __init__(self, finetune = False, use_clamped_fape: Optional[float] = None):
+    """Combined AlphaFold loss (supplement 1.9 equation 7).
+
+    Training:
+        L = 0.5 L_FAPE + 0.5 L_aux + 0.3 L_dist + 2.0 L_msa + 0.01 L_conf
+    Fine-tuning:
+        L += 0.01 L_exp_resolved + 1.0 L_viol
+
+    Term-by-term mapping (all weights below are *absolute* eq 7 weights, not
+    relative fractions):
+
+    * `sidechain_weight_frac = 0.5` doubles as the weight of L_FAPE (final
+      all-atom FAPE, Algorithm 20 line 28) AND the weight on the FAPE half
+      of L_aux (backbone FAPE averaged over iterations, Algorithm 20 line 17).
+      We decompose `0.5 L_aux = 0.5 L_aux^{FAPE} + 0.5 L_aux^{torsion}` and
+      sum `0.5 L_FAPE + 0.5 L_aux^{FAPE}` directly.
+    * `distogram_weight = 0.3`   → 0.3 L_dist (supplement 1.9.8, eq 41).
+    * `msa_weight = 2.0`         → 2.0 L_msa  (supplement 1.9.9, eq 42).
+    * `confidence_weight = 0.01` → 0.01 L_conf (supplement 1.9.6, Alg 29).
+    * `experimentally_resolved_weight = 0.01` → 0.01 L_exp_resolved (1.9.10).
+    * `structural_violation_weight = 1.0` → 1.0 L_viol (1.9.11, eq 47).
+
+    `TorsionAngleLoss` pre-applies the outer 0.5 factor on L_aux^{torsion}
+    and the 0.02 coefficient on L_anglenorm from Algorithm 27, so
+    `weighted_torsion_loss = torsion_loss` without an additional weight.
+
+    `use_clamped_fape` implements supplement 1.11.5: in 90% of training
+    mini-batches the backbone FAPE is clamped by 10 Å, and unclamped in the
+    remaining 10%. Passing a float in [0, 1] mixes the two versions with
+    the given clamped weight; `None` defaults to fully clamped. The side-
+    chain FAPE is always clamped regardless, so this knob never reaches it.
+    """
+
+    def __init__(self, finetune: bool = False, use_clamped_fape: Optional[float] = None):
         super().__init__()
         self.torsion_angle_loss = TorsionAngleLoss()
         self.plddt_loss = PLDDTLoss(
@@ -101,9 +151,7 @@ class AlphaFoldLoss(torch.nn.Module):
         self.backbone_loss = BackboneTrajectoryLoss()
         self.sidechain_fape_loss = AllAtomFAPE()
 
-        # AF2 monomer head weights:
-        # training   = 0.5 L_FAPE + 0.5 L_aux + 0.3 L_dist + 2.0 L_msa + 0.01 L_conf
-        # finetuning = training + 0.01 L_exp_resolved + 1.0 L_viol
+        # Equation 7 weights, all absolute (not relative).
         self.sidechain_weight_frac = 0.5
         self.distogram_weight = 0.3
         self.msa_weight = 2.0
@@ -112,11 +160,7 @@ class AlphaFoldLoss(torch.nn.Module):
         self.structural_violation_weight = 1.0
 
         self.finetune = finetune
-        # use_clamped_fape: None = clamped only (AF2 initial training default)
-        # 0.0 = fully unclamped, 0.9 = 90% clamped + 10% unclamped (AF2 fine-tuning default)
         self.use_clamped_fape = use_clamped_fape
-        # coordinate_loss_weight: direct Cartesian MSE on atom14 positions (bypasses FAPE indirection)
-        self.coordinate_loss_weight = 0.0
 
     def forward(
             self,
@@ -249,6 +293,8 @@ class AlphaFoldLoss(torch.nn.Module):
             seq_mask=seq_mask,
             use_clamped_fape=self.use_clamped_fape,
         )
+        # Side-chain FAPE is always clamped (supplement 1.11.5); use_clamped_fape
+        # controls only the backbone FAPE trajectory loss above.
         sidechain_loss = self.sidechain_fape_loss(
             pred_all_frames_R,
             pred_all_frames_t,
@@ -260,54 +306,50 @@ class AlphaFoldLoss(torch.nn.Module):
             true_atom_mask=true_atom_mask,
             seq_mask=seq_mask,
             frame_mask=true_rigid_group_exists,
-            use_clamped_fape=self.use_clamped_fape,
         )
-        chi_loss = self.torsion_angle_loss(
+        torsion_loss = self.torsion_angle_loss(
             structure_model_prediction["traj_torsion_angles"],
             structure_model_prediction["traj_torsion_angles_unnormalized"],
             true_torsion_angles,
             true_torsion_angles_alt,
             true_torsion_mask,
-            res_types,
             seq_mask=seq_mask,
         )
 
-        # --- Derive distogram_true ---
-        # CB-CB distances (CA for GLY) binned into distance buckets
-        is_gly = (res_types == 7)  # (batch, N_res)
-        cb_idx = torch.where(is_gly, 1, 4)  # CA=1 for GLY, CB=4 otherwise
+        # --- Derive distogram target (supplement 1.9.8) ---
+        # Targets are the one-hot encoding of Cβ-Cβ distances (Cα for GLY).
+        is_gly = (res_types == 7)                       # (batch, N_res)
+        cb_idx = torch.where(is_gly, 1, 4)              # atom14 slots: CA=1, CB=4
         cb_pos = torch.gather(
             true_atom_positions, 2,
             cb_idx[:, :, None, None].expand(-1, -1, 1, 3),
-        ).squeeze(2)  # (batch, N_res, 3)
+        ).squeeze(2)
         n_dist_bins = distogram_pred.shape[-1]
-        cb_mask = torch.gather(
-            true_atom_mask, 2,
-            cb_idx[:, :, None],
-        ).squeeze(-1)
+        cb_mask = torch.gather(true_atom_mask, 2, cb_idx[:, :, None]).squeeze(-1)
         distogram_true = distance_bin(cb_pos, n_dist_bins)
         dist_pair_mask = cb_mask[:, :, None] * cb_mask[:, None, :]
         if seq_mask is not None:
             dist_pair_mask = dist_pair_mask * (seq_mask[:, :, None] * seq_mask[:, None, :])
 
         dist_loss = self.distogram_loss(distogram_pred, distogram_true, pair_mask=dist_pair_mask)
-
         msa_loss = self.msa_loss(masked_msa_pred, masked_msa_target, masked_msa_mask)
 
-        # --- Derive plddt_true ---
-        # Per-residue lDDT between predicted and true CA positions, then binned
+        # --- Derive pLDDT target (supplement 1.9.6) ---
+        # Compute per-residue lDDT-Cα of the prediction against ground truth,
+        # then discretise into 50 bins of width 2 (v_bins in Algorithm 29).
+        # lDDT-Cα is the mean over 4 thresholds (0.5, 1, 2, 4 Å) of the fraction
+        # of included Cα-Cα distance pairs that are preserved within tolerance.
+        # "Included" = pairs with d_true < 15 Å, excluding self.
         N_res = atom_coords.shape[1]
         with torch.no_grad():
-            pred_ca = atom_coords[:, :, 1, :]       # (batch, N_res, 3)
+            pred_ca = atom_coords[:, :, 1, :]                 # (batch, N_res, 3)
             true_ca = true_atom_positions[:, :, 1, :]
             true_ca_mask = true_atom_mask[:, :, 1]
-            true_ca_dists = torch.cdist(true_ca, true_ca)  # (batch, N_res, N_res)
+            true_ca_dists = torch.cdist(true_ca, true_ca)     # (batch, N_res, N_res)
             pred_ca_dists = torch.cdist(pred_ca, pred_ca)
-            # Include pairs within 15 Å in the true structure, exclude self
             inclusion = (true_ca_dists < 15.0).float() * (
                 1.0 - torch.eye(N_res, device=pred_ca.device).unsqueeze(0))
             inclusion = inclusion * (true_ca_mask[:, :, None] * true_ca_mask[:, None, :])
-            # Mask out padded residues from lDDT inclusion set
             if seq_mask is not None:
                 pair_valid = seq_mask[:, :, None] * seq_mask[:, None, :]  # (batch, N_res, N_res)
                 inclusion = inclusion * pair_valid
@@ -331,30 +373,19 @@ class AlphaFoldLoss(torch.nn.Module):
             resolution=resolution,
         )
 
+        # Equation 7, training row. `backbone_loss` is L_aux^{FAPE} = mean_l(FAPE^l);
+        # `sidechain_loss` is L_FAPE (all-atom, final layer); `torsion_loss` already
+        # bundles 0.5 * L_aux^{torsion} + 0.01 * L_aux^{anglenorm} per Algorithm 27
+        # and the L_aux factor from equation 7.
         weighted_backbone_loss = (1.0 - self.sidechain_weight_frac) * backbone_loss
         weighted_sidechain_fape_loss = self.sidechain_weight_frac * sidechain_loss
-        weighted_chi_loss = chi_loss
+        weighted_torsion_loss = torsion_loss
         fape_loss = weighted_backbone_loss + weighted_sidechain_fape_loss
-        structure_loss = fape_loss + weighted_chi_loss
+        structure_loss = fape_loss + weighted_torsion_loss
         weighted_distogram_loss = self.distogram_weight * dist_loss
         weighted_msa_loss = self.msa_weight * msa_loss
         weighted_plddt_loss = self.confidence_weight * plddt_loss
         loss = structure_loss + weighted_distogram_loss + weighted_msa_loss + weighted_plddt_loss
-
-        # Direct Cartesian coordinate loss — bypasses FAPE frame indirection
-        if self.coordinate_loss_weight > 0:
-            combined_mask = atom_mask
-            if true_atom_mask is not None:
-                combined_mask = combined_mask * true_atom_mask
-            if seq_mask is not None:
-                combined_mask = combined_mask * seq_mask[:, :, None]
-            coord_error = torch.sum((atom_coords - true_atom_positions) ** 2, dim=-1)  # (b, N, 14)
-            coord_loss = (coord_error * combined_mask).sum(dim=(1, 2)) / combined_mask.sum(dim=(1, 2)).clamp(min=1)
-            weighted_coord_loss = self.coordinate_loss_weight * coord_loss
-            loss = loss + weighted_coord_loss
-        else:
-            coord_loss = atom_coords.new_zeros(atom_coords.shape[0])
-            weighted_coord_loss = coord_loss
 
         loss_terms = {
             "loss": loss,
@@ -362,18 +393,16 @@ class AlphaFoldLoss(torch.nn.Module):
             "fape_loss": fape_loss,
             "backbone_loss": backbone_loss,
             "sidechain_fape_loss": sidechain_loss,
-            "chi_loss": chi_loss,
+            "torsion_loss": torsion_loss,
             "distogram_loss": dist_loss,
             "msa_loss": msa_loss,
             "plddt_loss": plddt_loss,
-            "coordinate_loss": coord_loss,
             "weighted_backbone_loss": weighted_backbone_loss,
             "weighted_sidechain_fape_loss": weighted_sidechain_fape_loss,
-            "weighted_chi_loss": weighted_chi_loss,
+            "weighted_torsion_loss": weighted_torsion_loss,
             "weighted_distogram_loss": weighted_distogram_loss,
             "weighted_msa_loss": weighted_msa_loss,
             "weighted_plddt_loss": weighted_plddt_loss,
-            "weighted_coordinate_loss": weighted_coord_loss,
         }
 
         if self.finetune:
@@ -403,6 +432,19 @@ class AlphaFoldLoss(torch.nn.Module):
         return loss_terms
     
 class BackboneTrajectoryLoss(torch.nn.Module):
+    """Per-iteration backbone FAPE averaged over layers (L_aux^{FAPE}).
+
+    Algorithm 20 emits backbone frames at every iteration l ∈ [1, N_layer];
+    line 17 computes a Cα-only FAPE against ground truth on each iteration
+    and line 23 averages them to yield the FAPE component of L_aux.
+
+    `use_clamped_fape ∈ [0, 1]` (supplement 1.11.5): weight of the clamped
+    FAPE in a soft mix with the unclamped version. `None` ≡ 1.0 (fully
+    clamped). AlphaFold samples 10% of mini-batches to be fully unclamped,
+    so the expected loss per batch has ≈0.9 weight on the clamped form;
+    passing `use_clamped_fape=0.9` reproduces that expectation directly.
+    """
+
     def __init__(self):
         super().__init__()
         self.fape_loss = BackboneFAPE()
@@ -449,6 +491,9 @@ class BackboneTrajectoryLoss(torch.nn.Module):
                     clamped_fape * use_clamped_fape + unclamped_fape * (1.0 - use_clamped_fape)
                 )
 
+        # Algorithm 20 line 23: L_aux = mean_l(L_aux^l). This returns just the
+        # FAPE component; the torsion component is added separately by the
+        # caller as TorsionAngleLoss.
         return total_loss / num_layers
 
 
@@ -460,6 +505,21 @@ def select_best_atom14_ground_truth(
     true_atom_mask_alt: torch.Tensor,
     true_atom_is_ambiguous: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Rename 180°-symmetric ground-truth atoms (Algorithm 26).
+
+    Some residues (ASP/GLU/PHE/TYR — see Table 3) are symmetric under a 180°
+    flip around their side-chain torsion axis, which makes the naming of
+    their terminal atoms ambiguous. For each residue i we pick the naming
+    (either "true" or "alt truth") that minimises the |pred - true| distance
+    sum over pairs (a, (j, b)) where a is ambiguous in residue i and (j, b)
+    is a non-ambiguous atom elsewhere — matching Algorithm 26 line 5.
+
+    Paper asymmetry: `d^{alt truth}_{(i,a),(j,b)} = ||x_i^{alt truth,a} -
+    x_j^{true,b}||` uses alt positions only on the i side. We compute
+    pairwise distances from `true_atom_positions_alt` on both sides, which
+    agrees with the paper because the j-side (b) is masked to non-ambiguous
+    atoms where `alt == true` anyway.
+    """
     batch_size, num_residues, num_atoms = predicted_atom_positions.shape[:3]
 
     def pairwise_distances(atom14_positions: torch.Tensor) -> torch.Tensor:
@@ -471,9 +531,12 @@ def select_best_atom14_ground_truth(
     true_dists = pairwise_distances(true_atom_positions)
     alt_true_dists = pairwise_distances(true_atom_positions_alt)
 
+    # |d - d^true| vs |d - d^{alt truth}| per Algorithm 26 line 5.
     error = torch.sqrt(1e-10 + (pred_dists - true_dists) ** 2)
     alt_error = torch.sqrt(1e-10 + (pred_dists - alt_true_dists) ** 2)
 
+    # Restrict sums to pairs with (i, a) ambiguous and (j, b) non-ambiguous
+    # (S_non-ambiguous atoms in the paper), per Algorithm 26 line 5's quantifier.
     ambiguity_mask = (
         true_atom_mask[:, :, None, :, None]
         * true_atom_is_ambiguous[:, :, None, :, None]
@@ -483,6 +546,8 @@ def select_best_atom14_ground_truth(
 
     per_res_error = torch.sum(ambiguity_mask * error, dim=(2, 3, 4))
     per_res_alt_error = torch.sum(ambiguity_mask * alt_error, dim=(2, 3, 4))
+
+    # Algorithm 26 lines 5-7: swap truth ↔ alt for residues where alt fits better.
     use_alt = (per_res_alt_error < per_res_error).to(true_atom_positions.dtype)
     chosen_positions = torch.where(
         use_alt[..., None, None] > 0,
@@ -497,15 +562,28 @@ def select_best_atom14_ground_truth(
     return chosen_positions, chosen_mask, use_alt
 
 class TorsionAngleLoss(torch.nn.Module):
-    chi_mask_table: torch.Tensor
+    """Side-chain and backbone torsion angle loss (Algorithm 27).
+
+    Scores all 7 torsions f ∈ {ω, φ, ψ, χ1, χ2, χ3, χ4} per the supplement.
+    Validity of each torsion is carried by `torsion_mask_true` (shape
+    [..., 7]): ω/φ are undefined for the first residue, χ1..χ4 existence
+    depends on residue type, and any torsion whose atoms are missing in the
+    ground truth is masked out. See `geometry.torsion_angles` for how the
+    mask is built from atom14 data.
+
+    The min-of-(true, alt_true) term in line 3 handles 180°-rotation symmetry
+    for ASP/GLU/PHE/TYR; for all other torsions alt_true == true, so the
+    minimum reduces to the plain L2 term.
+
+    Both `torsion_weight` and `angle_norm_weight` pre-apply the outer 0.5
+    factor that equation (7) multiplies L_aux by: they are (1.0, 0.02) from
+    Algorithm 27 times 0.5, i.e. (0.5, 0.01). Keeping the pre-multiplication
+    here lets `AlphaFoldLoss` add the returned value directly.
+    """
 
     def __init__(self):
         super().__init__()
-        self.register_buffer(
-            "chi_mask_table",
-            torch.tensor(chi_angles_mask + [[0.0, 0.0, 0.0, 0.0]], dtype=torch.float32),
-        )
-        self.chi_weight = 0.5
+        self.torsion_weight = 0.5
         self.angle_norm_weight = 0.01
 
     def forward(
@@ -515,29 +593,33 @@ class TorsionAngleLoss(torch.nn.Module):
         torsion_angles_true: torch.Tensor,
         torsion_angles_true_alt: torch.Tensor,
         torsion_mask_true: torch.Tensor,
-        res_types: torch.Tensor,
         seq_mask: Optional[torch.Tensor] = None,
     ):
+        # Prepend the per-layer trajectory dim if only the final iteration was
+        # passed (Algorithm 20 averages L_aux over layers; the normalization
+        # below sums across L so a single layer broadcasts as L=1).
         if torsion_angles.ndim == 4:
             torsion_angles = torsion_angles.unsqueeze(0)
             unnormalized_torsion_angles = unnormalized_torsion_angles.unsqueeze(0)
 
-        pred_chi = torsion_angles[..., 3:, :]
-        true_chi = torsion_angles_true.unsqueeze(0)[..., 3:, :]
-        true_chi_alt = torsion_angles_true_alt.unsqueeze(0)[..., 3:, :]
-        chi_mask = self.chi_mask_table[res_types.long()].to(torsion_angles.dtype).unsqueeze(0)
-        torsion_mask = chi_mask * torsion_mask_true.unsqueeze(0)[..., 3:]
-
+        true_angles = torsion_angles_true.unsqueeze(0)
+        true_alt = torsion_angles_true_alt.unsqueeze(0)
+        mask = torsion_mask_true.unsqueeze(0)  # (1, b, N_res, 7)
         if seq_mask is not None:
-            torsion_mask = torsion_mask * seq_mask.unsqueeze(0).unsqueeze(-1)
+            mask = mask * seq_mask.unsqueeze(0).unsqueeze(-1)
 
-        true_dist_sq = torch.sum((true_chi - pred_chi) ** 2, dim=-1)
-        alt_true_dist_sq = torch.sum((true_chi_alt - pred_chi) ** 2, dim=-1)
-        torsion_dist_sq = torch.minimum(true_dist_sq, alt_true_dist_sq)
+        # Algorithm 27 line 3: L_torsion = mean_{i,f} min(||α̂ - α_true||², ||α̂ - α_alt||²).
+        true_dist_sq = torch.sum((true_angles - torsion_angles) ** 2, dim=-1)
+        alt_dist_sq = torch.sum((true_alt - torsion_angles) ** 2, dim=-1)
+        torsion_dist_sq = torch.minimum(true_dist_sq, alt_dist_sq)
 
-        torsion_normalizer = torsion_mask.sum(dim=(0, 2, 3)).clamp(min=1.0)
-        torsion_loss = torch.sum(torsion_dist_sq * torsion_mask, dim=(0, 2, 3)) / torsion_normalizer
+        torsion_normalizer = mask.sum(dim=(0, 2, 3)).clamp(min=1.0)
+        torsion_loss = torch.sum(torsion_dist_sq * mask, dim=(0, 2, 3)) / torsion_normalizer
 
+        # Algorithm 27 line 4: L_anglenorm = mean_{i,f} |||α_tilde_i^f|| - 1|.
+        # Covers all 7 torsions regardless of mask — this regulariser keeps the
+        # raw network output close to unit norm before the α̂ = α̃ / ||α̃||
+        # normalization, independent of whether the torsion is supervised.
         angle_norm = torch.sqrt(torch.sum(unnormalized_torsion_angles ** 2, dim=-1) + 1e-8)
         if seq_mask is not None:
             angle_norm_mask = seq_mask.unsqueeze(0).unsqueeze(-1).expand_as(angle_norm)
@@ -546,10 +628,21 @@ class TorsionAngleLoss(torch.nn.Module):
         norm_normalizer = angle_norm_mask.sum(dim=(0, 2, 3)).clamp(min=1.0)
         angle_norm_loss = torch.sum(torch.abs(angle_norm - 1.0) * angle_norm_mask, dim=(0, 2, 3)) / norm_normalizer
 
-        return self.chi_weight * torsion_loss + self.angle_norm_weight * angle_norm_loss
+        return self.torsion_weight * torsion_loss + self.angle_norm_weight * angle_norm_loss
     
 class BackboneFAPE(torch.nn.Module):
-    def __init__(self, d_clamp=10.0, eps=1e-4, Z=10.0):
+    """Auxiliary backbone FAPE (Algorithm 20 line 17).
+
+    Scores per-iteration backbone frames against the ground-truth backbone
+    frames, using the frame translations (Cα positions) as the atoms. Runs
+    inside `BackboneTrajectoryLoss`, which averages over Structure Module
+    iterations to realise `L_aux^{FAPE} = mean_l(L_FAPE^l)` from Algorithm
+    20 lines 17 and 23.
+
+    Uses ε = 10⁻¹² per Algorithm 20 line 17; Z = d_clamp = 10 Å.
+    """
+
+    def __init__(self, d_clamp: float = 10.0, eps: float = 1e-12, Z: float = 10.0):
         super().__init__()
         self.eps = eps
         self.d_clamp_val = d_clamp
@@ -565,6 +658,8 @@ class BackboneFAPE(torch.nn.Module):
                 pair_mask: Optional[torch.Tensor] = None,  # (b, N_res, N_res)
                 l1_clamp_distance: Optional[float] = None,
     ):
+        # The frames and the atoms are the same objects: backbone frames'
+        # translations *are* the Cα positions (Algorithm 20 lines 15-16).
         return frame_aligned_point_error(
             predicted_rotations,
             predicted_translations,
@@ -580,8 +675,20 @@ class BackboneFAPE(torch.nn.Module):
             eps=self.eps,
         )
 
+
 class AllAtomFAPE(torch.nn.Module):
-    def __init__(self, d_clamp=10.0, eps=1e-4, Z=10.0):
+    """Final all-atom FAPE (Algorithm 20 line 28).
+
+    Scores the 8 per-residue rigid-group frames (3 backbone + 4 side-chain
+    torsion frames + ψ frame, see Table 2) against all 14 atom positions of
+    every residue after the symmetric-ground-truth renaming of Algorithm 26.
+
+    Per supplement 1.11.5, the side-chain FAPE is *always* clamped by
+    d_clamp = 10 Å (unlike the backbone FAPE, which is unclamped in 10% of
+    mini-batches). Uses ε = 10⁻⁴ per Algorithm 20 line 28.
+    """
+
+    def __init__(self, d_clamp: float = 10.0, eps: float = 1e-4, Z: float = 10.0):
         super().__init__()
         self.eps = eps
         self.d_clamp_val = d_clamp
@@ -591,79 +698,73 @@ class AllAtomFAPE(torch.nn.Module):
                 predicted_frames_R,       # (b, N_res, 8, 3, 3)
                 predicted_frames_t,       # (b, N_res, 8, 3)
                 predicted_atom_positions, # (b, N_res, 14, 3)
-                atom_mask,                # (b, N_res, 14)
+                atom_mask,                # (b, N_res, 14) — predicted atom existence
                 true_frames_R,            # (b, N_res, 8, 3, 3)
                 true_frames_t,            # (b, N_res, 8, 3)
                 true_atom_positions,      # (b, N_res, 14, 3)
                 true_atom_mask: Optional[torch.Tensor] = None,  # (b, N_res, 14)
-                seq_mask: Optional[torch.Tensor] = None,  # (b, N_res)
-                frame_mask: Optional[torch.Tensor] = None,  # (b, N_res, 8)
-                rigid_group_mask: Optional[torch.Tensor] = None,  # (21, 8)
-                aatype: Optional[torch.Tensor] = None,  # (b, N_res)
-                use_clamped_fape: Optional[float] = None,
+                seq_mask: Optional[torch.Tensor] = None,       # (b, N_res)
+                frame_mask: Optional[torch.Tensor] = None,     # (b, N_res, 8)
     ):
         b, N_res, n_frames = predicted_frames_R.shape[:3]
         n_atoms = predicted_atom_positions.shape[2]
 
-        # Flatten rigid-group frames and atoms.
+        # Flatten per-residue rigid groups and atoms into a single list of
+        # frames / atoms so FAPE scores every (frame, atom) pair, as required
+        # by Algorithm 20 line 28's `mean_{i,j}` over the full structure.
         pred_R = predicted_frames_R.reshape(b, N_res * n_frames, 3, 3)
         pred_t = predicted_frames_t.reshape(b, N_res * n_frames, 3)
         true_R = true_frames_R.reshape(b, N_res * n_frames, 3, 3)
         true_t = true_frames_t.reshape(b, N_res * n_frames, 3)
-
-        # Flatten atoms: (b, N_res*14, 3) and mask: (b, N_res*14)
         pred_pos = predicted_atom_positions.reshape(b, N_res * n_atoms, 3)
         true_pos = true_atom_positions.reshape(b, N_res * n_atoms, 3)
+
         flat_atom_mask = atom_mask.reshape(b, N_res * n_atoms)
         if true_atom_mask is not None:
             flat_atom_mask = flat_atom_mask * true_atom_mask.reshape(b, N_res * n_atoms)
 
-        # Per-residue-type rigid group existence mask
-        if frame_mask is not None:
-            group_mask = frame_mask.to(predicted_frames_R.dtype)
-        elif rigid_group_mask is not None and aatype is not None:
-            group_mask = rigid_group_mask[aatype.long()]  # (b, N_res, 8)
-        else:
-            group_mask = predicted_frames_R.new_ones(b, N_res, n_frames)
+        group_mask = (
+            frame_mask.to(predicted_frames_R.dtype)
+            if frame_mask is not None
+            else predicted_frames_R.new_ones(b, N_res, n_frames)
+        )
 
-        # Combine atom_mask and frame mask with seq_mask for padded residues
+        # Fold the residue-level seq_mask into both the per-atom mask and
+        # per-frame mask so padded residues do not contribute.
         if seq_mask is not None:
             seq_atom_mask = seq_mask[:, :, None].expand(-1, -1, n_atoms).reshape(b, N_res * n_atoms)
             flat_atom_mask = flat_atom_mask * seq_atom_mask
-            frame_mask = (seq_mask[:, :, None] * group_mask).reshape(b, N_res * n_frames)
+            flat_frame_mask = (seq_mask[:, :, None] * group_mask).reshape(b, N_res * n_frames)
         else:
-            frame_mask = group_mask.reshape(b, N_res * n_frames)
+            flat_frame_mask = group_mask.reshape(b, N_res * n_frames)
 
-        fape_args = dict(
+        return frame_aligned_point_error(
             predicted_rotations=pred_R,
             predicted_translations=pred_t,
             true_rotations=true_R,
             true_translations=true_t,
             predicted_positions=pred_pos,
             true_positions=true_pos,
-            frames_mask=frame_mask,
+            frames_mask=flat_frame_mask,
             positions_mask=flat_atom_mask,
             length_scale=self.Z,
+            # Supplement 1.11.5: side-chain FAPE is always clamped.
+            l1_clamp_distance=self.d_clamp_val,
             eps=self.eps,
         )
 
-        if use_clamped_fape is None:
-            return frame_aligned_point_error(
-                **fape_args,
-                l1_clamp_distance=self.d_clamp_val,
-            )
-
-        clamped = frame_aligned_point_error(
-            **fape_args,
-            l1_clamp_distance=self.d_clamp_val,
-        )
-        unclamped = frame_aligned_point_error(
-            **fape_args,
-            l1_clamp_distance=None,
-        )
-        return clamped * use_clamped_fape + unclamped * (1.0 - use_clamped_fape)
-
 class PLDDTLoss(torch.nn.Module):
+    """Model-confidence loss L_conf (supplement 1.9.6, Algorithm 29 line 4).
+
+    Cross-entropy between the predicted pLDDT distribution (from Algorithm 29
+    lines 1-2) and the one-hot discretisation of the per-residue true lDDT-Cα
+    score into 50 bins of width 2. The true lDDT-Cα is computed in
+    `AlphaFoldLoss.compute_loss_terms`, this module just performs the CE.
+
+    `filter_by_resolution` zeros the loss on examples whose crystal-structure
+    resolution falls outside [0.1 Å, 3.0 Å] per supplement 1.9.6.
+    """
+
     def __init__(
         self,
         *,
@@ -683,12 +784,12 @@ class PLDDTLoss(torch.nn.Module):
         seq_mask: Optional[torch.Tensor] = None,
         resolution: Optional[torch.Tensor] = None,
     ):
-        # pred_plddt, true_plddt: (batch, N_res, n_plddt_bins)
-        # seq_mask: (batch, N_res) — 1 for valid residues, 0 for padding
-
+        # pred_plddt, true_plddt: (batch, N_res, n_plddt_bins), latter one-hot.
         log_pred = torch.log_softmax(pred_plddt, dim=-1)
 
-        # Per-residue cross-entropy: (batch, N_res)
+        # Algorithm 29 line 4: L_conf = mean_i(p_i^{true LDDT T} · log p_i^pLDDT).
+        # (The published formula omits the minus sign; cross-entropy is a
+        # negative log-likelihood, hence the sign here.)
         conf_loss = -torch.einsum('bic, bic -> bi', true_plddt, log_pred)
 
         if seq_mask is not None:
@@ -710,35 +811,55 @@ class PLDDTLoss(torch.nn.Module):
             conf_loss = conf_loss * in_range
 
         return conf_loss
-    
+
+
 class DistogramLoss(torch.nn.Module):
+    """Distogram cross-entropy L_dist (supplement 1.9.8 equation 41).
+
+        L_dist = -1/N_res^2 Σ_{i,j} Σ_b y_{ij}^b log p_{ij}^b
+
+    where p_{ij}^b comes from the distogram head applied to the symmetrised
+    pair representation and y_{ij}^b is the one-hot encoding of the true
+    Cβ-Cβ distance (Cα for glycine) into 64 equal-width bins covering 2-22 Å,
+    with the final bin catching anything more distant. Target construction
+    lives in `AlphaFoldLoss.compute_loss_terms`.
+
+    When `pair_mask` masks padded residues, the denominator is the number of
+    *valid* pairs rather than `N_res^2` so variable-length batches behave
+    sensibly; on a full un-padded crop the two agree.
+    """
+
     def __init__(self):
         super().__init__()
 
     def forward(self, pred_distograms: torch.Tensor, true_distograms: torch.Tensor,
                 pair_mask: Optional[torch.Tensor] = None):
         # input shapes: (batch, N_res, N_res, num_dist_buckets)
-
         log_pred = torch.log_softmax(pred_distograms, dim=-1)
-
         vals = torch.einsum('bijc, bijc -> bij', true_distograms, log_pred)
         if pair_mask is not None:
             vals = vals * pair_mask
             dist_loss = -vals.sum(dim=(1, 2)) / pair_mask.sum(dim=(1, 2)).clamp(min=1)
         else:
-            dist_loss = - torch.mean(vals, dim=(1,2))
-
+            dist_loss = -torch.mean(vals, dim=(1, 2))
         return dist_loss
 
+
 class MSALoss(torch.nn.Module):
+    """Masked MSA cross-entropy L_msa (supplement 1.9.9 equation 42).
+
+        L_msa = -1/N_mask Σ_{(s,i)∈mask} Σ_{c=1}^{23} y_{si}^c log p_{si}^c
+
+    23 classes = 20 amino acids + unknown + gap + mask token (supplement
+    1.9.9). Only positions selected by the BERT-style MSA masking
+    contribute, and the sum is divided by the number of masked positions.
+    """
+
     def __init__(self):
         super().__init__()
 
     def forward(self, msa_preds: torch.Tensor, msa_true: torch.Tensor, masked_msa_mask: torch.Tensor):
-        # msa_preds: (batch, N_seq, N_res, n_msa_classes) — raw logits
-        # msa_true:  (batch, N_seq, N_res, n_msa_classes) — one-hot targets
-        # masked_msa_mask:  (batch, N_seq, N_res) or (N_seq, N_res)
-
+        # msa_preds: (batch, N_seq, N_res, 23) logits; msa_true: one-hot targets.
         log_pred = torch.log_softmax(msa_preds, dim=-1)
 
         # Per-position cross-entropy: (batch, N_seq, N_res)
@@ -749,13 +870,29 @@ class MSALoss(torch.nn.Module):
             mask = mask.unsqueeze(0)
         ce = ce * mask
 
-        # Average over masked positions only
+        # Mean over masked positions only (eq 42: 1/N_mask).
         N_mask = torch.sum(mask, dim=(1, 2)).clamp(min=1)
         msa_loss = torch.sum(ce, dim=(1, 2)) / N_mask
-
         return msa_loss
-    
+
+
 class ExperimentallyResolvedLoss(torch.nn.Module):
+    """Experimentally-resolved loss L_exp_resolved (supplement 1.9.10 eq 43).
+
+        L_exp_resolved = mean_{(i,a)} (
+            -y_i^a log p_i^{exp resolved,a}
+            -(1 - y_i^a) log(1 - p_i^{exp resolved,a}))
+
+    Binary cross-entropy per (residue, atom37) slot predicting whether that
+    atom was resolved in the crystal structure. Only used during fine-tuning
+    (eq 7 fine-tuning row) and only on examples with resolution in
+    [0.1 Å, 3.0 Å] (1.9.10).
+
+    The `atom37_exists` mask restricts the mean to atom slots that are
+    defined for the residue type — slots that do not exist (e.g. χ atoms on
+    ALA) would otherwise inject meaningless BCE terms.
+    """
+
     def __init__(
         self,
         *,
@@ -775,7 +912,6 @@ class ExperimentallyResolvedLoss(torch.nn.Module):
         atom37_exists: torch.Tensor,
         resolution: Optional[torch.Tensor] = None,
     ):
-        # Canonical AF2 semantics: predict atom37 resolution, mask BCE by atom existence.
         xent = torch.nn.functional.binary_cross_entropy_with_logits(
             exp_resolved_preds,
             exp_resolved_true,
@@ -798,8 +934,30 @@ class ExperimentallyResolvedLoss(torch.nn.Module):
             loss = loss * in_range
 
         return loss
-    
+
+
+
 class StructuralViolationLoss(torch.nn.Module):
+    """Structural-violation loss L_viol (supplement 1.9.11 equations 44-47).
+
+        L_viol = L_bondlength + L_bondangle + L_clash        (eq 47)
+
+    * `L_bondlength` (eq 44): flat-bottom L1 on inter-residue C-N peptide
+      bond lengths relative to literature values, tolerance 12 σ_lit.
+    * `L_bondangle` (eq 45): flat-bottom L1 on the cosine of each peptide
+      bond angle (CA-C-N and C-N-CA) against literature, tolerance 12 σ_lit.
+      Supplement 1.9.11 describes a single bond-angle term; we sum the two
+      peptide-bond angles, which is a sum of two paper-faithful flat-bottom
+      L1 terms and matches what the DeepMind reference releases compute.
+    * `L_clash` (eq 46): one-sided flat-bottom on VDW overlaps between
+      non-bonded heavy atoms with tolerance 1.5 Å. Split into between- and
+      within-residue halves for memory, averaged per atom so the term sits
+      at a sane scale relative to L_bondlength / L_bondangle (eq 7 applies
+      an absolute weight of 1.0 to L_viol).
+
+    Used only during fine-tuning (eq 7 fine-tuning row).
+    """
+
     vdw_table: torch.Tensor
 
     def __init__(

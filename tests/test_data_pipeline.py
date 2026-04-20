@@ -868,7 +868,18 @@ def test_build_supervision_round_trips_into_exact_structure_targets():
         seq_mask=torch.ones((1, len(sequence)), dtype=torch.float32),
     )
 
-    expected_minimum = torch.tensor([0.0010], dtype=torch.float32)
-    assert torch.allclose(loss_terms["backbone_loss"], expected_minimum, atol=5e-4)
-    assert torch.allclose(loss_terms["sidechain_fape_loss"], expected_minimum, atol=5e-4)
+    # With predictions matching the supervision targets, each FAPE d_ij
+    # collapses to sqrt(eps) / Z. BackboneFAPE uses eps=1e-12 per Algorithm
+    # 20 line 17 (sqrt ≈ 1e-6, /Z=10 ≈ 1e-7); AllAtomFAPE uses eps=1e-4 per
+    # Algorithm 20 line 28 (sqrt=1e-2, /Z=10 ≈ 1e-3).
+    assert torch.allclose(
+        loss_terms["backbone_loss"],
+        torch.tensor([1e-7], dtype=torch.float32),
+        atol=5e-7,
+    )
+    assert torch.allclose(
+        loss_terms["sidechain_fape_loss"],
+        torch.tensor([0.0010], dtype=torch.float32),
+        atol=5e-4,
+    )
     assert float(loss_terms["structure_loss"].item()) < 0.01

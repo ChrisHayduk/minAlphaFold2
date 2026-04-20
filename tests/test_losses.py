@@ -38,14 +38,16 @@ def test_all_atom_fape_matches_joint_masked_mean():
     atom_mask = torch.zeros((1, 2, 14), dtype=torch.float32)
     true_atom_mask = torch.zeros_like(atom_mask)
     seq_mask = torch.tensor([[1.0, 1.0]], dtype=torch.float32)
-    rigid_group_mask = torch.tensor(
+    # Rigid-group existence: only frames 0 (backbone) and 1 (ω→bb) active.
+    rigid_group_existence = torch.tensor(
         [
-            [1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-            [1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            [
+                [1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                [1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            ]
         ],
         dtype=torch.float32,
     )
-    aatype = torch.tensor([[0, 1]], dtype=torch.long)
 
     atom_mask[0, 0, 0] = 1.0
     atom_mask[0, 1, 0] = 1.0
@@ -63,12 +65,11 @@ def test_all_atom_fape_matches_joint_masked_mean():
         true_atom_positions,
         true_atom_mask=true_atom_mask,
         seq_mask=seq_mask,
-        rigid_group_mask=rigid_group_mask,
-        aatype=aatype,
+        frame_mask=rigid_group_existence,
     )
 
     flat_atom_mask = atom_mask.reshape(1, -1)
-    frame_mask = (seq_mask[:, :, None] * rigid_group_mask[aatype]).reshape(1, -1)
+    frame_mask = (seq_mask[:, :, None] * rigid_group_existence).reshape(1, -1)
     pred_R = predicted_frames_R.reshape(1, -1, 3, 3)
     pred_t = predicted_frames_t.reshape(1, -1, 3)
     true_R = true_frames_R.reshape(1, -1, 3, 3)
@@ -78,11 +79,8 @@ def test_all_atom_fape_matches_joint_masked_mean():
     local_pred = torch.einsum("bfij,baj->bfai", pred_R.transpose(-1, -2), pred_pos)
     local_true = torch.einsum("bfij,baj->bfai", true_R.transpose(-1, -2), true_pos)
     error = torch.sqrt(((local_pred - local_true) ** 2).sum(dim=-1) + 1e-4).clamp(max=10.0) / 10.0
-    pair_mask = frame_mask[:, :, None] * flat_atom_mask[:, None, :]
-    expected = (error * pair_mask).sum(dim=-1)
-    expected = expected / (1e-4 + frame_mask.sum(dim=-1))[:, None]
-    expected = expected.sum(dim=-1)
-    expected = expected / (1e-4 + flat_atom_mask.sum(dim=-1))
+    joint_mask = frame_mask[:, :, None] * flat_atom_mask[:, None, :]
+    expected = (error * joint_mask).sum(dim=(-1, -2)) / joint_mask.sum(dim=(-1, -2)).clamp(min=1.0)
 
     assert torch.allclose(loss, expected, atol=1e-6)
 
@@ -113,10 +111,8 @@ def test_backbone_fape_matches_af2_frame_aligned_point_error():
     local_pred = torch.einsum("bfij,baj->bfai", pred_rot_inv, predicted_translations) + pred_trans_inv[:, :, None, :]
     local_true = torch.einsum("bfij,baj->bfai", true_rot_inv, true_translations) + true_trans_inv[:, :, None, :]
     error = torch.sqrt(((local_pred - local_true) ** 2).sum(dim=-1) + 1e-4).clamp(max=10.0) / 10.0
-    expected = error.sum(dim=-1)
-    expected = expected / (1e-4 + mask.sum(dim=-1))[:, None]
-    expected = expected.sum(dim=-1)
-    expected = expected / (1e-4 + mask.sum(dim=-1))
+    joint_mask = mask[:, :, None] * mask[:, None, :]
+    expected = (error * joint_mask).sum(dim=(-1, -2)) / joint_mask.sum(dim=(-1, -2)).clamp(min=1.0)
 
     assert torch.allclose(loss, expected, atol=1e-6)
 
@@ -162,41 +158,39 @@ def test_select_best_atom14_ground_truth_uses_pairwise_distance_rule():
     assert torch.equal(chosen_mask[0, 1], true_mask[0, 1])
 
 
-def test_torsion_angle_loss_ignores_backbone_torsions_and_scores_chi():
+def test_torsion_angle_loss_scores_all_seven_torsions():
+    """Algorithm 27 scores f ∈ {ω, φ, ψ, χ1..χ4} — backbone torsions included."""
     loss_fn = TorsionAngleLoss()
 
+    # Predicted matches true everywhere → baseline torsion loss is 0.
     predicted = torch.zeros((1, 1, 7, 2), dtype=torch.float32)
-    predicted[..., 0, :] = torch.tensor([1.0, 0.0])
-    predicted[..., 1, :] = torch.tensor([0.0, 1.0])
-    predicted[..., 2, :] = torch.tensor([1.0, 0.0])
-    predicted[..., 3, :] = torch.tensor([0.0, 1.0])
+    predicted[..., :, 1] = 1.0  # unit [sin=0, cos=1] for every angle
+    true_angles = predicted.clone()
+    true_alt = true_angles.clone()
 
-    true_angles = torch.zeros_like(predicted)
-    true_alt = torch.zeros_like(predicted)
-    true_angles[..., 0, :] = torch.tensor([0.0, 1.0])
-    true_angles[..., 1, :] = torch.tensor([1.0, 0.0])
-    true_angles[..., 2, :] = torch.tensor([0.0, 1.0])
-    true_angles[..., 3, :] = torch.tensor([0.0, 1.0])
-    true_alt.copy_(true_angles)
+    torsion_mask = torch.ones((1, 1, 7), dtype=torch.float32)
+    baseline_loss = loss_fn(predicted, predicted, true_angles, true_alt, torsion_mask)
 
-    torsion_mask = torch.zeros((1, 1, 7), dtype=torch.float32)
-    torsion_mask[..., :4] = 1.0
-    res_types = torch.tensor([[15]], dtype=torch.long)  # SER: chi1 only
+    # Perturbing a backbone torsion (ω) must increase the loss per Algorithm 27.
+    changed_omega = predicted.clone()
+    changed_omega[..., 0, :] = torch.tensor([1.0, 0.0])
+    changed_omega_loss = loss_fn(changed_omega, changed_omega, true_angles, true_alt, torsion_mask)
+    assert changed_omega_loss.item() > baseline_loss.item()
 
-    baseline_loss = loss_fn(predicted, predicted, true_angles, true_alt, torsion_mask, res_types)
-
-    changed_backbone = predicted.clone()
-    changed_backbone[..., 0, :] = torch.tensor([0.0, 1.0])
-    changed_backbone[..., 1, :] = torch.tensor([1.0, 0.0])
-    changed_backbone[..., 2, :] = torch.tensor([0.0, 1.0])
-    changed_backbone_loss = loss_fn(changed_backbone, changed_backbone, true_angles, true_alt, torsion_mask, res_types)
-
+    # Perturbing a side-chain torsion (χ1) must also increase the loss.
     changed_chi = predicted.clone()
     changed_chi[..., 3, :] = torch.tensor([1.0, 0.0])
-    changed_chi_loss = loss_fn(changed_chi, changed_chi, true_angles, true_alt, torsion_mask, res_types)
-
-    assert torch.allclose(baseline_loss, changed_backbone_loss, atol=1e-6)
+    changed_chi_loss = loss_fn(changed_chi, changed_chi, true_angles, true_alt, torsion_mask)
     assert changed_chi_loss.item() > baseline_loss.item()
+
+    # A perturbation to a torsion whose mask is 0 must be ignored — torsion_mask
+    # is how geometry.torsion_angles propagates residue-type and atom-presence
+    # validity (e.g. χ2 for SER or ω at the first residue is zero).
+    masked_out = torsion_mask.clone()
+    masked_out[..., 0] = 0.0
+    changed_omega_masked_loss = loss_fn(changed_omega, changed_omega, true_angles, true_alt, masked_out)
+    aligned_masked_loss = loss_fn(predicted, predicted, true_angles, true_alt, masked_out)
+    assert torch.allclose(changed_omega_masked_loss, aligned_masked_loss, atol=1e-5)
 
 
 def test_structural_violation_loss_respects_residue_index_gaps():
