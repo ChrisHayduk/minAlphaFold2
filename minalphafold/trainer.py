@@ -40,14 +40,9 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-try:
-    from .data import ProcessedOpenProteinSetDataset, collate_batch
-    from .losses import AlphaFoldLoss
-    from .model import AlphaFold2
-except ImportError:  # pragma: no cover - compatibility for direct module imports in tests/scripts.
-    from data import ProcessedOpenProteinSetDataset, collate_batch
-    from losses import AlphaFoldLoss
-    from model import AlphaFold2
+from .data import ProcessedOpenProteinSetDataset, collate_batch
+from .losses import AlphaFoldLoss
+from .model import AlphaFold2
 
 
 def default_device() -> str:

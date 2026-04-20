@@ -1,22 +1,49 @@
+"""AlphaFold2 loss functions (supplement 1.9).
+
+Every loss term used during training lives here, wired together by
+:class:`AlphaFoldLoss` (equation 7). The algorithm-to-class mapping:
+
+* :func:`frame_aligned_point_error` — Algorithm 28 core computation of
+  ``d_ij = ||T_i^{-1} ∘ x_j - T_i_true^{-1} ∘ x_j_true||`` used by both
+  FAPE heads.
+* :class:`BackboneFAPE` — Algorithm 20 line 17 (per-layer auxiliary
+  backbone FAPE on Cα) + final backbone FAPE at Z = 10 Å (supplement
+  1.9.2); handles the 90/10 clamped/unclamped mix from supplement 1.11.5.
+* :class:`AllAtomFAPE` — Algorithm 20 line 28 (final all-atom FAPE on
+  every rigid-group frame and every atom, always clamped at 10 Å).
+* :class:`TorsionAngleLoss` — Algorithm 27 (supplement 1.9.1). L2 on
+  normalised (sin, cos) pairs + an "anglenorm" term (eq 27-ish) that
+  pulls the pre-normalised length back to 1.
+* :class:`PLDDTLoss` — Algorithm 29 (supplement 1.9.6). LDDT-Cα with
+  the standard 4-threshold {0.5, 1, 2, 4 Å} scoring, filtered to
+  resolution 0.1-3.0 Å.
+* :class:`DistogramLoss` — supplement 1.9.8 eq 41.
+* :class:`MSALoss` — supplement 1.9.9 eq 42.
+* :class:`ExperimentallyResolvedLoss` — supplement 1.9.10 eq 43.
+* :class:`TMScoreLoss` — supplement 1.9.7 eqs 38-40 (PAE/pTM head).
+* :class:`StructuralViolationLoss` — supplement 1.9.11 eqs 44-47
+  (bond-length, bond-angle, and clash penalties, fine-tuning only).
+* :func:`select_best_atom14_ground_truth` — Algorithm 26 helper that
+  picks the smaller-FAPE member of a 180°-ambiguous ground-truth pair
+  (ASP χ2 / GLU χ3 / PHE χ2 / TYR χ2).
+
+Masks (``seq_mask``, ``msa_mask``, ``pair_mask``, resolution filters)
+propagate throughout — padded / low-resolution / unresolved positions
+do not contribute to any term. Every loss returns a per-example
+(shape ``(batch,)``) value; :class:`AlphaFoldLoss.forward` sums the
+weighted terms and then the caller averages over the batch.
+"""
+
 import torch
 from typing import Optional
 
-try:
-    from .utils import distance_bin
-    from .residue_constants import (
-        between_res_bond_length_c_n, between_res_bond_length_stddev_c_n,
-        between_res_cos_angles_c_n_ca, between_res_cos_angles_ca_c_n,
-        make_atom14_dists_bounds,
-        restype_atom14_vdw_radius,
-    )
-except ImportError:  # pragma: no cover - compatibility for direct module imports in tests/scripts.
-    from utils import distance_bin
-    from residue_constants import (
-        between_res_bond_length_c_n, between_res_bond_length_stddev_c_n,
-        between_res_cos_angles_c_n_ca, between_res_cos_angles_ca_c_n,
-        make_atom14_dists_bounds,
-        restype_atom14_vdw_radius,
-    )
+from .utils import distance_bin
+from .residue_constants import (
+    between_res_bond_length_c_n, between_res_bond_length_stddev_c_n,
+    between_res_cos_angles_c_n_ca, between_res_cos_angles_ca_c_n,
+    make_atom14_dists_bounds,
+    restype_atom14_vdw_radius,
+)
 
 
 def frame_aligned_point_error(

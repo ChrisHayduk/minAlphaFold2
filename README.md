@@ -14,34 +14,44 @@ Inspired by Andrej Karpathy's [minGPT](https://github.com/karpathy/minGPT).
 
 - **Pure PyTorch.** Every layer is built from `nn.Linear`, `nn.LayerNorm`, `torch.einsum`, and standard activations. No external ML libraries, no hidden abstractions.
 - **1-to-1 mapping to the supplement.** Each module corresponds directly to numbered algorithms in the [AlphaFold2 supplementary information](https://www.nature.com/articles/s41586-021-03819-2#Sec20). Comments reference specific algorithm and line numbers throughout.
-- **Designed to be read and modified.** The entire model fits in ~3,500 lines across 9 modules. If you can read PyTorch, you can read this.
+- **Designed to be read and modified.** The entire model fits in ~4,000 lines across 15 modules. If you can read PyTorch, you can read this.
 
 ## File Structure
 
 ```
 minalphafold/
-    a3m.py                # Minimal A3M parsing and tokenization
-    mmcif.py              # Minimal mmCIF atom-site parsing to atom14 coordinates
-    geometry.py           # Rigid frames, torsions, pseudo-beta helpers for supervision
-    data.py               # Processed OpenProteinSet dataset, crops, collation, feature builders
-    model.py              # Top-level AlphaFold2 module, recycling loop, ensemble averaging
-    embedders.py          # Input embedding, relative position encoding, all attention/update modules
-    evoformer.py          # Evoformer block, MSA row attention with pair bias
-    structure_module.py   # Structure module, IPA, backbone update, all-atom coordinate generation
-    heads.py              # Distogram, pLDDT, masked MSA, TM-score, experimentally resolved heads
-    losses.py             # FAPE (backbone + all-atom), torsion angle, pLDDT, distogram, MSA, structural violation losses
-    utils.py              # Dropout (row/column-wise), distance binning, recycling distogram
-    residue_constants.py  # Amino acid chemical data (frames, bond lengths, VDW radii, torsion masks)
-    trainer.py            # Minimal training loop, dataloader wiring, and checkpoint helpers
+    a3m.py                # A3M parsing and MSA tokenization
+    mmcif.py              # mmCIF atom-site parsing → atom14 coordinates
+    pdbio.py              # PDB writer for predicted structures (pLDDT → B-factor)
+    geometry.py           # Rigid frames, torsions, pseudo-β helpers for supervision
+    residue_constants.py  # Amino acid chemical data (frames, bond lengths, VDW, torsion masks)
+    data.py               # Processed-cache dataset, crops, collation, feature builders
+    initialization.py     # Linear init helpers (default/relu/glorot/final, gate, zero)
+    utils.py              # Row/column dropout, distance binning, recycling distogram
+    embedders.py          # Input embedding, RelPos, every attention/update submodule (Alg 8–19)
+    evoformer.py          # Evoformer block (Alg 6); MSA row attention with pair bias (Alg 7)
+    structure_module.py   # Structure Module, IPA, backbone update, all-atom coordinates
+    heads.py              # Distogram, pLDDT, masked MSA, PAE/TM-score, experimentally-resolved
+    losses.py             # FAPE (backbone + all-atom), torsion, pLDDT, distogram, MSA, violations
+    model.py              # Top-level AlphaFold2, recycling loop, ensemble averaging
+    trainer.py            # Training loop, dataloader wiring, checkpoint helpers
 scripts/
-    download_openproteinset.py   # Minimal OpenProteinSet downloader/setup helper
-    preprocess_openproteinset.py # Raw OpenProteinSet -> per-chain NPZ caches
+    download_openproteinset.py   # OpenProteinSet downloader
+    preprocess_openproteinset.py # Raw OpenProteinSet → per-chain NPZ caches
+    overfit_single_pdb.py        # Self-contained single-PDB overfit driver (no MSAs/templates)
+    autoresearch_overfit.py      # Multi-experiment overfit research loop
 tests/
-    test_shapes.py        # Core shape and semantic tests
-    test_a3m.py           # A3M parser tests
-    test_mmcif.py         # mmCIF parser tests
-    test_geometry.py      # Geometry helper tests
-    test_data_pipeline.py # Dataset, preprocessing, and end-to-end batch tests
+    conftest.py                  # Adds repo root + scripts/ to sys.path for pytest
+    test_shapes.py               # Shape + semantic tests for every module
+    test_a3m.py                  # A3M parser tests
+    test_mmcif.py                # mmCIF parser tests
+    test_pdbio.py                # PDB writer tests
+    test_geometry.py             # Geometry helper tests
+    test_data_pipeline.py        # Dataset, preprocessing, end-to-end batch tests
+    test_losses.py               # Loss head tests (FAPE, violations, torsion, pLDDT, …)
+    test_trainer.py              # Training-loop + optimiser + CLI tests
+    test_openproteinset_scripts.py  # Download/preprocess script tests
+af2_paper.pdf                    # AF2 supplement — PRIMARY REFERENCE
 ```
 
 ## Supplement Algorithm Mapping
@@ -72,8 +82,8 @@ tests/
 | 22 | Invariant Point Attention (IPA) | `structure_module.py: InvariantPointAttention` |
 | 23 | Backbone Update | `structure_module.py: BackboneUpdate` |
 | 24 | Compute All Atom Coordinates | `structure_module.py: compute_all_atom_coordinates` |
-| 25 | Rigid-group Frames from Torsions | `structure_module.py: make_rot_x`, `compose_transforms` |
-| 26 | Rename Symmetric Ground Truth Atoms | `losses.py: AlphaFoldLoss.forward` (lines 83–94, computes `true_torsion_angles_alt`) |
+| 25 | Rigid-group Frames from Torsions | `structure_module.py: make_rot_x`, `compose_transforms`, `rigid_group_frames_from_torsions` |
+| 26 | Rename Symmetric Ground Truth Atoms | `losses.py: select_best_atom14_ground_truth`; ground-truth side: `data.py: build_supervision` (computes `true_torsion_angles_alt` via `geometry.alternative_torsion_angles`) |
 | 27 | Torsion Angle Loss | `losses.py: TorsionAngleLoss` |
 | 28 | FAPE (Backbone) | `losses.py: BackboneFAPE` |
 | 28 | FAPE (All-Atom) | `losses.py: AllAtomFAPE` |
@@ -82,13 +92,16 @@ tests/
 | 31 | Training with Recycling | `model.py: AlphaFold2.forward` (random cycle sampling) |
 | 32 | Recycling Embedder | `model.py: AlphaFold2.forward` (recycle norms + distance bins) |
 
+Loss terms beyond the algorithm table: `losses.StructuralViolationLoss` implements supplement §1.9.11 equations 44–47 (bond length, bond angle, clash), `losses.DistogramLoss` implements §1.9.8 eq 41, `losses.MSALoss` implements §1.9.9 eq 42, `losses.ExperimentallyResolvedLoss` implements §1.9.10 eq 43, `losses.TMScoreLoss` implements §1.9.7 eqs 38–40.
+
 ## Key Design Decisions
 
 - **Pure PyTorch primitives.** `nn.Linear`, `nn.LayerNorm`, `torch.einsum`, `torch.sigmoid`, `F.softmax`, `F.relu`. Nothing else.
-- **Config-as-object.** A single config object threads hyperparameters (channel dims, number of heads, dropout rates) through every module.
+- **Config-as-object.** A single config object threads hyperparameters (channel dims, number of heads, dropout rates) through every module. Channel dim conventions: `c_m` (MSA), `c_s` (single), `c_z` (pair), `c_e` (extra MSA), `c_t` (template pair). Projection `c_m → c_s` happens via `single_rep_proj` in `model.py`.
 - **Explicit masking throughout.** Every attention and update module accepts optional `seq_mask`, `msa_mask`, or `pair_mask` tensors. Masks propagate from top-level input all the way through to loss computation.
-- **nm/Angstrom boundary.** The Structure Module operates internally in nanometres (matching the supplement). The boundary is at `StructureModule.__init__` (converts residue constants from Angstroms to nm) and `StructureModule.forward` (converts outputs back to Angstroms).
-- **Zero-init per supplement 1.11.4.** Output projections for attention modules, transition blocks, and head logit layers are zero-initialized. Gate biases are initialized to 1.
+- **nm/Å boundary at the Structure Module edge.** The Structure Module operates internally in nanometres (matching the supplement). The boundary is at `StructureModule.__init__` (converts residue constants from Å to nm) and `StructureModule.forward` (converts outputs back to Å). No unit mixing inside.
+- **Zero-init per supplement 1.11.4.** Output projections for attention modules, transition blocks, and head logit layers are zero-initialized. Gate biases are initialized to 1 (`sigmoid(1) ≈ 0.73`, mostly pass-through). `AlphaFold2._initialize_alphafold_parameters` enforces this sweep after construction.
+- **Relative imports inside the package.** Every `minalphafold/*.py` uses `from .X import Y` — no dual-path try/except shims. Tests and scripts put the repo root on `sys.path` (via `tests/conftest.py` or a one-liner at the top of each script) and then use `from minalphafold.X import Y`.
 
 ## Getting Started
 
@@ -104,6 +117,22 @@ tests/
 ```bash
 pip install torch pytest
 ```
+
+No packaging step is needed — the tests' `conftest.py` and the scripts' short `sys.path` preamble put the repo root on the import path automatically. If you want to import `minalphafold` from elsewhere, add the repo root to `PYTHONPATH`.
+
+### Overfit a single protein (no MSA, no templates)
+
+The fastest way to verify the pipeline runs end-to-end — parses a PDB,
+builds all input features from just the sequence, trains to
+sub-Å RMSD on CPU in about a minute:
+
+```bash
+python scripts/overfit_single_pdb.py \
+  --pdb artifacts/overfit_1a0m_A/ground_truth_1a0m_A.pdb \
+  --steps 1000
+```
+
+Artifacts (predicted PDB, ground-truth PDB, PyMOL view script, per-step loss log) land in `artifacts/overfit_single_pdb/<chain_id>/`.
 
 ### Download OpenProteinSet
 
@@ -131,7 +160,7 @@ python scripts/preprocess_openproteinset.py \
 ### Train
 
 ```bash
-python minalphafold/trainer.py \
+python -m minalphafold.trainer \
   --processed-features-dir data/processed_features \
   --processed-labels-dir data/processed_labels \
   --epochs 1 \
@@ -144,30 +173,32 @@ python minalphafold/trainer.py \
 pytest -q
 ```
 
-The test suite includes 67 tests covering parsers, geometry, dataset processing, and model/loss behavior.
+The test suite has **130 tests** across parsers (`test_a3m`, `test_mmcif`, `test_pdbio` — 8), geometry (`test_geometry` — 12), dataset and preprocessing (`test_data_pipeline`, `test_openproteinset_scripts` — 26), loss heads (`test_losses` — 15), shape and semantic coverage of every model module (`test_shapes` — 54), and training-loop behaviour (`test_trainer` — 15).
 
 ## Work in Progress
 
 ### What's done
 
-- Full forward pass: input embedding through Evoformer through Structure Module to all-atom coordinates
-- All auxiliary heads: distogram, pLDDT, masked MSA, TM-score, experimentally resolved
+- Full forward pass: input embedding → Evoformer → Structure Module → all-atom coordinates
+- All auxiliary heads: distogram, pLDDT, masked MSA, PAE/pTM, experimentally resolved
 - All losses: FAPE (backbone + all-atom), torsion angle, pLDDT, distogram, MSA, structural violations
-- Recycling loop with proper gradient detachment and pseudo-beta distance features
+- Recycling loop with proper gradient detachment and pseudo-β distance features (Algorithm 32)
 - Template processing (pair stack + pointwise attention + torsion angle features)
 - Extra MSA stack with global column attention
 - Self-contained OpenProteinSet download and preprocessing scripts
-- Minimal cached dataset loader with crops, collation, MSA processing, template features, and supervision tensors
-- Minimal training loop with direct data -> model -> loss wiring and optional checkpoints
-- Geometry helpers for frames, torsions, and pseudo-beta coordinates
+- Cached dataset loader with crops, collation, MSA processing, template features, and supervision tensors
+- Minimal training loop with data → model → loss wiring and checkpoints
+- Geometry helpers for frames, torsions, and pseudo-β coordinates
 - Ensemble averaging
-- Parameter initialization matching supplement 1.11.4
-- 67 parser, shape, semantic, and end-to-end tests
+- Parameter initialization matching supplement 1.11.4 (centralised sweep in `AlphaFold2._initialize_alphafold_parameters`)
+- Single-protein overfit driver (`scripts/overfit_single_pdb.py`) reaching sub-Å Cα RMSD in ≤1000 CPU steps
+- 130 parser, shape, semantic, loss, and end-to-end tests
 
 ### Next steps
 
-- [ ] Test training on a small set of proteins
-- [ ] Iterate on default training hyperparameters once real runs exist
+- [ ] Train on a small set of proteins and iterate on default hyperparameters
+- [ ] Inference-time Amber relaxation (supplement 1.8.6) for the predicted structures
+- [ ] Self-distillation dataset generation (supplement 1.3)
 
 ## License
 

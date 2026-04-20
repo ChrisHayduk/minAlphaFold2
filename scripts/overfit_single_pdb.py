@@ -36,16 +36,17 @@ import torch
 
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "minalphafold"))
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 
-from a3m import MASK_ID, MSA_ALPHABET_SIZE, sequence_to_ids
-from data import build_processed_example_from_cropped, collate_batch
-from losses import AlphaFoldLoss, select_best_atom14_ground_truth
-from model import AlphaFold2
-from pdbio import write_atom14_pdb, write_model_output_pdb
-from residue_constants import restype_1to3, restype_name_to_atom14_names, restypes
-from trainer import (
+from minalphafold.a3m import MASK_ID, MSA_ALPHABET_SIZE, sequence_to_ids
+from minalphafold.data import build_processed_example_from_cropped, collate_batch
+from minalphafold.losses import AlphaFoldLoss, select_best_atom14_ground_truth
+from minalphafold.model import AlphaFold2
+from minalphafold.pdbio import write_atom14_pdb, write_model_output_pdb
+from minalphafold.residue_constants import restype_1to3, restype_name_to_atom14_names, restypes
+from minalphafold.trainer import (
     alphafold2_model_config,
     build_optimizer,
     default_model_config,

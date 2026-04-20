@@ -1,15 +1,8 @@
-from pathlib import Path
 import math
-import sys
 
 import torch
 
-
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "minalphafold"))
-
-
-from losses import (
+from minalphafold.losses import (
     AlphaFoldLoss,
     AllAtomFAPE,
     BackboneFAPE,
@@ -20,7 +13,7 @@ from losses import (
     TorsionAngleLoss,
     select_best_atom14_ground_truth,
 )
-from residue_constants import (
+from minalphafold.residue_constants import (
     restype_atom14_distance_lower_bound,
     restype_atom14_distance_upper_bound,
 )

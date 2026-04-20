@@ -1,12 +1,8 @@
 """Smoke tests: instantiate each module and verify output shapes with random inputs."""
-import sys
-import os
 import math
-import torch
-import pytest
 
-# Add the package directory to path so imports resolve
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'minalphafold'))
+import pytest
+import torch
 
 
 # ---------------------------------------------------------------------------
@@ -82,7 +78,7 @@ N_res = 6   # residues
 
 class TestRelPos:
     def test_output_shape(self, cfg):
-        from embedders import RelPos
+        from minalphafold.embedders import RelPos
         module = RelPos(cfg)
         residue_index = torch.arange(N_res).unsqueeze(0).expand(B, -1)
         out = module(residue_index)
@@ -91,7 +87,7 @@ class TestRelPos:
 
 class TestInputEmbedder:
     def test_output_shapes(self, cfg):
-        from embedders import InputEmbedder
+        from minalphafold.embedders import InputEmbedder
         module = InputEmbedder(cfg)
         target_feat = torch.randn(B, N_res, 22)
         residue_index = torch.arange(N_res).unsqueeze(0).expand(B, -1)
@@ -103,7 +99,7 @@ class TestInputEmbedder:
 
 class TestMSAColumnAttention:
     def test_output_shape(self, cfg):
-        from embedders import MSAColumnAttention
+        from minalphafold.embedders import MSAColumnAttention
         module = MSAColumnAttention(cfg)
         msa = torch.randn(B, N_seq, N_res, cfg.c_m)
         out = module(msa)
@@ -112,7 +108,7 @@ class TestMSAColumnAttention:
 
 class TestMSATransition:
     def test_output_shape(self, cfg):
-        from embedders import MSATransition
+        from minalphafold.embedders import MSATransition
         module = MSATransition(cfg)
         msa = torch.randn(B, N_seq, N_res, cfg.c_m)
         out = module(msa)
@@ -121,7 +117,7 @@ class TestMSATransition:
 
 class TestOuterProductMean:
     def test_output_shape(self, cfg):
-        from embedders import OuterProductMean
+        from minalphafold.embedders import OuterProductMean
         module = OuterProductMean(cfg)
         msa = torch.randn(B, N_seq, N_res, cfg.c_m)
         out = module(msa)
@@ -130,7 +126,7 @@ class TestOuterProductMean:
 
 class TestTriangleMultiplicationOutgoing:
     def test_output_shape(self, cfg):
-        from embedders import TriangleMultiplicationOutgoing
+        from minalphafold.embedders import TriangleMultiplicationOutgoing
         module = TriangleMultiplicationOutgoing(cfg)
         pair = torch.randn(B, N_res, N_res, cfg.c_z)
         out = module(pair)
@@ -139,7 +135,7 @@ class TestTriangleMultiplicationOutgoing:
 
 class TestTriangleMultiplicationIncoming:
     def test_output_shape(self, cfg):
-        from embedders import TriangleMultiplicationIncoming
+        from minalphafold.embedders import TriangleMultiplicationIncoming
         module = TriangleMultiplicationIncoming(cfg)
         pair = torch.randn(B, N_res, N_res, cfg.c_z)
         out = module(pair)
@@ -148,7 +144,7 @@ class TestTriangleMultiplicationIncoming:
 
 class TestTriangleAttentionStartingNode:
     def test_output_shape(self, cfg):
-        from embedders import TriangleAttentionStartingNode
+        from minalphafold.embedders import TriangleAttentionStartingNode
         module = TriangleAttentionStartingNode(cfg)
         pair = torch.randn(B, N_res, N_res, cfg.c_z)
         out = module(pair)
@@ -157,7 +153,7 @@ class TestTriangleAttentionStartingNode:
 
 class TestTriangleAttentionEndingNode:
     def test_output_shape(self, cfg):
-        from embedders import TriangleAttentionEndingNode
+        from minalphafold.embedders import TriangleAttentionEndingNode
         module = TriangleAttentionEndingNode(cfg)
         pair = torch.randn(B, N_res, N_res, cfg.c_z)
         out = module(pair)
@@ -166,7 +162,7 @@ class TestTriangleAttentionEndingNode:
 
 class TestPairTransition:
     def test_output_shape(self, cfg):
-        from embedders import PairTransition
+        from minalphafold.embedders import PairTransition
         module = PairTransition(cfg)
         pair = torch.randn(B, N_res, N_res, cfg.c_z)
         out = module(pair)
@@ -175,7 +171,7 @@ class TestPairTransition:
 
 class TestTemplatePair:
     def test_output_shape(self, cfg):
-        from embedders import TemplatePair
+        from minalphafold.embedders import TemplatePair
         module = TemplatePair(cfg)
         N_templ = 2
         templ = torch.randn(B, N_templ, N_res, N_res, cfg.c_t)
@@ -185,7 +181,7 @@ class TestTemplatePair:
 
 class TestTemplatePointwiseAttention:
     def test_output_shape(self, cfg):
-        from embedders import TemplatePointwiseAttention
+        from minalphafold.embedders import TemplatePointwiseAttention
         module = TemplatePointwiseAttention(cfg)
         N_templ = 2
         templ = torch.randn(B, N_templ, N_res, N_res, cfg.c_z)
@@ -196,7 +192,7 @@ class TestTemplatePointwiseAttention:
 
 class TestExtraMsaStack:
     def test_output_shapes(self, cfg):
-        from embedders import ExtraMsaStack
+        from minalphafold.embedders import ExtraMsaStack
         module = ExtraMsaStack(cfg)
         N_extra = 8
         extra_msa = torch.randn(B, N_extra, N_res, cfg.c_e)
@@ -208,7 +204,7 @@ class TestExtraMsaStack:
 
 class TestMSAColumnGlobalAttention:
     def test_output_shape(self, cfg):
-        from embedders import MSAColumnGlobalAttention
+        from minalphafold.embedders import MSAColumnGlobalAttention
         module = MSAColumnGlobalAttention(cfg, c_in=cfg.c_e)
         msa = torch.randn(B, N_seq, N_res, cfg.c_e)
         out = module(msa)
@@ -219,7 +215,7 @@ class TestMSAColumnGlobalAttention:
 
 class TestMSARowAttentionWithPairBias:
     def test_output_shape(self, cfg):
-        from evoformer import MSARowAttentionWithPairBias
+        from minalphafold.evoformer import MSARowAttentionWithPairBias
         module = MSARowAttentionWithPairBias(cfg)
         msa = torch.randn(B, N_seq, N_res, cfg.c_m)
         pair = torch.randn(B, N_res, N_res, cfg.c_z)
@@ -229,7 +225,7 @@ class TestMSARowAttentionWithPairBias:
 
 class TestEvoformer:
     def test_output_shapes(self, cfg):
-        from evoformer import Evoformer
+        from minalphafold.evoformer import Evoformer
         module = Evoformer(cfg)
         msa = torch.randn(B, N_seq, N_res, cfg.c_m)
         pair = torch.randn(B, N_res, N_res, cfg.c_z)
@@ -238,7 +234,7 @@ class TestEvoformer:
         assert out_pair.shape == pair.shape
 
     def test_with_masks(self, cfg):
-        from evoformer import Evoformer
+        from minalphafold.evoformer import Evoformer
         module = Evoformer(cfg)
         msa = torch.randn(B, N_seq, N_res, cfg.c_m)
         pair = torch.randn(B, N_res, N_res, cfg.c_z)
@@ -253,7 +249,7 @@ class TestEvoformer:
 
 class TestBackboneUpdate:
     def test_output_shapes(self, cfg):
-        from structure_module import BackboneUpdate
+        from minalphafold.structure_module import BackboneUpdate
         module = BackboneUpdate(cfg)
         s = torch.randn(B, N_res, cfg.c_s)
         R, t = module(s)
@@ -263,7 +259,7 @@ class TestBackboneUpdate:
 
 class TestInvariantPointAttention:
     def test_output_shape(self, cfg):
-        from structure_module import InvariantPointAttention
+        from minalphafold.structure_module import InvariantPointAttention
         module = InvariantPointAttention(cfg)
         s = torch.randn(B, N_res, cfg.c_s)
         pair = torch.randn(B, N_res, N_res, cfg.c_z)
@@ -273,7 +269,7 @@ class TestInvariantPointAttention:
         assert out.shape == (B, N_res, cfg.c_s)
 
     def test_matches_canonical_reference_layout(self, cfg):
-        from structure_module import InvariantPointAttention
+        from minalphafold.structure_module import InvariantPointAttention
 
         torch.manual_seed(0)
         module = InvariantPointAttention(cfg)
@@ -367,7 +363,7 @@ class TestInvariantPointAttention:
         assert torch.allclose(actual, reference, atol=1e-6)
 
     def test_pre_output_features_are_rigid_transform_invariant(self, cfg):
-        from structure_module import InvariantPointAttention
+        from minalphafold.structure_module import InvariantPointAttention
 
         torch.manual_seed(0)
         module = InvariantPointAttention(cfg)
@@ -404,7 +400,7 @@ class TestInvariantPointAttention:
 
 class TestMakeRotX:
     def test_output_shapes(self):
-        from structure_module import make_rot_x
+        from minalphafold.structure_module import make_rot_x
         alpha = torch.randn(B, N_res, 7, 2)
         R, t = make_rot_x(alpha)
         assert R.shape == (B, N_res, 7, 3, 3)
@@ -413,7 +409,7 @@ class TestMakeRotX:
 
 class TestComposeTransforms:
     def test_identity(self):
-        from structure_module import compose_transforms
+        from minalphafold.structure_module import compose_transforms
         R1 = torch.eye(3).unsqueeze(0).expand(B, 3, 3)
         t1 = torch.zeros(B, 3)
         R2 = torch.eye(3).unsqueeze(0).expand(B, 3, 3)
@@ -426,7 +422,7 @@ class TestComposeTransforms:
 
 class TestStructureModule:
     def test_output_dict(self, cfg):
-        from structure_module import StructureModule
+        from minalphafold.structure_module import StructureModule
         module = StructureModule(cfg)
         s = torch.randn(B, N_res, cfg.c_s)
         pair = torch.randn(B, N_res, N_res, cfg.c_z)
@@ -450,14 +446,14 @@ class TestStructureModule:
 
 class TestDistogramHead:
     def test_output_shape(self, cfg):
-        from heads import DistogramHead
+        from minalphafold.heads import DistogramHead
         module = DistogramHead(cfg)
         pair = torch.randn(B, N_res, N_res, cfg.c_z)
         out = module(pair)
         assert out.shape == (B, N_res, N_res, cfg.n_dist_bins)
 
     def test_symmetry(self, cfg):
-        from heads import DistogramHead
+        from minalphafold.heads import DistogramHead
         module = DistogramHead(cfg)
         pair = torch.randn(B, N_res, N_res, cfg.c_z)
         out = module(pair)
@@ -466,7 +462,7 @@ class TestDistogramHead:
 
 class TestPLDDTHead:
     def test_output_shape(self, cfg):
-        from heads import PLDDTHead
+        from minalphafold.heads import PLDDTHead
         module = PLDDTHead(cfg)
         s = torch.randn(B, N_res, cfg.c_s)
         out = module(s)
@@ -475,7 +471,7 @@ class TestPLDDTHead:
 
 class TestMaskedMSAHead:
     def test_output_shape(self, cfg):
-        from heads import MaskedMSAHead
+        from minalphafold.heads import MaskedMSAHead
         module = MaskedMSAHead(cfg)
         msa = torch.randn(B, N_seq, N_res, cfg.c_m)
         out = module(msa)
@@ -484,7 +480,7 @@ class TestMaskedMSAHead:
 
 class TestTMScoreHead:
     def test_output_shape(self, cfg):
-        from heads import TMScoreHead
+        from minalphafold.heads import TMScoreHead
         module = TMScoreHead(cfg)
         pair = torch.randn(B, N_res, N_res, cfg.c_z)
         out = module(pair)
@@ -493,7 +489,7 @@ class TestTMScoreHead:
 
 class TestExperimentallyResolvedHead:
     def test_output_shape(self, cfg):
-        from heads import ExperimentallyResolvedHead
+        from minalphafold.heads import ExperimentallyResolvedHead
         module = ExperimentallyResolvedHead(cfg)
         s = torch.randn(B, N_res, cfg.c_s)
         out = module(s)
@@ -504,14 +500,14 @@ class TestExperimentallyResolvedHead:
 
 class TestDropoutRowwise:
     def test_noop_in_eval(self):
-        from utils import dropout_rowwise
+        from minalphafold.utils import dropout_rowwise
         x = torch.randn(B, N_seq, N_res, 32)
         out = dropout_rowwise(x, p=0.5, training=False)
         assert torch.equal(out, x)
 
     def test_shares_mask_across_rows(self):
         """DropoutRowwise: identical mask for every row (dim=1)."""
-        from utils import dropout_rowwise
+        from minalphafold.utils import dropout_rowwise
         torch.manual_seed(42)
         x = torch.ones(2, 5, 7, 3)
         y = dropout_rowwise(x, p=0.5, training=True)
@@ -522,14 +518,14 @@ class TestDropoutRowwise:
 
 class TestDropoutColumnwise:
     def test_noop_in_eval(self):
-        from utils import dropout_columnwise
+        from minalphafold.utils import dropout_columnwise
         x = torch.randn(B, N_seq, N_res, 32)
         out = dropout_columnwise(x, p=0.5, training=False)
         assert torch.equal(out, x)
 
     def test_shares_mask_across_columns(self):
         """DropoutColumnwise: identical mask for every column (dim=2)."""
-        from utils import dropout_columnwise
+        from minalphafold.utils import dropout_columnwise
         torch.manual_seed(42)
         x = torch.ones(2, 5, 7, 3)
         y = dropout_columnwise(x, p=0.5, training=True)
@@ -540,7 +536,7 @@ class TestDropoutColumnwise:
 
 class TestDistanceBin:
     def test_output_shape(self):
-        from utils import distance_bin
+        from minalphafold.utils import distance_bin
         pos = torch.randn(B, N_res, 3)
         n_bins = 64
         out = distance_bin(pos, n_bins)
@@ -551,13 +547,13 @@ class TestDistanceBin:
 
 class TestRecyclingDistanceBin:
     def test_output_shape(self):
-        from utils import recycling_distance_bin
+        from minalphafold.utils import recycling_distance_bin
         pos = torch.randn(B, N_res, 3)
         out = recycling_distance_bin(pos, n_bins=15)
         assert out.shape == (B, N_res, N_res, 15)
 
     def test_one_hot(self):
-        from utils import recycling_distance_bin
+        from minalphafold.utils import recycling_distance_bin
         pos = torch.randn(B, N_res, 3)
         out = recycling_distance_bin(pos, n_bins=15)
         # Each entry should be one-hot (sum to 1)
@@ -568,7 +564,7 @@ class TestRecyclingDistanceBin:
 
 class TestAlphaFold2:
     def test_forward_shapes(self, cfg):
-        from model import AlphaFold2
+        from minalphafold.model import AlphaFold2
         model = AlphaFold2(cfg)
         model.eval()
 
@@ -617,7 +613,7 @@ class TestIPAMasking:
     """IPA seq_mask: padded key positions should get zero attention weight."""
 
     def test_padded_keys_get_zero_attention(self, cfg):
-        from structure_module import InvariantPointAttention
+        from minalphafold.structure_module import InvariantPointAttention
         module = InvariantPointAttention(cfg)
         module.eval()
         with torch.no_grad():
@@ -643,7 +639,7 @@ class TestIPAMasking:
 
     def test_no_mask_matches_all_ones(self, cfg):
         """No mask = all-ones mask should give identical outputs."""
-        from structure_module import InvariantPointAttention
+        from minalphafold.structure_module import InvariantPointAttention
         module = InvariantPointAttention(cfg)
         module.eval()
         with torch.no_grad():
@@ -663,7 +659,7 @@ class TestIPAEquivariance:
     """IPA outputs should transform equivariantly under global rotations."""
 
     def test_rotation_equivariance(self, cfg):
-        from structure_module import InvariantPointAttention
+        from minalphafold.structure_module import InvariantPointAttention
         module = InvariantPointAttention(cfg)
         module.eval()
         with torch.no_grad():
@@ -704,7 +700,7 @@ class TestStructureModuleMask:
     """StructureModule with seq_mask should zero padded outputs."""
 
     def test_padded_outputs_zeroed(self, cfg):
-        from structure_module import StructureModule
+        from minalphafold.structure_module import StructureModule
         module = StructureModule(cfg)
         module.eval()
 
@@ -726,7 +722,7 @@ class TestGradientFlow:
 
     def test_structure_module_has_gradients(self, cfg):
         """Gradients flow through StructureModule into single_representation."""
-        from structure_module import StructureModule
+        from minalphafold.structure_module import StructureModule
         module = StructureModule(cfg)
 
         s = torch.randn(1, N_res, cfg.c_s, requires_grad=True)
@@ -743,7 +739,7 @@ class TestGradientFlow:
 
     def test_rotation_detach_stops_gradient(self, cfg):
         """Rotation gradients should be detached between SM iterations."""
-        from structure_module import StructureModule
+        from minalphafold.structure_module import StructureModule
         module = StructureModule(cfg)
 
         s = torch.randn(1, N_res, cfg.c_s, requires_grad=True)
@@ -765,7 +761,7 @@ class TestFrameComposition:
     """Composing identity transforms should give identity."""
 
     def test_identity_composition(self):
-        from structure_module import compose_transforms
+        from minalphafold.structure_module import compose_transforms
         R_id = torch.eye(3).unsqueeze(0)  # (1, 3, 3)
         t_zero = torch.zeros(1, 3)
 
@@ -774,7 +770,7 @@ class TestFrameComposition:
         assert torch.allclose(t_out, t_zero, atol=1e-6)
 
     def test_translation_only(self):
-        from structure_module import compose_transforms
+        from minalphafold.structure_module import compose_transforms
         R_id = torch.eye(3).unsqueeze(0)
         t1 = torch.tensor([[1.0, 2.0, 3.0]])
         t2 = torch.tensor([[4.0, 5.0, 6.0]])
@@ -785,8 +781,8 @@ class TestFrameComposition:
 
     def test_backbone_update_zero_init(self, cfg):
         """BackboneUpdate with zero input produces identity rotation + zero translation."""
-        from structure_module import BackboneUpdate
-        from model import AlphaFold2
+        from minalphafold.structure_module import BackboneUpdate
+        from minalphafold.model import AlphaFold2
         # Use AlphaFold2 to trigger _initialize_alphafold_parameters
         model = AlphaFold2(cfg)
         bu = model.structure_model.backbone_update
@@ -802,7 +798,7 @@ class TestFrameComposition:
             f"Expected zero translation, max diff = {t.abs().max():.6f}"
 
     def test_angle_resnet_second_linear_zero_init(self, cfg):
-        from model import AlphaFold2
+        from minalphafold.model import AlphaFold2
 
         model = AlphaFold2(cfg)
         angle_resnet = model.structure_model.sidechain_module.angle_resnet
@@ -812,8 +808,8 @@ class TestFrameComposition:
             assert torch.allclose(block.linear_2.bias, torch.zeros_like(block.linear_2.bias))
 
     def test_structure_module_uses_configurable_position_scale(self, cfg):
-        from residue_constants import restype_atom14_rigid_group_positions, restype_rigid_group_default_frame
-        from structure_module import StructureModule
+        from minalphafold.residue_constants import restype_atom14_rigid_group_positions, restype_rigid_group_default_frame
+        from minalphafold.structure_module import StructureModule
 
         cfg.position_scale = 20.0
         module = StructureModule(cfg)
@@ -829,18 +825,18 @@ class TestHeadZeroInit:
     """Verify head logit layers are zero-initialized per Supplement 1.11.4."""
 
     def test_distogram_head_zero_init(self, cfg):
-        from heads import DistogramHead
+        from minalphafold.heads import DistogramHead
         head = DistogramHead(cfg)
         assert torch.allclose(head.linear.weight, torch.zeros_like(head.linear.weight))
 
     def test_plddt_head_zero_init(self, cfg):
-        from heads import PLDDTHead
+        from minalphafold.heads import PLDDTHead
         head = PLDDTHead(cfg)
         final_linear = head.net[-1]
         assert torch.allclose(final_linear.weight, torch.zeros_like(final_linear.weight))
 
     def test_masked_msa_head_zero_init(self, cfg):
-        from heads import MaskedMSAHead
+        from minalphafold.heads import MaskedMSAHead
         head = MaskedMSAHead(cfg)
         assert torch.allclose(head.linear.weight, torch.zeros_like(head.linear.weight))
 
@@ -849,14 +845,14 @@ class TestIPAInitialization:
     """Verify IPA head weights initialize so softplus(w) = 1."""
 
     def test_head_weights_softplus_one(self, cfg):
-        from model import AlphaFold2
+        from minalphafold.model import AlphaFold2
         model = AlphaFold2(cfg)
         ipa = model.structure_model.IPA
         gamma = torch.nn.functional.softplus(ipa.head_weights)
         assert torch.allclose(gamma, torch.ones_like(gamma), atol=1e-5)
 
     def test_ipa_output_zero_init(self, cfg):
-        from model import AlphaFold2
+        from minalphafold.model import AlphaFold2
         model = AlphaFold2(cfg)
         ipa = model.structure_model.IPA
         assert torch.allclose(ipa.linear_output.weight, torch.zeros_like(ipa.linear_output.weight))

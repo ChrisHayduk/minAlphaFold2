@@ -1,16 +1,10 @@
 from pathlib import Path
-import sys
 
 import torch
 
-
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "minalphafold"))
-
-
-from a3m import sequence_to_ids
-from pdbio import atom14_to_pdb_string, write_model_output_pdb
-from residue_constants import restype_1to3, restype_name_to_atom14_names, restypes
+from minalphafold.a3m import sequence_to_ids
+from minalphafold.pdbio import atom14_to_pdb_string, write_model_output_pdb
+from minalphafold.residue_constants import restype_1to3, restype_name_to_atom14_names, restypes
 
 
 def make_full_atom14_example(sequence: str) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:

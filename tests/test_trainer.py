@@ -1,18 +1,12 @@
 import os
 from pathlib import Path
-import sys
 
 import torch
 
-
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "minalphafold"))
-
-
-from losses import AlphaFoldLoss
-from model import AlphaFold2
+from minalphafold.losses import AlphaFoldLoss
+from minalphafold.model import AlphaFold2
 from tests.test_data_pipeline import write_processed_cache
-from trainer import (
+from minalphafold.trainer import (
     alphafold2_model_config,
     build_optimizer,
     DataConfig,

@@ -1,21 +1,34 @@
+"""Structure Module (supplement 1.8, Algorithm 20) and its sub-modules.
+
+The Structure Module turns the Evoformer's single representation ``s_i``
+and pair representation ``z_ij`` into 3-D atom coordinates. Internally
+everything is in nanometres to match the supplement (literature bond
+lengths, translation scale ``s = 10``); the boundary is ``__init__``
+(constants Å → nm via ``position_scale``) and ``forward`` (outputs
+nm → Å). Algorithm-table mapping:
+
+* :class:`StructureModule`           — Algorithm 20 (the whole iterative loop).
+* :class:`InvariantPointAttention`   — Algorithm 22 (1.8.2).
+* :class:`BackboneUpdate`            — Algorithm 23 (1.8.3).
+* :func:`compute_all_atom_coordinates` — Algorithm 24 (1.8.4).
+* :func:`make_rot_x`                 — Algorithm 25 (1.8.4 line 1).
+* :class:`MultiRigidSidechain`       — torsion-angle head (supplement 1.8.4
+  text, produces the seven χ/φ/ψ/ω angles consumed by Algorithm 24).
+* :class:`AngleResnet` / :class:`AngleResnetBlock` — the ReLU-MLP trunk of
+  :class:`MultiRigidSidechain`; no algorithm number but called out in the
+  supplement's 1.8.4 discussion.
+"""
+
 import torch
 import math
 from typing import Optional
 
-try:
-    from .residue_constants import (
-        restype_rigid_group_default_frame,
-        restype_atom14_rigid_group_positions,
-        restype_atom14_to_rigid_group,
-        restype_atom14_mask,
-    )
-except ImportError:  # pragma: no cover - compatibility for direct module imports in tests/scripts.
-    from residue_constants import (
-        restype_rigid_group_default_frame,
-        restype_atom14_rigid_group_positions,
-        restype_atom14_to_rigid_group,
-        restype_atom14_mask,
-    )
+from .residue_constants import (
+    restype_rigid_group_default_frame,
+    restype_atom14_rigid_group_positions,
+    restype_atom14_to_rigid_group,
+    restype_atom14_mask,
+)
 
 
 def _truncated_normal_(tensor: torch.Tensor, std: float) -> None:
@@ -40,6 +53,14 @@ def _init_linear(linear: torch.nn.Linear, init: str = "default") -> None:
 
 
 class AngleResnetBlock(torch.nn.Module):
+    """One pre-ReLU residual block used inside :class:`AngleResnet`.
+
+    ``a → a + Linear(ReLU(Linear(ReLU(a))))``. The second Linear is
+    ``final``-initialised (zero weight/bias) so the block starts as
+    the identity, matching the supplement's "zero-init final weight
+    layer of every residual" rule (1.11.4).
+    """
+
     def __init__(self, c_hidden: int):
         super().__init__()
         self.linear_1 = torch.nn.Linear(c_hidden, c_hidden)
@@ -94,6 +115,31 @@ class AngleResnet(torch.nn.Module):
         return unnormalized_angles, angles
 
 class StructureModule(torch.nn.Module):
+    """Structure Module — iterative IPA + frame update (Algorithm 20).
+
+    Given the Evoformer's ``s_i`` and ``z_ij``:
+
+    1. Normalise inputs and project ``s_i`` to the module's internal
+       ``c`` channel dim (line 1-2).
+    2. Initialise the per-residue rigid frame ``T_i`` to the identity
+       ("black-hole initialisation", line 3).
+    3. Run ``config.structure_module_layers`` IPA iterations (default
+       8): :class:`InvariantPointAttention` updates ``s_i`` with
+       geometric context; a transition MLP mixes channels; a
+       :class:`BackboneUpdate` applies a local rotation + translation
+       to ``T_i`` (supplement 1.8.3).
+    4. After every iteration, :class:`MultiRigidSidechain` predicts
+       seven torsion angles from ``s_i`` and :func:`compute_all_atom_coordinates`
+       rolls them + ``T_i`` out to atom14 coordinates (Algorithm 24).
+
+    Units: internal nm (literature bond lengths divided by
+    ``position_scale``, output translations multiplied back to Å).
+    The frame rotation is detached between iterations (line 13,
+    "stop_gradient" on rotation only) — translations keep gradients so
+    the auxiliary FAPE on Cα at every layer has signal through to the
+    Evoformer.
+    """
+
     default_frames: torch.Tensor
     lit_positions: torch.Tensor
     atom_frame_idx_table: torch.Tensor
@@ -268,6 +314,28 @@ class StructureModule(torch.nn.Module):
 
 
 class InvariantPointAttention(torch.nn.Module):
+    """Invariant Point Attention (Algorithm 22, supplement 1.8.2).
+
+    The geometry-aware attention that lets the Structure Module reason
+    about 3-D context while staying equivariant to rigid motions of the
+    input. For each head, three attention-score contributions are summed:
+
+    1. Standard scalar Q·K attention on channel projections of ``s_i``.
+    2. Pair bias ``b_{ij} = Linear(z_{ij})`` — the pair rep as score bias.
+    3. "Point" attention on 3-D points ``Q, K, V`` transformed into each
+       residue's local frame ``T_i``: the attention score for (i, j) is
+       ``-γ_h · ||T_i(q_i^h) - T_j(k_j^h)||^2 / 2`` (line 7). Invariance
+       to rigid motion of the whole protein is guaranteed because frames
+       and points move together.
+
+    The combined score is ``(1/sqrt(3)) · (scalar + bias + points)`` per
+    supplement 1.8.2 (line 7), softmax'd over j, and the output pools
+    scalar values, pair values, and point values (transformed back into
+    each residue's local frame). ``seq_mask`` zeros both queries and
+    keys before the softmax so padded residues neither attend nor are
+    attended to.
+    """
+
     def __init__(self, config):
         super().__init__()
         self.num_heads = config.ipa_num_heads
@@ -473,6 +541,17 @@ class InvariantPointAttention(torch.nn.Module):
         return output
     
 class BackboneUpdate(torch.nn.Module):
+    """Backbone frame update (Algorithm 23, supplement 1.8.3).
+
+    Projects ``s_i`` to six scalars per residue: three for the local
+    axis-angle rotation update (interpreted as a unit quaternion
+    ``(1, b, c, d)`` after normalising, line 3-4) and three for the
+    translation update (in the residue's own frame, line 5). The
+    current frame ``T_i`` is then updated as ``T_i ← T_i ∘ (R, t)``.
+    The output projection is ``final``-initialised (zero) so each IPA
+    iteration starts as a no-op — training discovers the updates.
+    """
+
     def __init__(self, config):
         super().__init__()
         self.linear = torch.nn.Linear(in_features=config.c_s, out_features=6)
@@ -532,6 +611,19 @@ class BackboneUpdate(torch.nn.Module):
 
 
 class MultiRigidSidechain(torch.nn.Module):
+    """Torsion-angle head (supplement 1.8.4, the ``s_i → angles`` path).
+
+    Predicts the seven per-residue torsion angles ``α_i = (ω, φ, ψ,
+    χ1, χ2, χ3, χ4)`` as (sin, cos) pairs. Wraps an :class:`AngleResnet`
+    that takes both the current single rep ``s_i`` and the pre-IPA
+    "initial" single rep (supplement 1.8.4 recommends both, so the
+    torsion head keeps access to the undeformed Evoformer signal).
+    Returns the unnormalised (sin, cos) pairs (used by
+    :class:`~minalphafold.losses.TorsionAngleLoss` for the anglenorm
+    term) and their L2-normalised version (used by Algorithm 24 to
+    build rotation matrices).
+    """
+
     def __init__(self, config):
         super().__init__()
         self.c = getattr(config, "sidechain_num_channel", config.structure_module_c)
@@ -581,6 +673,20 @@ class MultiRigidSidechain(torch.nn.Module):
         }
     
 def make_rot_x(alpha: torch.Tensor):
+    """Rotation about the local x-axis by torsion angle ``α`` (Algorithm 25).
+
+    ``alpha`` comes in as ``(sin α, cos α)`` pairs (normalised by the
+    torsion head). The rotation matrix is::
+
+        | 1      0        0    |
+        | 0   cos α   -sin α   |
+        | 0   sin α    cos α   |
+
+    Returns ``(R, t)`` where ``t`` is zero — makeRotX builds a pure
+    rotation, the translation comes from the literature frame
+    ``T^lit`` that :func:`compute_all_atom_coordinates` composes with
+    this rotation (Algorithm 24 lines 4-10).
+    """
     # alpha is (sin, cos) pairs; extract cos and sin for rotation matrix
     a1 = alpha[..., 1]  # cos
     a2 = alpha[..., 0]  # sin
@@ -683,6 +789,30 @@ def compute_all_atom_coordinates(
     atom_frame_idx_table: torch.Tensor,  # (21, 14) — registered buffer
     atom_mask_table: torch.Tensor,       # (21, 14) — registered buffer
 ):
+    """Assemble per-residue atom14 coordinates (Algorithm 24).
+
+    Given the backbone frame ``(R_i, t_i)`` and seven torsion angles
+    ``α_i``, this rolls out the eight per-residue rigid-group frames
+    (backbone + ω + φ + ψ + χ1–χ4) and places each atom by looking up
+    which group it belongs to and its literature position within that
+    group:
+
+    * Lines 1-10: build the 8 frames parametrically — every sidechain
+      frame composes ``T_i ∘ T^lit_{r,f→bb} ∘ makeRotX(α_f)`` so the
+      torsion angles rotate about the local x-axis of each group
+      (:func:`make_rot_x`). χ2-χ4 chain off χ1 instead of the backbone.
+      Factored out into :func:`rigid_group_frames_from_torsions` so the
+      data pipeline can build ground-truth sidechain frames the same
+      way (see :func:`~minalphafold.data.build_supervision`).
+    * Lines 11-14: for each atom slot, look up its group index and
+      literature position, apply that group's frame.
+
+    Inputs are in the Structure Module's nm units; ``lit_positions``
+    and ``default_frames`` are already pre-scaled in
+    :class:`StructureModule.__init__`. Returns a dict with the 8
+    per-group frames (``frames_R``, ``frames_t``), the atom14 atom
+    positions ``atom_pos``, and per-atom validity ``atom_mask``.
+    """
     dtype = translations.dtype
     device = translations.device
 

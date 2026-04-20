@@ -10,11 +10,11 @@ from typing import Iterable, List, Sequence, Tuple
 import numpy as np
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-if str(REPO_ROOT / "minalphafold") not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT / "minalphafold"))
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
-from a3m import read_a3m, sequence_to_ids, ungap_query_columns
-from mmcif import extract_chain_atoms
+from minalphafold.a3m import read_a3m, sequence_to_ids, ungap_query_columns
+from minalphafold.mmcif import extract_chain_atoms
 
 
 def parse_args() -> argparse.Namespace:

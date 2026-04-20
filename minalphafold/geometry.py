@@ -46,36 +46,20 @@ from __future__ import annotations
 
 import torch
 
-try:
-    from .residue_constants import (
-        chi_angles_atoms,
-        chi_angles_mask,
-        chi_pi_periodic,
-        restype_atom14_is_ambiguous,
-        restype_atom14_renaming_matrices,
-        restype_rigidgroup_ambiguity_rot,
-        restype_rigidgroup_base_atom14_idx,
-        restype_rigidgroup_is_ambiguous,
-        restype_rigid_group_mask,
-        restype_1to3,
-        restype_name_to_atom14_names,
-        restypes,
-    )
-except ImportError:  # pragma: no cover - compatibility for direct module imports in tests/scripts.
-    from residue_constants import (
-        chi_angles_atoms,
-        chi_angles_mask,
-        chi_pi_periodic,
-        restype_atom14_is_ambiguous,
-        restype_atom14_renaming_matrices,
-        restype_rigidgroup_ambiguity_rot,
-        restype_rigidgroup_base_atom14_idx,
-        restype_rigidgroup_is_ambiguous,
-        restype_rigid_group_mask,
-        restype_1to3,
-        restype_name_to_atom14_names,
-        restypes,
-    )
+from .residue_constants import (
+    chi_angles_atoms,
+    chi_angles_mask,
+    chi_pi_periodic,
+    restype_atom14_is_ambiguous,
+    restype_atom14_renaming_matrices,
+    restype_rigidgroup_ambiguity_rot,
+    restype_rigidgroup_base_atom14_idx,
+    restype_rigidgroup_is_ambiguous,
+    restype_rigid_group_mask,
+    restype_1to3,
+    restype_name_to_atom14_names,
+    restypes,
+)
 
 
 # Chi-angle lookup tables, indexed by (restype_id, chi_index):

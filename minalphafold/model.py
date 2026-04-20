@@ -2,20 +2,12 @@ import torch
 import math
 from typing import cast
 
-try:
-    from .evoformer import Evoformer
-    from .structure_module import StructureModule
-    from .initialization import init_gate_linear, init_linear, zero_linear
-    from .embedders import InputEmbedder, TemplatePair, TemplatePointwiseAttention, ExtraMsaStack
-    from .heads import DistogramHead, PLDDTHead, MaskedMSAHead, TMScoreHead, ExperimentallyResolvedHead
-    from .utils import recycling_distance_bin
-except ImportError:  # pragma: no cover - compatibility for direct module imports in tests/scripts.
-    from evoformer import Evoformer
-    from structure_module import StructureModule
-    from initialization import init_gate_linear, init_linear, zero_linear
-    from embedders import InputEmbedder, TemplatePair, TemplatePointwiseAttention, ExtraMsaStack
-    from heads import DistogramHead, PLDDTHead, MaskedMSAHead, TMScoreHead, ExperimentallyResolvedHead
-    from utils import recycling_distance_bin
+from .evoformer import Evoformer
+from .structure_module import StructureModule
+from .initialization import init_gate_linear, init_linear, zero_linear
+from .embedders import InputEmbedder, TemplatePair, TemplatePointwiseAttention, ExtraMsaStack
+from .heads import DistogramHead, PLDDTHead, MaskedMSAHead, TMScoreHead, ExperimentallyResolvedHead
+from .utils import recycling_distance_bin
 
 class AlphaFold2(torch.nn.Module):
     """Top-level AlphaFold2 model (Algorithm 2).

@@ -35,12 +35,8 @@ from typing import Dict, Iterable, List, Tuple
 
 import numpy as np
 
-try:
-    from .a3m import sequence_to_ids
-    from .residue_constants import restype_name_to_atom14_names
-except ImportError:  # pragma: no cover - compatibility for direct module imports in tests/scripts.
-    from a3m import sequence_to_ids
-    from residue_constants import restype_name_to_atom14_names
+from .a3m import sequence_to_ids
+from .residue_constants import restype_name_to_atom14_names
 
 
 THREE_TO_ONE = {

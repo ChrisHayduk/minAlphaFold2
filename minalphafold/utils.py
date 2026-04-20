@@ -1,3 +1,23 @@
+"""Small tensor utilities shared across modules.
+
+Two groups of helpers:
+
+* **Shared-mask dropout** (supplement 1.11.6). :func:`dropout_rowwise`
+  and :func:`dropout_columnwise` implement the Evoformer's "drop a
+  whole row / column of the pair rep at once" variant — the mask is
+  constant along one spatial dimension and noisy along the other, so
+  every triangle-attention / triangle-multiplication update sees a
+  coherent drop pattern. Algorithm 6 + supplement 1.11.6 prescribe
+  row-wise drop on the starting-node triangle attention and column-
+  wise drop on the ending-node one; these helpers are the plumbing.
+* **Distance binning**. :func:`distance_bin` one-hots pairwise Cβ-Cβ
+  distances into the 64-bin distogram used by the distogram head
+  (supplement 1.9.8, bins in [2, 22] Å). :func:`one_hot_nearest`
+  implements Algorithm 5 ("assign to nearest bin centre"). The
+  recycling embedder uses a coarser 15-bin scheme in [3.375, 21.375]
+  Å (supplement 1.10 / Algorithm 32) via :func:`recycling_distance_bin`.
+"""
+
 import torch
 import torch.nn.functional as F
 

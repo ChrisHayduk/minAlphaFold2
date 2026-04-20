@@ -1,35 +1,54 @@
+"""Evoformer block (Algorithm 6) and MSA row attention with pair bias (Algorithm 7).
+
+The rest of the block's sub-modules (``MSAColumnAttention`` — Algorithm 8,
+``MSATransition`` — Algorithm 9, ``OuterProductMean`` — Algorithm 10,
+``TriangleMultiplication{Outgoing,Incoming}`` — Algorithms 11/12,
+``TriangleAttention{StartingNode,EndingNode}`` — Algorithms 13/14, and
+``PairTransition`` — Algorithm 15) live in :mod:`minalphafold.embedders`
+because they are reused by the Extra MSA stack and the Template pair stack.
+"""
+
 import torch
 import math
 from typing import Optional
 
-try:
-    from .initialization import init_gate_linear, init_linear
-    from .utils import dropout_columnwise, dropout_rowwise
-    from .embedders import (
-        MSATransition,
-        MSAColumnAttention,
-        OuterProductMean,
-        TriangleAttentionEndingNode,
-        TriangleAttentionStartingNode,
-        TriangleMultiplicationIncoming,
-        TriangleMultiplicationOutgoing,
-        PairTransition,
-    )
-except ImportError:  # pragma: no cover - compatibility for direct module imports in tests/scripts.
-    from initialization import init_gate_linear, init_linear
-    from utils import dropout_columnwise, dropout_rowwise
-    from embedders import (
-        MSATransition,
-        MSAColumnAttention,
-        OuterProductMean,
-        TriangleAttentionEndingNode,
-        TriangleAttentionStartingNode,
-        TriangleMultiplicationIncoming,
-        TriangleMultiplicationOutgoing,
-        PairTransition,
-    )
+from .initialization import init_gate_linear, init_linear
+from .utils import dropout_columnwise, dropout_rowwise
+from .embedders import (
+    MSATransition,
+    MSAColumnAttention,
+    OuterProductMean,
+    TriangleAttentionEndingNode,
+    TriangleAttentionStartingNode,
+    TriangleMultiplicationIncoming,
+    TriangleMultiplicationOutgoing,
+    PairTransition,
+)
 
 class Evoformer(torch.nn.Module):
+    """Evoformer block (Algorithm 6).
+
+    One full iteration over the paired MSA + pair representations:
+
+    1. MSA row-wise attention with pair bias (Alg 7) + row-wise dropout;
+    2. MSA column-wise attention (Alg 8) — no dropout;
+    3. MSA transition (Alg 9) — no dropout;
+    4. Pair update from the MSA via outer-product mean (Alg 10);
+    5. Triangle multiplicative updates outgoing/incoming (Alg 11/12) +
+       row-wise dropout;
+    6. Triangle self-attention around the starting/ending node (Alg 13/14)
+       — row-wise dropout on starting, column-wise on ending
+       (supplement 1.11.6);
+    7. Pair transition (Alg 15) — no dropout.
+
+    Dropout rates are read from ``config.evoformer_msa_dropout`` and
+    ``config.evoformer_pair_dropout`` so the Template pair stack
+    (:class:`minalphafold.embedders.TemplatePair`) and the Extra MSA stack
+    (:class:`minalphafold.embedders.ExtraMsaStack`) can reuse the same
+    sub-modules with different dropout schedules. The block is stacked
+    ``config.num_evoformer_blocks`` times in :class:`minalphafold.model.AlphaFold2`.
+    """
+
     def __init__(self, config):
         super().__init__()
         self.msa_row_att = MSARowAttentionWithPairBias(config)
@@ -76,6 +95,19 @@ class Evoformer(torch.nn.Module):
         return msa_representation, pair_representation
 
 class MSARowAttentionWithPairBias(torch.nn.Module):
+    """MSA row-wise gated self-attention with pair bias (Algorithm 7).
+
+    For each MSA row s, standard multi-head self-attention over residues
+    ``i, j``, with the pair representation z injected as a learned
+    per-head bias: ``a_{sij}^h = softmax_j(q · k / sqrt(c) + b_{ij}^h)``
+    where ``b_{ij}^h = LinearNoBias(LayerNorm(z_{ij}))`` (line 3). The
+    output is gated by ``sigmoid(Linear(m)) ⊙ attention_output`` and
+    projected back to ``c_m``. The pair bias is what lets the pair rep
+    influence the MSA rep inside a single Evoformer block — the
+    symmetric path through :class:`OuterProductMean` fires on the way
+    back in step 4.
+    """
+
     def __init__(self, config):
         super().__init__()
         self.layer_norm_msa = torch.nn.LayerNorm(config.c_m)

@@ -1,20 +1,56 @@
+"""Embedding and pair-update modules used by the Evoformer trunk.
+
+This module collects every shared Evoformer sub-block plus the pre-trunk
+embedders. The class-to-algorithm mapping mirrors the supplement:
+
+* :class:`InputEmbedder`                      — Algorithm 3
+* :class:`RelPos`                             — Algorithm 4
+* :class:`MSAColumnAttention`                 — Algorithm 8
+* :class:`MSATransition`                      — Algorithm 9
+* :class:`OuterProductMean`                   — Algorithm 10
+* :class:`TriangleMultiplicationOutgoing`     — Algorithm 11
+* :class:`TriangleMultiplicationIncoming`     — Algorithm 12
+* :class:`TriangleAttentionStartingNode`      — Algorithm 13
+* :class:`TriangleAttentionEndingNode`        — Algorithm 14
+* :class:`PairTransition`                     — Algorithm 15
+* :class:`TemplatePair`                       — Algorithm 16 (1.7.1)
+* :class:`TemplatePointwiseAttention`         — Algorithm 17 (1.7.1)
+* :class:`ExtraMsaStack`                      — Algorithm 18 (1.7.2)
+* :class:`MSAColumnGlobalAttention`           — Algorithm 19 (1.7.2)
+
+``MSARowAttentionWithPairBias`` (Algorithm 7) lives in
+:mod:`minalphafold.evoformer` alongside the full Evoformer block.
+"""
+
 import torch
 import math
 from typing import Optional
 
-try:
-    from .a3m import SEQ_ALPHABET_SIZE
-    from .initialization import init_gate_linear, init_linear
-    from .utils import dropout_columnwise, dropout_rowwise
-except ImportError:  # pragma: no cover - compatibility for direct module imports in tests/scripts.
-    from a3m import SEQ_ALPHABET_SIZE
-    from initialization import init_gate_linear, init_linear
-    from utils import dropout_columnwise, dropout_rowwise
+from .a3m import SEQ_ALPHABET_SIZE
+from .initialization import init_gate_linear, init_linear
+from .utils import dropout_columnwise, dropout_rowwise
 
 
 TARGET_FEAT_DIM = SEQ_ALPHABET_SIZE + 1
 
 class InputEmbedder(torch.nn.Module):
+    """Initial MSA + pair embedding (Algorithm 3).
+
+    Produces the starting ``m_si`` and ``z_ij`` for the Evoformer by
+    combining:
+
+    * three linear projections of ``target_feat`` (shape
+      ``(batch, N_res, TARGET_FEAT_DIM)``) — two broadcast into the
+      outer-sum for ``z`` and one added to the query row of ``m``;
+    * a relative-positional encoding ``RelPos(residue_index)`` added to
+      ``z`` (Algorithm 4);
+    * a linear projection of ``msa_feat`` (49 channels — cluster profile
+      + deletion features, per Table 1) added to every MSA row in ``m``.
+
+    Output shapes: ``m`` ``(batch, N_cluster, N_res, c_m)``, ``z``
+    ``(batch, N_res, N_res, c_z)``.
+    """
+
     def __init__(self, config):
         super().__init__()
 
@@ -58,6 +94,16 @@ class InputEmbedder(torch.nn.Module):
         return m, z
 
 class RelPos(torch.nn.Module):
+    """Relative-position encoding (Algorithm 4).
+
+    One-hots the clipped residue-index difference
+    ``clamp(r_i - r_j, -max_rel, max_rel)`` into ``2·max_rel+1`` bins
+    (default ``max_rel = 32`` → 65 bins) and projects to ``c_z``. The
+    output is added to the pair representation by :class:`InputEmbedder`
+    so the Evoformer trunk has a learned sense of residue adjacency from
+    the very first block. Clipping at ±32 matches the supplement.
+    """
+
     def __init__(self, config, max_rel=32):
         super().__init__()
         self.max_rel = max_rel
@@ -72,6 +118,19 @@ class RelPos(torch.nn.Module):
         return self.linear(oh)  # (batch, N_res, N_res, c_z)
 
 class TemplatePair(torch.nn.Module):
+    """Template pair stack (Algorithm 16, supplement 1.7.1).
+
+    Per-template shallow Evoformer-like pair stack: each of
+    ``config.template_pair_num_blocks`` blocks applies triangle
+    self-attention (start + end), triangle multiplication
+    (outgoing + incoming), and a pair transition. Dropout matches the
+    supplement — row-wise on starting / multiplicative updates, column-
+    wise on ending. Batch and template dims are flattened for each
+    block so templates evolve independently; the final LayerNorm
+    happens once before the pointwise attention pool in
+    :class:`TemplatePointwiseAttention`.
+    """
+
     def __init__(self, config):
         super().__init__()
 
@@ -154,6 +213,18 @@ class TemplatePair(torch.nn.Module):
         return pair_representation
 
 class TemplatePointwiseAttention(torch.nn.Module):
+    """Template pointwise attention (Algorithm 17, supplement 1.7.1).
+
+    Pool ``N_templates`` per-pair features into a single pair update by
+    attending, for each residue pair (i, j) independently, across the
+    template dimension. The query is the current pair representation
+    ``z_ij``; keys and values are the per-template embeddings produced
+    by :class:`TemplatePair`. No spatial mixing — the softmax is only
+    over templates. Padding templates are masked before the softmax
+    and the attention rows are renormalised over the surviving
+    templates.
+    """
+
     def __init__(self, config):
         super().__init__()
 
@@ -227,6 +298,26 @@ class TemplatePointwiseAttention(torch.nn.Module):
         return output
 
 class ExtraMsaStack(torch.nn.Module):
+    """Extra MSA stack (Algorithm 18, supplement 1.7.2).
+
+    Lightweight Evoformer-like block for the unclustered "extra" MSA.
+    The extra MSA is much deeper (default ``N_extra_seq = 1024`` vs
+    ``N_cluster = 128``) but compressed to a smaller channel dim
+    ``c_e`` to stay cheap. Two differences from the main Evoformer:
+
+    * MSA column attention is replaced by
+      :class:`MSAColumnGlobalAttention` (Algorithm 19) — across
+      thousands of sequences, per-head K/V sharing is what keeps
+      the column step tractable.
+    * Row attention with pair bias is inlined here rather than
+      reusing :class:`~minalphafold.evoformer.MSARowAttentionWithPairBias`
+      so ``c_e ≠ c_m`` projections stay self-contained.
+
+    Consumes the extra MSA representation and the pair representation;
+    writes updates back to both (triangle updates + pair transition
+    apply after the OPM consumes the updated extra MSA).
+    """
+
     def __init__(self, config):
         super().__init__()
 
@@ -467,6 +558,16 @@ class MSAColumnGlobalAttention(torch.nn.Module):
         return output
 
 class MSAColumnAttention(torch.nn.Module):
+    """MSA column-wise gated self-attention (Algorithm 8).
+
+    For each residue column i, attend across MSA sequences
+    ``s = 1, ..., N_seq`` with standard multi-head attention on ``m_{si}``
+    (no pair bias, unlike the row variant). Gated by
+    ``sigmoid(Linear(m))`` and projected back to ``c_m``. No dropout
+    per Algorithm 6. Used only in the main Evoformer; the extra MSA
+    stack uses :class:`MSAColumnGlobalAttention` instead.
+    """
+
     def __init__(self, config):
         super().__init__()
         self.layer_norm_msa = torch.nn.LayerNorm(config.c_m)
@@ -537,6 +638,17 @@ class MSAColumnAttention(torch.nn.Module):
 
 
 class MSATransition(torch.nn.Module):
+    """MSA transition (Algorithm 9).
+
+    Two-layer feed-forward applied per MSA cell: ``LayerNorm → Linear(c
+    → n·c) → ReLU → Linear(n·c → c)`` with ``n = 4`` by default. The
+    widening factor ``n`` is the supplement's ``n`` parameter, kept
+    configurable so the extra MSA stack can choose its own (``c_in``
+    also overrideable so the same module serves both ``c_m`` and
+    ``c_e`` MSA reps). No dropout — the residual connection is purely
+    additive per Algorithm 6.
+    """
+
     def __init__(self, config, c_in: Optional[int] = None, n: Optional[int] = None):
         super().__init__()
         self.c_in = config.c_m if c_in is None else c_in
@@ -557,6 +669,19 @@ class MSATransition(torch.nn.Module):
         return self.linear_down(torch.nn.functional.relu(activations))
 
 class OuterProductMean(torch.nn.Module):
+    """Outer product mean (Algorithm 10).
+
+    Symmetric MSA → pair update: project each MSA cell to two hidden
+    vectors ``a_{si}, b_{si} ∈ R^{c_hidden}``, take the MSA mean of
+    their outer product ``mean_s (a_{si} ⊗ b_{sj})``, flatten to
+    ``c_hidden^2`` channels, and project back to ``c_z``. This is the
+    only channel in the Evoformer where the MSA rep writes into the
+    pair rep; the reverse direction (pair → MSA) goes through the
+    pair-biased row attention.
+    ``c_in``/``c_hidden`` are configurable so the extra MSA stack can
+    run a narrower OPM.
+    """
+
     def __init__(self, config, c_in: Optional[int] = None, c_hidden: Optional[int] = None):
         super().__init__()
         self.c_in = config.c_m if c_in is None else c_in
@@ -603,6 +728,17 @@ class OuterProductMean(torch.nn.Module):
         return self.linear_out(mean_val)
 
 class TriangleMultiplicationOutgoing(torch.nn.Module):
+    """Triangle multiplicative update, outgoing edges (Algorithm 11).
+
+    Update ``z_ij`` from the two *outgoing* edges of the triangle
+    ``(i, j, k)``: ``z_ij ← g_ij ⊙ Linear(LayerNorm(sum_k a_ik ⊙
+    b_jk))`` where ``a = gate_a ⊙ projection_a(z)`` and likewise for
+    ``b``. Enforces the triangle-inequality structure across the pair
+    rep. Algorithm 11 pools over intermediate node ``k`` via the
+    outgoing edges ``z_{ik}`` and ``z_{jk}``; the incoming-edge
+    counterpart is :class:`TriangleMultiplicationIncoming`.
+    """
+
     def __init__(self, config):
         super().__init__()
         self.layer_norm_pair = torch.nn.LayerNorm(config.c_z)
@@ -654,6 +790,15 @@ class TriangleMultiplicationOutgoing(torch.nn.Module):
 
 
 class TriangleMultiplicationIncoming(torch.nn.Module):
+    """Triangle multiplicative update, incoming edges (Algorithm 12).
+
+    Symmetric partner of :class:`TriangleMultiplicationOutgoing`: pool
+    over intermediate node ``k`` using the *incoming* edges
+    ``z_{ki}`` and ``z_{kj}`` (i.e. ``sum_k a_ki ⊙ b_kj``). Outgoing and
+    incoming variants fire back-to-back in every Evoformer block so the
+    pair rep sees both triangle orientations per iteration.
+    """
+
     def __init__(self, config):
         super().__init__()
         self.layer_norm_pair = torch.nn.LayerNorm(config.c_z)
@@ -704,6 +849,15 @@ class TriangleMultiplicationIncoming(torch.nn.Module):
         return out
 
 class TriangleAttentionStartingNode(torch.nn.Module):
+    """Triangle self-attention around the starting node (Algorithm 13).
+
+    Gated multi-head self-attention over the pair rep with a
+    triangle-consistency bias: for fixed starting node i, attend over
+    ending nodes j with keys from ``z_{ij}`` and values from
+    ``z_{ik}``, plus a pair bias ``b_{jk} = LinearNoBias(LayerNorm(
+    z_{jk}))``. Row-wise dropout (supplement 1.11.6) matches Algorithm 6.
+    """
+
     def __init__(self, config):
         super().__init__()
         self.layer_norm = torch.nn.LayerNorm(config.c_z)
@@ -782,6 +936,15 @@ class TriangleAttentionStartingNode(torch.nn.Module):
         return output
 
 class TriangleAttentionEndingNode(torch.nn.Module):
+    """Triangle self-attention around the ending node (Algorithm 14).
+
+    Mirror image of :class:`TriangleAttentionStartingNode`: fix the
+    ending node j and attend over starting nodes i. The pair bias is
+    ``b_{ki} = LinearNoBias(LayerNorm(z_{ki}))``. The supplement
+    prescribes column-wise dropout (not row-wise) on this output — the
+    Evoformer block applies it accordingly.
+    """
+
     def __init__(self, config):
         super().__init__()
         self.layer_norm = torch.nn.LayerNorm(config.c_z)
@@ -873,6 +1036,14 @@ class TriangleAttentionEndingNode(torch.nn.Module):
         return output
 
 class PairTransition(torch.nn.Module):
+    """Pair transition (Algorithm 15).
+
+    Per-pair feed-forward: ``LayerNorm → Linear(c_z → n·c_z) → ReLU →
+    Linear(n·c_z → c_z)`` with widening factor ``n = 4``. Same shape as
+    :class:`MSATransition` but over the pair rep instead of the MSA
+    rep. No dropout per Algorithm 6.
+    """
+
     def __init__(self, config):
         super().__init__()
         self.n = config.pair_transition_n

@@ -1,19 +1,13 @@
 import os
-from pathlib import Path
 import random
-import sys
+from pathlib import Path
 
 import numpy as np
 import torch
 
-
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "minalphafold"))
-sys.path.insert(0, str(ROOT / "scripts"))
-
-import data as data_module
-from a3m import MASK_ID, MSA_ALPHABET_SIZE, sequence_to_ids
-from data import (
+from minalphafold import data as data_module
+from minalphafold.a3m import MASK_ID, MSA_ALPHABET_SIZE, sequence_to_ids
+from minalphafold.data import (
     ProcessedOpenProteinSetDataset,
     TARGET_FEAT_DIM,
     build_msa_features,
@@ -27,10 +21,9 @@ from data import (
     discover_chain_ids,
     split_chain_ids,
 )
-from losses import AlphaFoldLoss, select_best_atom14_ground_truth
-from model import AlphaFold2
-from preprocess_openproteinset import preprocess_chain
-from residue_constants import (
+from minalphafold.losses import AlphaFoldLoss, select_best_atom14_ground_truth
+from minalphafold.model import AlphaFold2
+from minalphafold.residue_constants import (
     atom_type_num,
     restype_1to3,
     restype_atom14_mask,
@@ -38,7 +31,10 @@ from residue_constants import (
     restype_atom14_to_rigid_group,
     restype_rigid_group_default_frame,
 )
-from structure_module import compute_all_atom_coordinates
+from minalphafold.structure_module import compute_all_atom_coordinates
+from preprocess_openproteinset import preprocess_chain
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 class SmallConfig:

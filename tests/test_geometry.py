@@ -1,14 +1,7 @@
-import os
-import sys
-
 import torch
 
-
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "minalphafold"))
-
-
-from a3m import sequence_to_ids
-from geometry import (
+from minalphafold.a3m import sequence_to_ids
+from minalphafold.geometry import (
     alternative_torsion_angles,
     atom14_to_rigid_group_frames,
     backbone_frames,
@@ -16,7 +9,7 @@ from geometry import (
     rigid_group_exists,
     torsion_angles,
 )
-from residue_constants import (
+from minalphafold.residue_constants import (
     chi_pi_periodic,
     restype_atom14_mask,
     restype_atom14_rigid_group_positions,
@@ -24,7 +17,7 @@ from residue_constants import (
     restype_rigid_group_default_frame,
     restype_rigid_group_mask,
 )
-from structure_module import compute_all_atom_coordinates
+from minalphafold.structure_module import compute_all_atom_coordinates
 
 
 def make_atom14_example(sequence: str) -> tuple[torch.Tensor, torch.Tensor]:

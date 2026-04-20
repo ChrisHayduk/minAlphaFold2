@@ -1,13 +1,13 @@
-import os
-import sys
-
 import numpy as np
 
-
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "minalphafold"))
-
-
-from a3m import GAP_ID, MASK_ID, aa_to_id, read_a3m, sequence_to_ids, ungap_query_columns
+from minalphafold.a3m import (
+    GAP_ID,
+    MASK_ID,
+    aa_to_id,
+    read_a3m,
+    sequence_to_ids,
+    ungap_query_columns,
+)
 
 
 def test_read_a3m_parses_insertions_and_deletions(tmp_path):

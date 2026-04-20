@@ -1,14 +1,7 @@
-import os
-import sys
-
 import numpy as np
 
-
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "minalphafold"))
-
-
-from a3m import sequence_to_ids
-from mmcif import extract_chain_atoms
+from minalphafold.a3m import sequence_to_ids
+from minalphafold.mmcif import extract_chain_atoms
 
 
 def test_extract_chain_atoms_uses_label_chain_fallback_and_altloc_priority(tmp_path):

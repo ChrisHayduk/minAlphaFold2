@@ -44,40 +44,22 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset
 
-try:
-    from .a3m import GAP_ID, MASK_ID, MSA_ALPHABET_SIZE, SEQ_ALPHABET_SIZE
-    from .geometry import (
-        atom14_to_rigid_group_frames,
-        alternative_atom14_ground_truth,
-        alternative_torsion_angles,
-        backbone_frames,
-        pseudo_beta_positions,
-        torsion_angles,
-    )
-    from .residue_constants import (
-        STANDARD_ATOM_MASK,
-        atom_type_num,
-        restype_atom14_to_atom37,
-        restype_rigid_group_default_frame,
-    )
-    from .structure_module import rigid_group_frames_from_torsions
-except ImportError:  # pragma: no cover - compatibility for direct module imports in tests/scripts.
-    from a3m import GAP_ID, MASK_ID, MSA_ALPHABET_SIZE, SEQ_ALPHABET_SIZE
-    from geometry import (
-        atom14_to_rigid_group_frames,
-        alternative_atom14_ground_truth,
-        alternative_torsion_angles,
-        backbone_frames,
-        pseudo_beta_positions,
-        torsion_angles,
-    )
-    from residue_constants import (
-        STANDARD_ATOM_MASK,
-        atom_type_num,
-        restype_atom14_to_atom37,
-        restype_rigid_group_default_frame,
-    )
-    from structure_module import rigid_group_frames_from_torsions
+from .a3m import GAP_ID, MASK_ID, MSA_ALPHABET_SIZE, SEQ_ALPHABET_SIZE
+from .geometry import (
+    atom14_to_rigid_group_frames,
+    alternative_atom14_ground_truth,
+    alternative_torsion_angles,
+    backbone_frames,
+    pseudo_beta_positions,
+    torsion_angles,
+)
+from .residue_constants import (
+    STANDARD_ATOM_MASK,
+    atom_type_num,
+    restype_atom14_to_atom37,
+    restype_rigid_group_default_frame,
+)
+from .structure_module import rigid_group_frames_from_torsions
 
 # Table 1 feature dimensions.
 TEMPLATE_PAIR_BINS = 39              # distogram: 38 equal-width + 1 catch-all
