@@ -13,9 +13,14 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from data import ProcessedOpenProteinSetDataset, collate_batch
-from losses import AlphaFoldLoss
-from model import AlphaFold2
+try:
+    from .data import ProcessedOpenProteinSetDataset, collate_batch
+    from .losses import AlphaFoldLoss
+    from .model import AlphaFold2
+except ImportError:  # pragma: no cover - compatibility for direct module imports in tests/scripts.
+    from data import ProcessedOpenProteinSetDataset, collate_batch
+    from losses import AlphaFoldLoss
+    from model import AlphaFold2
 
 
 def default_device() -> str:
@@ -52,6 +57,10 @@ def _make_model_config(**overrides: Any) -> SimpleNamespace:
         "structure_module_layers": 2,
         "structure_module_dropout_ipa": 0.0,
         "structure_module_dropout_transition": 0.0,
+        "sidechain_num_channel": 16,
+        "sidechain_num_residual_block": 2,
+        "position_scale": 10.0,
+        "zero_init": True,
         "ipa_num_heads": 4,
         "ipa_c": 8,
         "ipa_n_query_points": 4,
@@ -73,11 +82,14 @@ class DataConfig:
     processed_features_dir: str | Path = "data/processed_features"
     processed_labels_dir: str | Path = "data/processed_labels"
     val_fraction: float = 0.1
-    crop_size: int = 128
-    msa_depth: int = 64
-    extra_msa_depth: int = 128
-    max_templates: int = 1
+    crop_size: int = 256
+    msa_depth: int = 128
+    extra_msa_depth: int = 1024
+    max_templates: int = 4
     block_delete_training_msa: bool = True
+    block_delete_msa_fraction: float = 0.3
+    block_delete_msa_randomize_num_blocks: bool = False
+    block_delete_msa_num_blocks: int = 5
     masked_msa_probability: float = 0.15
     fixed_feature_seed: int | None = None
 
@@ -102,6 +114,7 @@ class TrainingConfig:
     n_ensemble: int = 1
     finetune: bool = False
     finetune_start_step: int | None = None
+    detach_rotations: bool = True
     latest_checkpoint_path: str | Path | None = None
     best_checkpoint_path: str | Path | None = None
 
@@ -135,6 +148,8 @@ def medium_model_config() -> SimpleNamespace:
         num_evoformer=4,
         structure_module_c=64,
         structure_module_layers=4,
+        sidechain_num_channel=64,
+        sidechain_num_residual_block=2,
         ipa_num_heads=8,
         ipa_c=16,
         ipa_n_query_points=4,
@@ -177,6 +192,8 @@ def alphafold2_model_config() -> SimpleNamespace:
         structure_module_layers=8,
         structure_module_dropout_ipa=0.1,
         structure_module_dropout_transition=0.1,
+        sidechain_num_channel=128,
+        sidechain_num_residual_block=2,
         ipa_num_heads=12,
         ipa_c=16,
         ipa_n_query_points=4,
@@ -242,6 +259,8 @@ def build_dataloader(
     num_workers: int = 0,
     device: str = "cpu",
     seed: int = 0,
+    n_cycles: int = 1,
+    n_ensemble: int = 1,
 ) -> DataLoader:
     dataset = ProcessedOpenProteinSetDataset(
         data_config.processed_features_dir,
@@ -258,8 +277,13 @@ def build_dataloader(
         max_templates=data_config.max_templates,
         training=training,
         block_delete_training_msa=data_config.block_delete_training_msa,
+        block_delete_msa_fraction=data_config.block_delete_msa_fraction,
+        block_delete_msa_randomize_num_blocks=data_config.block_delete_msa_randomize_num_blocks,
+        block_delete_msa_num_blocks=data_config.block_delete_msa_num_blocks,
         masked_msa_probability=data_config.masked_msa_probability,
         random_seed=data_config.fixed_feature_seed,
+        num_recycling_samples=n_cycles,
+        num_ensemble_samples=n_ensemble,
     )
     generator = torch.Generator()
     generator.manual_seed(seed)
@@ -336,31 +360,68 @@ def model_inputs_from_batch(batch: dict[str, Any], training_config: TrainingConf
         "aatype": batch["aatype"],
         "template_angle_feat": batch["template_angle_feat"],
         "template_mask": batch["template_mask"],
+        "template_residue_mask": batch["template_residue_mask"],
         "seq_mask": batch["seq_mask"],
         "msa_mask": batch["msa_mask"],
         "extra_msa_mask": batch["extra_msa_mask"],
         "n_cycles": training_config.n_cycles,
         "n_ensemble": training_config.n_ensemble,
+        "detach_rotations": training_config.detach_rotations,
     }
 
 
+def collapse_sampled_batch_tensor(
+    tensor: torch.Tensor,
+    *,
+    recycle_index: int | None = None,
+    ensemble_index: int = 0,
+) -> torch.Tensor:
+    if tensor.ndim >= 5:
+        if recycle_index is None:
+            recycle_index = tensor.shape[0] - 1
+        return tensor[recycle_index, ensemble_index]
+    return tensor
+
+
 def loss_inputs_from_batch(batch: dict[str, Any], outputs: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    recycle_index = max(int(outputs.get("sampled_n_cycles", 1)) - 1, 0)
+    ensemble_index = 0
     return {
         "structure_model_prediction": outputs,
         "true_rotations": batch["true_rotations"],
         "true_translations": batch["true_translations"],
         "true_atom_positions": batch["true_atom_positions"],
         "true_atom_mask": batch["true_atom_mask"],
+        "true_atom_positions_alt": batch["true_atom_positions_alt"],
+        "true_atom_mask_alt": batch["true_atom_mask_alt"],
+        "true_atom_is_ambiguous": batch["true_atom_is_ambiguous"],
         "true_torsion_angles": batch["true_torsion_angles"],
+        "true_torsion_angles_alt": batch["true_torsion_angles_alt"],
         "true_torsion_mask": batch["true_torsion_mask"],
+        "true_rigid_group_frames_R": batch["true_rigid_group_frames_R"],
+        "true_rigid_group_frames_t": batch["true_rigid_group_frames_t"],
+        "true_rigid_group_frames_R_alt": batch["true_rigid_group_frames_R_alt"],
+        "true_rigid_group_frames_t_alt": batch["true_rigid_group_frames_t_alt"],
+        "true_rigid_group_exists": batch["true_rigid_group_exists"],
         "experimentally_resolved_pred": outputs["experimentally_resolved_logits"],
         "experimentally_resolved_true": batch["experimentally_resolved_true"],
+        "experimentally_resolved_exists": batch["atom37_exists"],
+        "resolution": batch.get("resolution"),
         "masked_msa_pred": outputs["masked_msa_logits"],
-        "masked_msa_target": batch["masked_msa_target"],
-        "masked_msa_mask": batch["masked_msa_mask"],
+        "masked_msa_target": collapse_sampled_batch_tensor(
+            batch["masked_msa_target"],
+            recycle_index=recycle_index,
+            ensemble_index=ensemble_index,
+        ),
+        "masked_msa_mask": collapse_sampled_batch_tensor(
+            batch["masked_msa_mask"],
+            recycle_index=recycle_index,
+            ensemble_index=ensemble_index,
+        ),
         "plddt_pred": outputs["plddt_logits"],
         "distogram_pred": outputs["distogram_logits"],
         "res_types": batch["res_types"],
+        "residue_index": batch["residue_index"],
         "seq_mask": batch["seq_mask"],
     }
 
@@ -473,6 +534,8 @@ def fit(
         num_workers=training_config.num_workers,
         device=str(device),
         seed=training_config.seed,
+        n_cycles=training_config.n_cycles,
+        n_ensemble=training_config.n_ensemble,
     )
     if len(train_loader.dataset) == 0:
         raise ValueError("Training split is empty. Check the processed cache paths and val_fraction.")
@@ -485,6 +548,8 @@ def fit(
         num_workers=training_config.num_workers,
         device=str(device),
         seed=training_config.seed,
+        n_cycles=training_config.n_cycles,
+        n_ensemble=training_config.n_ensemble,
     )
     has_validation = data_config.val_fraction > 0.0 and len(val_loader.dataset) > 0
 
@@ -572,11 +637,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--processed-features-dir", type=str, default="data/processed_features")
     parser.add_argument("--processed-labels-dir", type=str, default="data/processed_labels")
     parser.add_argument("--val-fraction", type=float, default=0.1)
-    parser.add_argument("--crop-size", type=int, default=128)
-    parser.add_argument("--msa-depth", type=int, default=64)
-    parser.add_argument("--extra-msa-depth", type=int, default=128)
-    parser.add_argument("--max-templates", type=int, default=1)
+    parser.add_argument("--crop-size", type=int, default=256)
+    parser.add_argument("--msa-depth", type=int, default=128)
+    parser.add_argument("--extra-msa-depth", type=int, default=1024)
+    parser.add_argument("--max-templates", type=int, default=4)
     parser.add_argument("--disable-block-delete-training-msa", action="store_true")
+    parser.add_argument("--block-delete-msa-fraction", type=float, default=0.3)
+    parser.add_argument("--block-delete-msa-num-blocks", type=int, default=5)
+    parser.add_argument("--block-delete-msa-randomize-num-blocks", action="store_true")
     parser.add_argument("--masked-msa-probability", type=float, default=0.15)
     parser.add_argument("--fixed-feature-seed", type=int, default=None)
     parser.add_argument("--epochs", type=int, default=1)
@@ -614,6 +682,9 @@ def main(argv: list[str] | None = None) -> tuple[AlphaFold2, list[dict[str, floa
         extra_msa_depth=args.extra_msa_depth,
         max_templates=args.max_templates,
         block_delete_training_msa=not args.disable_block_delete_training_msa,
+        block_delete_msa_fraction=args.block_delete_msa_fraction,
+        block_delete_msa_randomize_num_blocks=args.block_delete_msa_randomize_num_blocks,
+        block_delete_msa_num_blocks=args.block_delete_msa_num_blocks,
         masked_msa_probability=args.masked_msa_probability,
         fixed_feature_seed=args.fixed_feature_seed,
     )

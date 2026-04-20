@@ -3,7 +3,10 @@ from typing import Any
 
 import torch
 
-from residue_constants import restype_1to3, restype_name_to_atom14_names, restypes
+try:
+    from .residue_constants import restype_1to3, restype_name_to_atom14_names, restypes
+except ImportError:  # pragma: no cover - compatibility for direct module imports in tests/scripts.
+    from residue_constants import restype_1to3, restype_name_to_atom14_names, restypes
 
 
 def _to_tensor(value: Any, *, dtype: torch.dtype) -> torch.Tensor:

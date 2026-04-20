@@ -1,27 +1,42 @@
 import torch
 import math
 from typing import Optional
-from utils import dropout_columnwise, dropout_rowwise
+
+try:
+    from .a3m import SEQ_ALPHABET_SIZE
+    from .initialization import init_gate_linear, init_linear
+    from .utils import dropout_columnwise, dropout_rowwise
+except ImportError:  # pragma: no cover - compatibility for direct module imports in tests/scripts.
+    from a3m import SEQ_ALPHABET_SIZE
+    from initialization import init_gate_linear, init_linear
+    from utils import dropout_columnwise, dropout_rowwise
+
+
+TARGET_FEAT_DIM = SEQ_ALPHABET_SIZE + 1
 
 class InputEmbedder(torch.nn.Module):
     def __init__(self, config):
         super().__init__()
 
-        self.linear_target_feat_1 = torch.nn.Linear(in_features=21, out_features=config.c_z)
-        self.linear_target_feat_2 = torch.nn.Linear(in_features=21, out_features=config.c_z)
-        self.linear_target_feat_3 = torch.nn.Linear(in_features=21, out_features=config.c_m)
+        self.linear_target_feat_1 = torch.nn.Linear(in_features=TARGET_FEAT_DIM, out_features=config.c_z)
+        self.linear_target_feat_2 = torch.nn.Linear(in_features=TARGET_FEAT_DIM, out_features=config.c_z)
+        self.linear_target_feat_3 = torch.nn.Linear(in_features=TARGET_FEAT_DIM, out_features=config.c_m)
 
 
         self.linear_msa = torch.nn.Linear(in_features=49, out_features=config.c_m)
+        init_linear(self.linear_target_feat_1, init="default")
+        init_linear(self.linear_target_feat_2, init="default")
+        init_linear(self.linear_target_feat_3, init="default")
+        init_linear(self.linear_msa, init="default")
 
         self.rel_pos = RelPos(config)
 
     def forward(self, target_feat: torch.Tensor, residue_index: torch.Tensor, msa_feat: torch.Tensor):
-        # target_feat shape: (batch, N_res, 21)
+        # target_feat shape: (batch, N_res, 22)
         # residue_index shape: (batch, N_res)
         # msa_feat shape: (batch, N_cluster, N_res, 49)
-        assert target_feat.ndim == 3 and target_feat.shape[-1] == 21, \
-            f"target_feat must be (batch, N_res, 21), got {target_feat.shape}"
+        assert target_feat.ndim == 3 and target_feat.shape[-1] == TARGET_FEAT_DIM, \
+            f"target_feat must be (batch, N_res, {TARGET_FEAT_DIM}), got {target_feat.shape}"
         assert residue_index.ndim == 2, \
             f"residue_index must be (batch, N_res), got {residue_index.shape}"
         assert msa_feat.ndim == 4 and msa_feat.shape[-1] == 49, \
@@ -47,6 +62,7 @@ class RelPos(torch.nn.Module):
         super().__init__()
         self.max_rel = max_rel
         self.linear = torch.nn.Linear(2 * max_rel + 1, config.c_z)
+        init_linear(self.linear, init="default")
 
     def forward(self, residue_index: torch.Tensor):
         # residue_index shape: (batch, N_res)
@@ -64,6 +80,7 @@ class TemplatePair(torch.nn.Module):
 
         self.layer_norm = torch.nn.LayerNorm(config.c_t)
         self.linear_in = torch.nn.Linear(in_features=config.c_t, out_features=config.c_z)
+        init_linear(self.linear_in, init="default")
 
         self.triangle_mult_out = torch.nn.ModuleList(
             [TriangleMultiplicationOutgoing(config) for _ in range(self.num_blocks)]
@@ -82,7 +99,7 @@ class TemplatePair(torch.nn.Module):
         )
         self.final_layer_norm = torch.nn.LayerNorm(config.c_z)
 
-    def forward(self, template_feat: torch.Tensor):
+    def forward(self, template_feat: torch.Tensor, pair_mask: Optional[torch.Tensor] = None):
         # template_feat shape: (batch, N_templates, N_res, N_res, c_t)
 
         # Project from template feature space to pair representation space
@@ -94,31 +111,41 @@ class TemplatePair(torch.nn.Module):
         # Merge batch and template dims to process each template independently
         # Shape: (batch * N_templates, N_res, N_res, c_z)
         pair_representation = template_feat.reshape(b * t, n_i, n_j, c)
+        flat_pair_mask = None
+        if pair_mask is not None:
+            flat_pair_mask = pair_mask.reshape(b * t, n_i, n_j)
+            pair_representation = pair_representation * flat_pair_mask[..., None]
 
         for block_idx in range(self.num_blocks):
+            if flat_pair_mask is not None:
+                pair_representation = pair_representation * flat_pair_mask[..., None]
             pair_representation = pair_representation + dropout_rowwise(
-                self.triangle_att_start[block_idx](pair_representation),
+                self.triangle_att_start[block_idx](pair_representation, pair_mask=flat_pair_mask),
                 p=self.dropout_p,
                 training=self.training,
             )
             pair_representation = pair_representation + dropout_columnwise(
-                self.triangle_att_end[block_idx](pair_representation),
+                self.triangle_att_end[block_idx](pair_representation, pair_mask=flat_pair_mask),
                 p=self.dropout_p,
                 training=self.training,
             )
             pair_representation = pair_representation + dropout_rowwise(
-                self.triangle_mult_out[block_idx](pair_representation),
+                self.triangle_mult_out[block_idx](pair_representation, pair_mask=flat_pair_mask),
                 p=self.dropout_p,
                 training=self.training,
             )
             pair_representation = pair_representation + dropout_rowwise(
-                self.triangle_mult_in[block_idx](pair_representation),
+                self.triangle_mult_in[block_idx](pair_representation, pair_mask=flat_pair_mask),
                 p=self.dropout_p,
                 training=self.training,
             )
             pair_representation = pair_representation + self.pair_transition[block_idx](pair_representation)
+            if flat_pair_mask is not None:
+                pair_representation = pair_representation * flat_pair_mask[..., None]
 
         pair_representation = self.final_layer_norm(pair_representation)
+        if flat_pair_mask is not None:
+            pair_representation = pair_representation * flat_pair_mask[..., None]
 
         # Restore batch and template dims
         # Output shape: (batch, N_templates, N_res, N_res, c_z)
@@ -140,6 +167,10 @@ class TemplatePointwiseAttention(torch.nn.Module):
         self.linear_v = torch.nn.Linear(in_features=config.c_z, out_features=self.total_dim, bias=False)
 
         self.linear_output = torch.nn.Linear(in_features=self.total_dim, out_features=config.c_z)
+        init_linear(self.linear_q, init="default")
+        init_linear(self.linear_k, init="default")
+        init_linear(self.linear_v, init="default")
+        init_linear(self.linear_output, init="final")
 
     def forward(
         self,
@@ -217,6 +248,12 @@ class ExtraMsaStack(torch.nn.Module):
         self.linear_gate = torch.nn.Linear(in_features=config.c_e, out_features=self.total_dim)
 
         self.linear_output = torch.nn.Linear(in_features=self.total_dim, out_features=config.c_e)
+        init_linear(self.linear_q, init="default")
+        init_linear(self.linear_k, init="default")
+        init_linear(self.linear_v, init="default")
+        init_linear(self.linear_pair, init="default")
+        init_gate_linear(self.linear_gate)
+        init_linear(self.linear_output, init="final")
 
         self.msa_col_att = MSAColumnGlobalAttention(config, c_in=config.c_e)
         self.msa_transition = MSATransition(
@@ -359,6 +396,11 @@ class MSAColumnGlobalAttention(torch.nn.Module):
         self.linear_gate = torch.nn.Linear(in_features=self.c_in, out_features=self.total_dim)
 
         self.linear_output = torch.nn.Linear(in_features=self.total_dim, out_features=self.c_in)
+        init_linear(self.linear_q, init="default")
+        init_linear(self.linear_k, init="default")
+        init_linear(self.linear_v, init="default")
+        init_gate_linear(self.linear_gate)
+        init_linear(self.linear_output, init="final")
 
     def forward(self, msa_representation: torch.Tensor, msa_mask: Optional[torch.Tensor] = None):
         # msa_representation: (batch, N_seq, N_res, c_in)
@@ -423,6 +465,11 @@ class MSAColumnAttention(torch.nn.Module):
         self.linear_gate = torch.nn.Linear(in_features=config.c_m, out_features=self.total_dim)
 
         self.linear_output = torch.nn.Linear(in_features=self.total_dim, out_features=config.c_m)
+        init_linear(self.linear_q, init="default")
+        init_linear(self.linear_k, init="default")
+        init_linear(self.linear_v, init="default")
+        init_gate_linear(self.linear_gate)
+        init_linear(self.linear_output, init="final")
 
     def forward(self, msa_representation: torch.Tensor, msa_mask: Optional[torch.Tensor] = None):
         msa_representation = self.layer_norm_msa(msa_representation)
@@ -481,6 +528,8 @@ class MSATransition(torch.nn.Module):
 
         self.linear_up = torch.nn.Linear(in_features=self.c_in, out_features=self.n * self.c_in)
         self.linear_down = torch.nn.Linear(in_features=self.c_in * self.n, out_features=self.c_in)
+        init_linear(self.linear_up, init="relu")
+        init_linear(self.linear_down, init="final")
 
     def forward(self, msa_representation: torch.Tensor):
         msa_representation = self.layer_norm(msa_representation)
@@ -501,6 +550,9 @@ class OuterProductMean(torch.nn.Module):
         self.linear_right = torch.nn.Linear(self.c_in, self.c)
 
         self.linear_out = torch.nn.Linear(in_features=self.c*self.c, out_features=config.c_z)
+        init_linear(self.linear_left, init="default")
+        init_linear(self.linear_right, init="default")
+        init_linear(self.linear_out, init="final")
 
     def forward(self, msa_representation: torch.Tensor, msa_mask: Optional[torch.Tensor] = None):
         # msa_mask: (batch, N_seq, N_res) — 1 for valid, 0 for padding
@@ -547,6 +599,12 @@ class TriangleMultiplicationOutgoing(torch.nn.Module):
         self.gate = torch.nn.Linear(in_features=config.c_z, out_features=config.c_z)
 
         self.out_linear = torch.nn.Linear(in_features=config.triangle_mult_c, out_features=config.c_z)
+        init_gate_linear(self.gate1)
+        init_gate_linear(self.gate2)
+        init_linear(self.linear1, init="default")
+        init_linear(self.linear2, init="default")
+        init_gate_linear(self.gate)
+        init_linear(self.out_linear, init="final")
 
     def forward(self, pair_representation: torch.Tensor, pair_mask: Optional[torch.Tensor] = None):
         pair_representation = self.layer_norm_pair(pair_representation)
@@ -592,6 +650,12 @@ class TriangleMultiplicationIncoming(torch.nn.Module):
         self.gate = torch.nn.Linear(in_features=config.c_z, out_features=config.c_z)
 
         self.out_linear = torch.nn.Linear(in_features=config.triangle_mult_c, out_features=config.c_z)
+        init_gate_linear(self.gate1)
+        init_gate_linear(self.gate2)
+        init_linear(self.linear1, init="default")
+        init_linear(self.linear2, init="default")
+        init_gate_linear(self.gate)
+        init_linear(self.out_linear, init="final")
 
     def forward(self, pair_representation: torch.Tensor, pair_mask: Optional[torch.Tensor] = None):
         pair_representation = self.layer_norm_pair(pair_representation)
@@ -640,6 +704,12 @@ class TriangleAttentionStartingNode(torch.nn.Module):
         self.linear_gate = torch.nn.Linear(in_features=config.c_z, out_features=self.total_dim)
 
         self.linear_output = torch.nn.Linear(in_features=self.total_dim, out_features=config.c_z)
+        init_linear(self.linear_q, init="default")
+        init_linear(self.linear_k, init="default")
+        init_linear(self.linear_v, init="default")
+        init_linear(self.linear_bias, init="default")
+        init_gate_linear(self.linear_gate)
+        init_linear(self.linear_output, init="final")
 
     def forward(self, pair_representation: torch.Tensor, pair_mask: Optional[torch.Tensor] = None):
         pair_representation = self.layer_norm(pair_representation)
@@ -712,6 +782,12 @@ class TriangleAttentionEndingNode(torch.nn.Module):
         self.linear_gate = torch.nn.Linear(in_features=config.c_z, out_features=self.total_dim)
 
         self.linear_output = torch.nn.Linear(in_features=self.total_dim, out_features=config.c_z)
+        init_linear(self.linear_q, init="default")
+        init_linear(self.linear_k, init="default")
+        init_linear(self.linear_v, init="default")
+        init_linear(self.linear_bias, init="default")
+        init_gate_linear(self.linear_gate)
+        init_linear(self.linear_output, init="final")
 
     def forward(self, pair_representation: torch.Tensor, pair_mask: Optional[torch.Tensor] = None):
         pair_representation = self.layer_norm(pair_representation)
@@ -777,6 +853,8 @@ class PairTransition(torch.nn.Module):
 
         self.linear_up = torch.nn.Linear(in_features=config.c_z, out_features=self.n*config.c_z)
         self.linear_down = torch.nn.Linear(in_features=config.c_z*self.n, out_features=config.c_z)
+        init_linear(self.linear_up, init="relu")
+        init_linear(self.linear_down, init="final")
 
     def forward(self, pair_representation: torch.Tensor):
         pair_representation = self.layer_norm(pair_representation)

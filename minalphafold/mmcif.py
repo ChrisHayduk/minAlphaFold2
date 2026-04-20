@@ -7,8 +7,12 @@ from typing import Dict, Iterable, List, Tuple
 
 import numpy as np
 
-from a3m import sequence_to_ids
-from residue_constants import restype_name_to_atom14_names
+try:
+    from .a3m import sequence_to_ids
+    from .residue_constants import restype_name_to_atom14_names
+except ImportError:  # pragma: no cover - compatibility for direct module imports in tests/scripts.
+    from a3m import sequence_to_ids
+    from residue_constants import restype_name_to_atom14_names
 
 
 THREE_TO_ONE = {
@@ -237,8 +241,46 @@ class ChainAtoms:
     chain_id: str
     sequence: str
     aatype: np.ndarray
+    residue_index: np.ndarray
     atom14_positions: np.ndarray
     atom14_mask: np.ndarray
+    resolution: float
+
+
+def _first_tag_value(
+    tag: str,
+    scalars: Dict[str, str],
+    loops: Iterable[Tuple[List[str], List[List[str]]]],
+) -> str | None:
+    if tag in scalars:
+        return scalars[tag]
+
+    for columns, rows in loops:
+        if tag not in columns or not rows:
+            continue
+        tag_index = columns.index(tag)
+        return rows[0][tag_index]
+
+    return None
+
+
+def _parse_resolution(
+    scalars: Dict[str, str],
+    loops: Iterable[Tuple[List[str], List[List[str]]]],
+) -> float:
+    for tag in (
+        "_refine.ls_d_res_high",
+        "_em_3d_reconstruction.resolution",
+        "_reflns.d_resolution_high",
+    ):
+        raw_value = _first_tag_value(tag, scalars, loops)
+        if raw_value in {None, ".", "?"}:
+            continue
+        try:
+            return float(raw_value)
+        except ValueError:
+            continue
+    return 0.0
 
 
 def extract_chain_atoms(
@@ -249,6 +291,7 @@ def extract_chain_atoms(
     mmcif_path = Path(mmcif_path)
     scalars, loops = _parse_mmcif(mmcif_path.read_text())
     entity_sequences = _entity_sequences(scalars, loops)
+    resolution = _parse_resolution(scalars, loops)
 
     atom_columns: List[str] | None = None
     atom_rows: List[List[str]] | None = None
@@ -281,7 +324,6 @@ def extract_chain_atoms(
 
     atom14_positions = np.zeros((len(sequence), 14, 3), dtype=np.float32)
     atom14_mask = np.zeros((len(sequence), 14), dtype=np.float32)
-
     for (seq_index, atom_name), (coordinates, residue_name) in _best_atom_rows(atom_only_rows, atom_columns).items():
         if seq_index < 0 or seq_index >= len(sequence):
             continue
@@ -299,6 +341,10 @@ def extract_chain_atoms(
         chain_id=chain_id,
         sequence=sequence,
         aatype=sequence_to_ids(sequence),
+        # Canonical AF2/OpenFold sequence features use contiguous 0..N-1 residue
+        # indices from sequence order, not author numbering from the mmCIF.
+        residue_index=np.arange(len(sequence), dtype=np.int32),
         atom14_positions=atom14_positions,
         atom14_mask=atom14_mask,
+        resolution=resolution,
     )

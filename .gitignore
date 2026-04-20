@@ -212,3 +212,11 @@ TODO.md
 artifacts/autoresearch_overfit/results.jsonl
 artifacts/autoresearch_overfit/summary.md
 scripts/autoresearch_overfit.py
+.claude/worktrees/trusting-leavitt/
+.tmp_af2_config.py
+.tmp_af2_folding.py
+.tmp_af2_residue_constants.py
+.tmp_all_atom_roundtrip.py
+.tmp_openfold_loss.py
+*.pt
+CLAUDE.md

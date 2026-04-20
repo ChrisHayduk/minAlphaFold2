@@ -1,8 +1,33 @@
 import torch
 import math
 from typing import Optional
-from utils import dropout_columnwise, dropout_rowwise
-from embedders import MSATransition, MSAColumnAttention, OuterProductMean, TriangleAttentionEndingNode, TriangleAttentionStartingNode, TriangleMultiplicationIncoming, TriangleMultiplicationOutgoing, PairTransition
+
+try:
+    from .initialization import init_gate_linear, init_linear
+    from .utils import dropout_columnwise, dropout_rowwise
+    from .embedders import (
+        MSATransition,
+        MSAColumnAttention,
+        OuterProductMean,
+        TriangleAttentionEndingNode,
+        TriangleAttentionStartingNode,
+        TriangleMultiplicationIncoming,
+        TriangleMultiplicationOutgoing,
+        PairTransition,
+    )
+except ImportError:  # pragma: no cover - compatibility for direct module imports in tests/scripts.
+    from initialization import init_gate_linear, init_linear
+    from utils import dropout_columnwise, dropout_rowwise
+    from embedders import (
+        MSATransition,
+        MSAColumnAttention,
+        OuterProductMean,
+        TriangleAttentionEndingNode,
+        TriangleAttentionStartingNode,
+        TriangleMultiplicationIncoming,
+        TriangleMultiplicationOutgoing,
+        PairTransition,
+    )
 
 class Evoformer(torch.nn.Module):
     def __init__(self, config):
@@ -70,6 +95,12 @@ class MSARowAttentionWithPairBias(torch.nn.Module):
         self.linear_gate = torch.nn.Linear(in_features=config.c_m, out_features=self.total_dim)
 
         self.linear_output = torch.nn.Linear(in_features=self.total_dim, out_features=config.c_m)
+        init_linear(self.linear_q, init="default")
+        init_linear(self.linear_k, init="default")
+        init_linear(self.linear_v, init="default")
+        init_linear(self.linear_pair, init="default")
+        init_gate_linear(self.linear_gate)
+        init_linear(self.linear_output, init="final")
 
     def forward(self, msa_representation: torch.Tensor, pair_representation: torch.Tensor,
                 msa_mask: Optional[torch.Tensor] = None):

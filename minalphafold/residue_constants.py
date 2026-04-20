@@ -14,6 +14,10 @@
 
 """Constants used in AlphaFold."""
 
+import collections
+import functools
+from pathlib import Path
+
 import numpy as np
 
 
@@ -72,6 +76,31 @@ chi_angles_mask = [
     [1.0, 1.0, 0.0, 0.0],  # TRP
     [1.0, 1.0, 0.0, 0.0],  # TYR
     [1.0, 0.0, 0.0, 0.0],  # VAL
+]
+
+# Chi angles that are pi-periodic instead of 2pi-periodic.
+# This follows the canonical AF2/OpenFold residue constants.
+chi_pi_periodic = [
+    [0.0, 0.0, 0.0, 0.0],  # ALA
+    [0.0, 0.0, 0.0, 0.0],  # ARG
+    [0.0, 0.0, 0.0, 0.0],  # ASN
+    [0.0, 1.0, 0.0, 0.0],  # ASP
+    [0.0, 0.0, 0.0, 0.0],  # CYS
+    [0.0, 0.0, 0.0, 0.0],  # GLN
+    [0.0, 0.0, 1.0, 0.0],  # GLU
+    [0.0, 0.0, 0.0, 0.0],  # GLY
+    [0.0, 0.0, 0.0, 0.0],  # HIS
+    [0.0, 0.0, 0.0, 0.0],  # ILE
+    [0.0, 0.0, 0.0, 0.0],  # LEU
+    [0.0, 0.0, 0.0, 0.0],  # LYS
+    [0.0, 0.0, 0.0, 0.0],  # MET
+    [0.0, 1.0, 0.0, 0.0],  # PHE
+    [0.0, 0.0, 0.0, 0.0],  # PRO
+    [0.0, 0.0, 0.0, 0.0],  # SER
+    [0.0, 0.0, 0.0, 0.0],  # THR
+    [0.0, 0.0, 0.0, 0.0],  # TRP
+    [0.0, 1.0, 0.0, 0.0],  # TYR
+    [0.0, 0.0, 0.0, 0.0],  # VAL
 ]
 
 # Atoms positions relative to the 8 rigid groups, defined by the pre-omega, phi,
@@ -236,7 +265,7 @@ rigid_group_atom_positions = {
         ['CB', 0, (-0.546, -0.611, -1.293)],
         ['O', 3, (0.621, 1.066, 0.000)],
         ['CG', 4, (0.382, 1.445, 0.0)],
-        ['CD', 5, (0.427, 1.440, 0.0)],
+        ['CD', 5, (0.477, 1.424, 0.0)],
     ],
     'SER': [
         ['N', 0, (-0.529, 1.360, -0.000)],
@@ -357,6 +386,74 @@ restype_1to3 = {
     'V': 'VAL',
 }
 
+restype_3to1 = {value: key for key, value in restype_1to3.items()}
+restype_order = {restype: index for index, restype in enumerate(restypes)}
+
+# Canonical AF2 atom37 order.
+atom_types = [
+    "N", "CA", "C", "CB", "O", "CG", "CG1", "CG2", "OG", "OG1", "SG", "CD",
+    "CD1", "CD2", "ND1", "ND2", "OD1", "OD2", "SD", "CE", "CE1", "CE2", "CE3",
+    "NE", "NE1", "NE2", "OE1", "OE2", "CH2", "NH1", "NH2", "OH", "CZ", "CZ2",
+    "CZ3", "NZ", "OXT",
+]
+atom_order = {atom_type: index for index, atom_type in enumerate(atom_types)}
+atom_type_num = len(atom_types)
+
+
+# Ambiguous atom names due to 180-degree symmetry.
+residue_atom_renaming_swaps = {
+    'ARG': {'NH1': 'NH2'},
+    'ASP': {'OD1': 'OD2'},
+    'GLU': {'OE1': 'OE2'},
+    'LEU': {'CD1': 'CD2'},
+    'PHE': {'CD1': 'CD2', 'CE1': 'CE2'},
+    'TYR': {'CD1': 'CD2', 'CE1': 'CE2'},
+    'VAL': {'CG1': 'CG2'},
+}
+
+
+restype_atom14_renaming_matrices = np.zeros([21, 14, 14], dtype=np.float32)
+restype_atom14_is_ambiguous = np.zeros([21, 14], dtype=np.float32)
+STANDARD_ATOM_MASK = np.zeros([21, atom_type_num], dtype=np.float32)
+restype_atom14_to_atom37 = np.full([21, 14], fill_value=-1, dtype=np.int64)
+
+
+def _make_atom14_renaming_tables():
+    for restype, restype_letter in enumerate(restypes):
+        resname = restype_1to3[restype_letter]
+        names = restype_name_to_atom14_names[resname]
+
+        correspondences = list(range(14))
+        for source_atom, target_atom in residue_atom_renaming_swaps.get(resname, {}).items():
+            source_index = names.index(source_atom)
+            target_index = names.index(target_atom)
+            correspondences[source_index] = target_index
+            correspondences[target_index] = source_index
+            restype_atom14_is_ambiguous[restype, source_index] = 1.0
+            restype_atom14_is_ambiguous[restype, target_index] = 1.0
+
+        for atom_index, correspondence in enumerate(correspondences):
+            restype_atom14_renaming_matrices[restype, atom_index, correspondence] = 1.0
+
+    restype_atom14_renaming_matrices[20] = np.eye(14, dtype=np.float32)
+
+
+_make_atom14_renaming_tables()
+
+
+def _make_atom37_constants():
+    for restype, restype_letter in enumerate(restypes):
+        resname = restype_1to3[restype_letter]
+        for atom14_index, atom_name in enumerate(restype_name_to_atom14_names[resname]):
+            if not atom_name:
+                continue
+            atom37_index = atom_order[atom_name]
+            STANDARD_ATOM_MASK[restype, atom37_index] = 1.0
+            restype_atom14_to_atom37[restype, atom14_index] = atom37_index
+
+
+_make_atom37_constants()
+
 
 # Van der Waals radii [Å] by element (from Wikipedia, used in original AF2)
 van_der_waals_radius = {'C': 1.7, 'N': 1.55, 'O': 1.52, 'S': 1.8}
@@ -405,6 +502,15 @@ restype_atom14_mask = np.zeros([21, 14], dtype=np.float32)
 restype_atom14_rigid_group_positions = np.zeros([21, 14, 3], dtype=np.float32)
 restype_rigid_group_default_frame = np.zeros([21, 8, 4, 4], dtype=np.float32)
 restype_rigid_group_mask = np.zeros([21, 8], dtype=np.float32)
+restype_rigidgroup_base_atom14_idx = np.full([21, 8, 3], fill_value=-1, dtype=np.int64)
+restype_rigidgroup_is_ambiguous = np.zeros([21, 8], dtype=np.float32)
+restype_rigidgroup_ambiguity_rot = np.tile(
+    np.eye(3, dtype=np.float32)[None, None, :, :],
+    [21, 8, 1, 1],
+)
+restype_atom14_distance_lower_bound = np.zeros([21, 14, 14], dtype=np.float32)
+restype_atom14_distance_upper_bound = np.zeros([21, 14, 14], dtype=np.float32)
+restype_atom14_distance_stddev = np.zeros([21, 14, 14], dtype=np.float32)
 
 
 def _make_rigid_group_constants():
@@ -421,6 +527,20 @@ def _make_rigid_group_constants():
     resname = restype_1to3[restype_letter]
     atom_positions = {name: np.array(pos) for name, _, pos
                       in rigid_group_atom_positions[resname]}
+    atom_lookup = {
+        atom_name: atom_index
+        for atom_index, atom_name in enumerate(restype_name_to_atom14_names[resname])
+        if atom_name
+    }
+
+    restype_rigidgroup_base_atom14_idx[restype, 0, :] = np.array(
+        [atom_lookup['C'], atom_lookup['CA'], atom_lookup['N']],
+        dtype=np.int64,
+    )
+    restype_rigidgroup_base_atom14_idx[restype, 3, :] = np.array(
+        [atom_lookup['CA'], atom_lookup['C'], atom_lookup['O']],
+        dtype=np.int64,
+    )
 
     # backbone to backbone is the identity transform
     restype_rigid_group_default_frame[restype, 0, :, :] = np.eye(4)
@@ -446,6 +566,10 @@ def _make_rigid_group_constants():
     if chi_angles_mask[restype][0]:
       base_atom_names = chi_angles_atoms[resname][0]
       base_atom_positions = [atom_positions[name] for name in base_atom_names]
+      restype_rigidgroup_base_atom14_idx[restype, 4, :] = np.array(
+          [atom_lookup[name] for name in base_atom_names[1:]],
+          dtype=np.int64,
+      )
       mat = _make_rigid_transformation_4x4(
           ex=base_atom_positions[2] - base_atom_positions[1],
           ey=base_atom_positions[0] - base_atom_positions[1],
@@ -461,6 +585,10 @@ def _make_rigid_group_constants():
       if chi_angles_mask[restype][chi_idx]:
         axis_end_atom_name = chi_angles_atoms[resname][chi_idx][2]
         axis_end_atom_position = atom_positions[axis_end_atom_name]
+        restype_rigidgroup_base_atom14_idx[restype, 4 + chi_idx, :] = np.array(
+            [atom_lookup[name] for name in chi_angles_atoms[resname][chi_idx][1:]],
+            dtype=np.int64,
+        )
         mat = _make_rigid_transformation_4x4(
             ex=axis_end_atom_position,
             ey=np.array([-1., 0., 0.]),
@@ -468,19 +596,236 @@ def _make_rigid_group_constants():
         restype_rigid_group_default_frame[restype, 4 + chi_idx, :, :] = mat
 
   # Populate restype_rigid_group_mask
-  for restype in range(20):
-    # Backbone frames 0-3 are always present for standard residues
-    restype_rigid_group_mask[restype, :4] = 1.0
-    # Chi frames 4-7 depend on which chi angles exist
-    for chi_idx in range(4):
-      restype_rigid_group_mask[restype, 4 + chi_idx] = chi_angles_mask[restype][chi_idx]
-  # Restype 20 (UNK) stays all zeros
-
-  # Fill unused frames (mask=0) with identity to prevent NaN from degenerate matrices
   for restype in range(21):
-    for frame_idx in range(8):
-      if restype_rigid_group_mask[restype, frame_idx] == 0.0:
-        restype_rigid_group_default_frame[restype, frame_idx, :, :] = np.eye(4)
+    # Canonical AF2 masks keep only the backbone frame, psi frame, and chi
+    # frames. Pre-omega and phi frames are empty and excluded from losses.
+    restype_rigid_group_mask[restype, 0] = 1.0
+    restype_rigid_group_mask[restype, 3] = 1.0
+    # Chi frames 4-7 depend on which chi angles exist
+    if restype < 20:
+      for chi_idx in range(4):
+        restype_rigid_group_mask[restype, 4 + chi_idx] = chi_angles_mask[restype][chi_idx]
+
+  # Canonical ambiguous rigid groups: the last chi frame for residues with
+  # symmetric terminal atoms.
+  ambiguous_rotation = np.diag([1.0, -1.0, -1.0]).astype(np.float32)
+  for resname in residue_atom_renaming_swaps:
+    restype = restype_order[restype_3to1[resname]]
+    ambiguous_group_index = 4 + int(sum(chi_angles_mask[restype]) - 1)
+    restype_rigidgroup_is_ambiguous[restype, ambiguous_group_index] = 1.0
+    restype_rigidgroup_ambiguity_rot[restype, ambiguous_group_index] = ambiguous_rotation
 
 
 _make_rigid_group_constants()
+
+
+def _compose_rigid_transforms(rotation_1, translation_1, rotation_2, translation_2):
+  rotation = rotation_1 @ rotation_2
+  translation = rotation_1 @ translation_2 + translation_1
+  return rotation, translation
+
+
+def _zero_torsion_atom14_positions(restype):
+  lit_all = restype_rigid_group_default_frame[restype]
+  lit_rotations = lit_all[:, :3, :3]
+  lit_translations = lit_all[:, :3, 3]
+
+  frames_rotation = [np.eye(3, dtype=np.float32)]
+  frames_translation = [np.zeros(3, dtype=np.float32)]
+
+  identity = np.eye(3, dtype=np.float32)
+  zeros = np.zeros(3, dtype=np.float32)
+
+  for frame_index in range(4):
+    mid_rotation, mid_translation = _compose_rigid_transforms(
+        lit_rotations[frame_index + 1],
+        lit_translations[frame_index + 1],
+        identity,
+        zeros,
+    )
+    rotation, translation = _compose_rigid_transforms(
+        frames_rotation[0],
+        frames_translation[0],
+        mid_rotation,
+        mid_translation,
+    )
+    frames_rotation.append(rotation)
+    frames_translation.append(translation)
+
+  for frame_index in range(3):
+    mid_rotation, mid_translation = _compose_rigid_transforms(
+        lit_rotations[frame_index + 5],
+        lit_translations[frame_index + 5],
+        identity,
+        zeros,
+    )
+    rotation, translation = _compose_rigid_transforms(
+        frames_rotation[frame_index + 4],
+        frames_translation[frame_index + 4],
+        mid_rotation,
+        mid_translation,
+    )
+    frames_rotation.append(rotation)
+    frames_translation.append(translation)
+
+  all_frames_rotation = np.stack(frames_rotation, axis=0)
+  all_frames_translation = np.stack(frames_translation, axis=0)
+  atom14_positions = np.zeros([14, 3], dtype=np.float32)
+  atom14_mask = restype_atom14_mask[restype]
+
+  for atom_index in range(14):
+    if atom14_mask[atom_index] == 0.0:
+      continue
+    frame_index = restype_atom14_to_rigid_group[restype, atom_index]
+    local_position = restype_atom14_rigid_group_positions[restype, atom_index]
+    atom14_positions[atom_index] = (
+        all_frames_rotation[frame_index] @ local_position + all_frames_translation[frame_index]
+    )
+
+  return atom14_positions
+
+
+Bond = collections.namedtuple(
+    "Bond",
+    ["atom1_name", "atom2_name", "length", "stddev"],
+)
+BondAngle = collections.namedtuple(
+    "BondAngle",
+    ["atom1_name", "atom2_name", "atom3_name", "angle_rad", "stddev"],
+)
+
+
+@functools.lru_cache(maxsize=1)
+def load_stereo_chemical_props():
+  """Load canonical bond and bond-angle statistics used by AF2/OpenFold."""
+  stereo_chemical_props = Path(__file__).with_name("stereo_chemical_props.txt").read_text()
+
+  lines_iter = iter(stereo_chemical_props.splitlines())
+
+  residue_bonds = {}
+  next(lines_iter)  # Header.
+  for line in lines_iter:
+    if line.strip() == "-":
+      break
+    bond, resname, length, stddev = line.split()
+    atom1_name, atom2_name = bond.split("-")
+    residue_bonds.setdefault(resname, []).append(
+        Bond(atom1_name, atom2_name, float(length), float(stddev))
+    )
+  residue_bonds["UNK"] = []
+
+  residue_bond_angles = {}
+  next(lines_iter)  # Empty line.
+  next(lines_iter)  # Header.
+  for line in lines_iter:
+    if line.strip() == "-":
+      break
+    bond, resname, angle_degree, stddev_degree = line.split()
+    atom1_name, atom2_name, atom3_name = bond.split("-")
+    residue_bond_angles.setdefault(resname, []).append(
+        BondAngle(
+            atom1_name,
+            atom2_name,
+            atom3_name,
+            float(angle_degree) / 180.0 * np.pi,
+            float(stddev_degree) / 180.0 * np.pi,
+        )
+    )
+  residue_bond_angles["UNK"] = []
+
+  def make_bond_key(atom1_name, atom2_name):
+    return "-".join(sorted([atom1_name, atom2_name]))
+
+  residue_virtual_bonds = {}
+  for resname, bond_angles in residue_bond_angles.items():
+    bond_cache = {
+        make_bond_key(bond.atom1_name, bond.atom2_name): bond
+        for bond in residue_bonds[resname]
+    }
+    residue_virtual_bonds[resname] = []
+    for bond_angle in bond_angles:
+      bond1 = bond_cache[make_bond_key(bond_angle.atom1_name, bond_angle.atom2_name)]
+      bond2 = bond_cache[make_bond_key(bond_angle.atom2_name, bond_angle.atom3_name)]
+
+      gamma = bond_angle.angle_rad
+      length = np.sqrt(
+          bond1.length ** 2
+          + bond2.length ** 2
+          - 2 * bond1.length * bond2.length * np.cos(gamma)
+      )
+
+      dl_outer = 0.5 / length
+      dl_dgamma = (2 * bond1.length * bond2.length * np.sin(gamma)) * dl_outer
+      dl_db1 = (2 * bond1.length - 2 * bond2.length * np.cos(gamma)) * dl_outer
+      dl_db2 = (2 * bond2.length - 2 * bond1.length * np.cos(gamma)) * dl_outer
+      stddev = np.sqrt(
+          (dl_dgamma * bond_angle.stddev) ** 2
+          + (dl_db1 * bond1.stddev) ** 2
+          + (dl_db2 * bond2.stddev) ** 2
+      )
+      residue_virtual_bonds[resname].append(
+          Bond(bond_angle.atom1_name, bond_angle.atom3_name, length, stddev)
+      )
+
+  return residue_bonds, residue_virtual_bonds, residue_bond_angles
+
+
+def make_atom14_dists_bounds(
+    overlap_tolerance=1.5,
+    bond_length_tolerance_factor=15.0,
+):
+  """Canonical AF2/OpenFold atom14 distance bounds for within-residue checks."""
+  lower_bound = np.zeros([21, 14, 14], dtype=np.float32)
+  upper_bound = np.zeros([21, 14, 14], dtype=np.float32)
+  stddev = np.zeros([21, 14, 14], dtype=np.float32)
+
+  residue_bonds, residue_virtual_bonds, _ = load_stereo_chemical_props()
+
+  for restype, restype_letter in enumerate(restypes):
+    resname = restype_1to3[restype_letter]
+    atom_list = restype_name_to_atom14_names[resname]
+
+    for atom1_idx, atom1_name in enumerate(atom_list):
+      if not atom1_name:
+        continue
+      atom1_radius = van_der_waals_radius[atom1_name[0]]
+      for atom2_idx, atom2_name in enumerate(atom_list):
+        if not atom2_name or atom1_idx == atom2_idx:
+          continue
+        atom2_radius = van_der_waals_radius[atom2_name[0]]
+        lower = atom1_radius + atom2_radius - overlap_tolerance
+        upper = 1e10
+        lower_bound[restype, atom1_idx, atom2_idx] = lower
+        lower_bound[restype, atom2_idx, atom1_idx] = lower
+        upper_bound[restype, atom1_idx, atom2_idx] = upper
+        upper_bound[restype, atom2_idx, atom1_idx] = upper
+
+    for bond in residue_bonds[resname] + residue_virtual_bonds[resname]:
+      if bond.atom1_name not in atom_list or bond.atom2_name not in atom_list:
+        continue
+      atom1_idx = atom_list.index(bond.atom1_name)
+      atom2_idx = atom_list.index(bond.atom2_name)
+      lower = bond.length - bond_length_tolerance_factor * bond.stddev
+      upper = bond.length + bond_length_tolerance_factor * bond.stddev
+      lower_bound[restype, atom1_idx, atom2_idx] = lower
+      lower_bound[restype, atom2_idx, atom1_idx] = lower
+      upper_bound[restype, atom1_idx, atom2_idx] = upper
+      upper_bound[restype, atom2_idx, atom1_idx] = upper
+      stddev[restype, atom1_idx, atom2_idx] = bond.stddev
+      stddev[restype, atom2_idx, atom1_idx] = bond.stddev
+
+  return {
+      "lower_bound": lower_bound,
+      "upper_bound": upper_bound,
+      "stddev": stddev,
+  }
+
+
+def _make_atom14_distance_bounds():
+  bounds = make_atom14_dists_bounds()
+  restype_atom14_distance_lower_bound[:] = bounds["lower_bound"]
+  restype_atom14_distance_upper_bound[:] = bounds["upper_bound"]
+  restype_atom14_distance_stddev[:] = bounds["stddev"]
+
+
+_make_atom14_distance_bounds()

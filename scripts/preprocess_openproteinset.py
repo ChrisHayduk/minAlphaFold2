@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 import re
 import sys
-from typing import Iterable, List, Tuple
+from typing import Iterable, List, Sequence, Tuple
 
 import numpy as np
 
@@ -29,6 +29,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--msa-name", type=str, default="uniref90_hits.a3m")
+    parser.add_argument("--msa-names", type=str, default="")
     parser.add_argument("--template-hhr-name", type=str, default="pdb70_hits.hhr")
     parser.add_argument("--skip-templates", action="store_true")
     return parser.parse_args()
@@ -96,16 +97,23 @@ def project_to_query(
     structure_sequence: str,
     atom14_positions: np.ndarray,
     atom14_mask: np.ndarray,
-) -> Tuple[np.ndarray, np.ndarray]:
+    residue_index: np.ndarray | None = None,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     pairs = global_alignment_pairs(query_sequence, structure_sequence)
     projected_positions = np.zeros((len(query_sequence), 14, 3), dtype=np.float32)
     projected_mask = np.zeros((len(query_sequence), 14), dtype=np.float32)
+    if residue_index is None:
+        projected_residue_index = np.arange(len(query_sequence), dtype=np.int32)
+    else:
+        projected_residue_index = np.arange(len(query_sequence), dtype=residue_index.dtype)
 
     for query_index, structure_index in pairs:
         projected_positions[query_index] = atom14_positions[structure_index]
         projected_mask[query_index] = atom14_mask[structure_index]
+        if residue_index is not None:
+            projected_residue_index[query_index] = residue_index[structure_index]
 
-    return projected_positions, projected_mask
+    return projected_positions, projected_mask, projected_residue_index
 
 
 def _parse_hhr_token(token: str) -> tuple[str, str] | None:
@@ -288,6 +296,78 @@ def iter_chain_dirs(roda_root: Path) -> Iterable[Path]:
             yield path
 
 
+def resolve_msa_names(
+    msa_name: str,
+    msa_names: str | Sequence[str] | None = None,
+) -> tuple[str, ...]:
+    if msa_names is None:
+        return (msa_name,)
+    if isinstance(msa_names, str):
+        parsed = tuple(token.strip() for token in msa_names.split(",") if token.strip())
+    else:
+        parsed = tuple(token.strip() for token in msa_names if token.strip())
+    return parsed or (msa_name,)
+
+
+def read_merged_msa(
+    chain_dir: Path,
+    *,
+    msa_name: str,
+    msa_names: str | Sequence[str] | None,
+    max_msa_seqs: int,
+) -> tuple[np.ndarray, np.ndarray, str]:
+    resolved_msa_names = resolve_msa_names(msa_name, msa_names)
+
+    merged_rows: list[np.ndarray] = []
+    merged_deletions: list[np.ndarray] = []
+    seen_rows: set[tuple[bytes, bytes]] = set()
+    loaded_paths: list[Path] = []
+    query_sequence: str | None = None
+
+    for source_name in resolved_msa_names:
+        msa_path = chain_dir / "a3m" / source_name
+        if not msa_path.exists():
+            continue
+
+        a3m = read_a3m(msa_path)
+        source_msa, source_deletions = a3m.to_tokens()
+        aligned_sequences, _ = a3m.to_aligned_msa()
+        query_aligned = aligned_sequences[0]
+        source_msa, source_deletions, source_query_sequence = ungap_query_columns(
+            source_msa,
+            source_deletions,
+            query_aligned,
+        )
+        if query_sequence is None:
+            query_sequence = source_query_sequence
+        elif query_sequence.upper() != source_query_sequence.upper():
+            raise ValueError(
+                f"Mismatched query sequences across MSA sources for {chain_dir.name}: "
+                f"{query_sequence} vs {source_query_sequence}"
+            )
+
+        loaded_paths.append(msa_path)
+        for row, deletion_row in zip(source_msa, source_deletions):
+            dedup_key = (row.tobytes(), deletion_row.tobytes())
+            if dedup_key in seen_rows:
+                continue
+            seen_rows.add(dedup_key)
+            merged_rows.append(row.copy())
+            merged_deletions.append(deletion_row.copy())
+            if len(merged_rows) >= max_msa_seqs:
+                break
+        if len(merged_rows) >= max_msa_seqs:
+            break
+
+    if not loaded_paths:
+        expected = ", ".join(str(chain_dir / "a3m" / name) for name in resolved_msa_names)
+        raise FileNotFoundError(f"Missing MSA files: {expected}")
+    if query_sequence is None or not merged_rows:
+        raise ValueError(f"No usable MSA rows found for {chain_dir.name}.")
+
+    return np.stack(merged_rows), np.stack(merged_deletions), query_sequence
+
+
 def preprocess_chain(
     chain_dir: Path,
     *,
@@ -295,45 +375,49 @@ def preprocess_chain(
     max_msa_seqs: int,
     max_templates: int,
     msa_name: str,
+    msa_names: str | Sequence[str] | None = None,
     template_hhr_name: str,
     skip_templates: bool,
 ) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
     chain_id = chain_dir.name
     pdb_id, auth_chain_id = chain_id.split("_", 1)
-    msa_path = chain_dir / "a3m" / msa_name
     mmcif_path = mmcif_root / f"{pdb_id.lower()}.cif"
 
-    if not msa_path.exists():
-        raise FileNotFoundError(f"Missing MSA file: {msa_path}")
     if not mmcif_path.exists():
         raise FileNotFoundError(f"Missing mmCIF file: {mmcif_path}")
 
-    a3m = read_a3m(msa_path)
-    msa, deletions = a3m.to_tokens(max_seqs=max_msa_seqs)
-    aligned_sequences, _ = a3m.to_aligned_msa()
-    query_aligned = aligned_sequences[0]
-    msa, deletions, query_sequence = ungap_query_columns(msa, deletions, query_aligned)
+    msa, deletions, query_sequence = read_merged_msa(
+        chain_dir,
+        msa_name=msa_name,
+        msa_names=msa_names,
+        max_msa_seqs=max_msa_seqs,
+    )
 
     structure_chain = extract_chain_atoms(mmcif_path, pdb_id.lower(), auth_chain_id)
     if structure_chain.sequence.upper() == query_sequence.upper():
         atom14_positions = structure_chain.atom14_positions.astype(np.float32)
         atom14_mask = structure_chain.atom14_mask.astype(np.float32)
+        residue_index = structure_chain.residue_index.astype(np.int32)
     else:
-        atom14_positions, atom14_mask = project_to_query(
+        atom14_positions, atom14_mask, residue_index = project_to_query(
             query_sequence,
             structure_chain.sequence,
             structure_chain.atom14_positions,
             structure_chain.atom14_mask,
+            residue_index=structure_chain.residue_index,
         )
 
     features = {
         "aatype": sequence_to_ids(query_sequence).astype(np.int32),
         "msa": msa.astype(np.int32),
         "deletions": deletions.astype(np.int32),
+        "between_segment_residues": np.zeros((len(query_sequence),), dtype=np.int32),
+        "residue_index": residue_index.astype(np.int32),
     }
     labels = {
         "atom14_positions": atom14_positions.astype(np.float32),
         "atom14_mask": atom14_mask.astype(np.float32),
+        "resolution": np.asarray(structure_chain.resolution, dtype=np.float32),
     }
 
     if skip_templates:
@@ -387,6 +471,7 @@ def main() -> None:
                 max_msa_seqs=args.max_msa_seqs,
                 max_templates=args.max_templates,
                 msa_name=args.msa_name,
+                msa_names=args.msa_names,
                 template_hhr_name=args.template_hhr_name,
                 skip_templates=args.skip_templates,
             )

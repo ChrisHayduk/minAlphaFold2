@@ -86,6 +86,39 @@ def test_train_step_updates_model_parameters(tmp_path):
     )
 
 
+def test_alphafold2_uses_canonical_constructor_initialization():
+    model = AlphaFold2(default_model_config())
+
+    assert torch.allclose(
+        model.evoformer_blocks[0].msa_row_att.linear_output.weight,
+        torch.zeros_like(model.evoformer_blocks[0].msa_row_att.linear_output.weight),
+    )
+    assert torch.allclose(
+        model.evoformer_blocks[0].msa_row_att.linear_gate.bias,
+        torch.ones_like(model.evoformer_blocks[0].msa_row_att.linear_gate.bias),
+    )
+    assert torch.allclose(
+        model.evoformer_blocks[0].triangle_mult_out.out_linear.weight,
+        torch.zeros_like(model.evoformer_blocks[0].triangle_mult_out.out_linear.weight),
+    )
+    assert torch.allclose(
+        model.evoformer_blocks[0].triangle_mult_out.gate.bias,
+        torch.ones_like(model.evoformer_blocks[0].triangle_mult_out.gate.bias),
+    )
+    assert torch.allclose(
+        model.input_embedder.linear_msa.bias,
+        torch.zeros_like(model.input_embedder.linear_msa.bias),
+    )
+    assert not torch.allclose(
+        model.input_embedder.linear_msa.weight,
+        torch.zeros_like(model.input_embedder.linear_msa.weight),
+    )
+    assert torch.allclose(
+        model.tm_score_head.linear.weight,
+        torch.zeros_like(model.tm_score_head.linear.weight),
+    )
+
+
 def test_evaluate_returns_finite_mean_loss_without_gradients(tmp_path):
     feature_dir, label_dir = make_processed_cache_dirs(tmp_path)
     data_config = DataConfig(
@@ -320,3 +353,33 @@ def test_build_dataloader_can_fix_training_features(tmp_path):
 
     assert torch.equal(first["msa_feat"], second["msa_feat"])
     assert torch.equal(first["masked_msa_mask"], second["masked_msa_mask"])
+
+
+def test_build_dataloader_can_emit_recycling_feature_samples(tmp_path):
+    feature_dir, label_dir = make_processed_cache_dirs(tmp_path)
+    data_config = DataConfig(
+        processed_features_dir=feature_dir,
+        processed_labels_dir=label_dir,
+        val_fraction=0.0,
+        crop_size=8,
+        msa_depth=3,
+        extra_msa_depth=2,
+        max_templates=1,
+        fixed_feature_seed=13,
+    )
+    loader = build_dataloader(
+        "all",
+        data_config,
+        training=True,
+        batch_size=1,
+        num_workers=0,
+        device="cpu",
+        seed=0,
+        n_cycles=2,
+        n_ensemble=1,
+    )
+
+    batch = next(iter(loader))
+
+    assert batch["msa_feat"].shape[:3] == (2, 1, 1)
+    assert batch["extra_msa_feat"].shape[:3] == (2, 1, 1)

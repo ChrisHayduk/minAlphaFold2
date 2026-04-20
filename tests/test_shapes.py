@@ -1,6 +1,7 @@
 """Smoke tests: instantiate each module and verify output shapes with random inputs."""
 import sys
 import os
+import math
 import torch
 import pytest
 
@@ -47,6 +48,10 @@ class MockConfig:
     structure_module_layers = 2
     structure_module_dropout_ipa = 0.0
     structure_module_dropout_transition = 0.0
+    sidechain_num_channel = 16
+    sidechain_num_residual_block = 2
+    position_scale = 10.0
+    zero_init = True
 
     ipa_num_heads = 4
     ipa_c = 8
@@ -88,7 +93,7 @@ class TestInputEmbedder:
     def test_output_shapes(self, cfg):
         from embedders import InputEmbedder
         module = InputEmbedder(cfg)
-        target_feat = torch.randn(B, N_res, 21)
+        target_feat = torch.randn(B, N_res, 22)
         residue_index = torch.arange(N_res).unsqueeze(0).expand(B, -1)
         msa_feat = torch.randn(B, N_seq, N_res, 49)
         m, z = module(target_feat, residue_index, msa_feat)
@@ -267,6 +272,135 @@ class TestInvariantPointAttention:
         out = module(s, pair, R, t)
         assert out.shape == (B, N_res, cfg.c_s)
 
+    def test_matches_canonical_reference_layout(self, cfg):
+        from structure_module import InvariantPointAttention
+
+        torch.manual_seed(0)
+        module = InvariantPointAttention(cfg)
+        module.eval()
+
+        s = torch.randn(1, N_res, cfg.c_s)
+        pair = torch.randn(1, N_res, N_res, cfg.c_z)
+        rotations = torch.eye(3).reshape(1, 1, 3, 3).expand(1, N_res, 3, 3).clone()
+        translations = torch.randn(1, N_res, 3)
+        seq_mask = torch.tensor([[1.0, 1.0, 1.0, 1.0, 0.0, 0.0]])
+
+        with torch.no_grad():
+            actual_features = module._forward_output_features(
+                s,
+                pair,
+                rotations,
+                translations,
+                seq_mask=seq_mask,
+            )
+            actual = module(s, pair, rotations, translations, seq_mask=seq_mask)
+
+            q = module.linear_q(s).reshape(1, N_res, cfg.ipa_num_heads, cfg.ipa_c)
+            kv = module.linear_kv(s).reshape(1, N_res, cfg.ipa_num_heads, 2 * cfg.ipa_c)
+            k, v = torch.split(kv, cfg.ipa_c, dim=-1)
+
+            def project_points(linear, inputs, num_points):
+                raw = linear(inputs)
+                x_coords, y_coords, z_coords = torch.chunk(raw, 3, dim=-1)
+                points = torch.stack([x_coords, y_coords, z_coords], dim=-1)
+                return points.reshape(1, N_res, cfg.ipa_num_heads, num_points, 3)
+
+            q_points = project_points(module.linear_q_points, s, cfg.ipa_n_query_points)
+            kv_points = project_points(
+                module.linear_kv_points,
+                s,
+                cfg.ipa_n_query_points + cfg.ipa_n_value_points,
+            )
+            k_points, v_points = torch.split(
+                kv_points,
+                [cfg.ipa_n_query_points, cfg.ipa_n_value_points],
+                dim=-2,
+            )
+
+            q_points_global = torch.einsum("biop,bihqp->bihqo", rotations, q_points) + translations[:, :, None, None, :]
+            k_points_global = torch.einsum("biop,bihqp->bihqo", rotations, k_points) + translations[:, :, None, None, :]
+            v_points_global = torch.einsum("biop,bihqp->bihqo", rotations, v_points) + translations[:, :, None, None, :]
+
+            bias = module.linear_bias(pair)
+            attention_logits = torch.matmul(q.permute(0, 2, 1, 3), k.permute(0, 2, 3, 1))
+            attention_logits *= math.sqrt(1.0 / (3.0 * cfg.ipa_c))
+            attention_logits += math.sqrt(1.0 / 3.0) * bias.permute(0, 3, 1, 2)
+
+            point_attention = q_points_global[:, :, None] - k_points_global[:, None, :]
+            point_attention = torch.sum(point_attention ** 2, dim=-1)
+            head_weights = torch.nn.functional.softplus(module.head_weights).view(1, 1, 1, cfg.ipa_num_heads, 1)
+            head_weights = head_weights * math.sqrt(1.0 / (3.0 * (cfg.ipa_n_query_points * 9.0 / 2.0)))
+            point_attention = torch.sum(point_attention * head_weights, dim=-1) * (-0.5)
+            attention_logits += point_attention.permute(0, 3, 1, 2)
+
+            square_mask = seq_mask.unsqueeze(-1) * seq_mask.unsqueeze(-2)
+            attention_logits = attention_logits + module.inf * (square_mask[:, None, :, :] - 1.0)
+            attention = torch.nn.functional.softmax(attention_logits, dim=-1)
+
+            output_rep = torch.matmul(attention, v.permute(0, 2, 1, 3)).permute(0, 2, 1, 3).reshape(1, N_res, -1)
+            output_points_global = torch.einsum("bhij,bjhpc->bihpc", attention, v_points_global)
+            output_points_local = torch.einsum(
+                "biop,bihqp->bihqo",
+                rotations.transpose(-1, -2),
+                output_points_global - translations[:, :, None, None, :],
+            )
+            output_norms = torch.sqrt(torch.sum(output_points_local ** 2, dim=-1) + module.eps).reshape(1, N_res, -1)
+            output_points_local = output_points_local.reshape(1, N_res, -1, 3)
+            output_point_x, output_point_y, output_point_z = output_points_local.unbind(dim=-1)
+            output_pair = torch.einsum("bhij,bijd->bihd", attention, pair).reshape(1, N_res, -1)
+
+            reference_features = torch.cat(
+                [
+                    output_rep,
+                    output_point_x,
+                    output_point_y,
+                    output_point_z,
+                    output_norms,
+                    output_pair,
+                ],
+                dim=-1,
+            )
+            reference = module.linear_output(reference_features)
+            reference = reference * seq_mask[:, :, None]
+
+        assert torch.allclose(actual_features, reference_features, atol=1e-6)
+        assert torch.allclose(actual, reference, atol=1e-6)
+
+    def test_pre_output_features_are_rigid_transform_invariant(self, cfg):
+        from structure_module import InvariantPointAttention
+
+        torch.manual_seed(0)
+        module = InvariantPointAttention(cfg)
+        module.eval()
+
+        s = torch.randn(1, N_res, cfg.c_s)
+        pair = torch.randn(1, N_res, N_res, cfg.c_z)
+        rotations = torch.empty(1, N_res, 3, 3)
+        for residue_index in range(N_res):
+            random_matrix = torch.randn(3, 3)
+            q_matrix, _ = torch.linalg.qr(random_matrix)
+            if torch.det(q_matrix) < 0:
+                q_matrix[:, 0] *= -1
+            rotations[0, residue_index] = q_matrix
+        translations = torch.randn(1, N_res, 3)
+
+        global_rotation = torch.tensor(
+            [
+                [0.0, -1.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0],
+            ],
+            dtype=translations.dtype,
+        )
+        global_translation = torch.tensor([0.25, -0.5, 0.75], dtype=translations.dtype)
+
+        original = module._forward_output_features(s, pair, rotations, translations)
+        rotated_frames = torch.einsum("ij,bnjk->bnik", global_rotation, rotations)
+        rotated_translations = torch.einsum("ij,bnj->bni", global_rotation, translations) + global_translation
+        transformed = module._forward_output_features(s, pair, rotated_frames, rotated_translations)
+
+        assert torch.allclose(original, transformed, atol=1e-5)
+
 
 class TestMakeRotX:
     def test_output_shapes(self):
@@ -302,6 +436,7 @@ class TestStructureModule:
         assert preds["traj_rotations"].shape == (cfg.structure_module_layers, B, N_res, 3, 3)
         assert preds["traj_translations"].shape == (cfg.structure_module_layers, B, N_res, 3)
         assert preds["traj_torsion_angles"].shape == (cfg.structure_module_layers, B, N_res, 7, 2)
+        assert preds["traj_torsion_angles_unnormalized"].shape == (cfg.structure_module_layers, B, N_res, 7, 2)
         assert preds["final_rotations"].shape == (B, N_res, 3, 3)
         assert preds["final_translations"].shape == (B, N_res, 3)
         assert preds["all_frames_R"].shape == (B, N_res, 8, 3, 3)
@@ -362,7 +497,7 @@ class TestExperimentallyResolvedHead:
         module = ExperimentallyResolvedHead(cfg)
         s = torch.randn(B, N_res, cfg.c_s)
         out = module(s)
-        assert out.shape == (B, N_res, 14)
+        assert out.shape == (B, N_res, 37)
 
 
 # ======================== utils.py ========================
@@ -439,7 +574,7 @@ class TestAlphaFold2:
 
         N_templ = 2
         N_extra = 8
-        target_feat = torch.randn(B, N_res, 21)
+        target_feat = torch.randn(B, N_res, 22)
         residue_index = torch.arange(N_res).unsqueeze(0).expand(B, -1)
         msa_feat = torch.randn(B, N_seq, N_res, 49)
         extra_msa_feat = torch.randn(B, N_extra, N_res, 25)
@@ -466,7 +601,7 @@ class TestAlphaFold2:
         # Head logits
         assert outputs["distogram_logits"].shape == (B, N_res, N_res, cfg.n_dist_bins)
         assert outputs["masked_msa_logits"].shape == (B, N_seq, N_res, cfg.n_msa_classes)
-        assert outputs["experimentally_resolved_logits"].shape == (B, N_res, 14)
+        assert outputs["experimentally_resolved_logits"].shape == (B, N_res, 37)
         assert outputs["plddt_logits"].shape == (B, N_res, cfg.n_plddt_bins)
         assert outputs["tm_logits"].shape == (B, N_res, N_res, cfg.n_pae_bins)
 
@@ -485,6 +620,8 @@ class TestIPAMasking:
         from structure_module import InvariantPointAttention
         module = InvariantPointAttention(cfg)
         module.eval()
+        with torch.no_grad():
+            module.linear_output.weight.normal_(std=0.02)
 
         s = torch.randn(1, N_res, cfg.c_s)
         pair = torch.randn(1, N_res, N_res, cfg.c_z)
@@ -509,6 +646,8 @@ class TestIPAMasking:
         from structure_module import InvariantPointAttention
         module = InvariantPointAttention(cfg)
         module.eval()
+        with torch.no_grad():
+            module.linear_output.weight.normal_(std=0.02)
 
         s = torch.randn(1, N_res, cfg.c_s)
         pair = torch.randn(1, N_res, N_res, cfg.c_z)
@@ -527,6 +666,8 @@ class TestIPAEquivariance:
         from structure_module import InvariantPointAttention
         module = InvariantPointAttention(cfg)
         module.eval()
+        with torch.no_grad():
+            module.linear_output.weight.normal_(std=0.02)
 
         torch.manual_seed(0)
         s = torch.randn(1, N_res, cfg.c_s)
@@ -593,7 +734,9 @@ class TestGradientFlow:
         aatype = torch.randint(0, 20, (1, N_res))
 
         preds = module(s, pair, aatype)
-        loss = preds["final_translations"].sum()
+        # Backbone updates are canonically final-zero initialized, so probe
+        # gradient flow through the all-atom sidechain path instead.
+        loss = preds["atom14_coords"].sum()
         loss.backward()
         assert s.grad is not None
         assert s.grad.abs().sum() > 0
@@ -655,6 +798,29 @@ class TestFrameComposition:
             f"Expected identity rotation, max diff = {(R - I).abs().max():.6f}"
         assert torch.allclose(t, torch.zeros_like(t), atol=1e-5), \
             f"Expected zero translation, max diff = {t.abs().max():.6f}"
+
+    def test_angle_resnet_second_linear_zero_init(self, cfg):
+        from model import AlphaFold2
+
+        model = AlphaFold2(cfg)
+        angle_resnet = model.structure_model.sidechain_module.angle_resnet
+
+        for block in angle_resnet.blocks:
+            assert torch.allclose(block.linear_2.weight, torch.zeros_like(block.linear_2.weight))
+            assert torch.allclose(block.linear_2.bias, torch.zeros_like(block.linear_2.bias))
+
+    def test_structure_module_uses_configurable_position_scale(self, cfg):
+        from residue_constants import restype_atom14_rigid_group_positions, restype_rigid_group_default_frame
+        from structure_module import StructureModule
+
+        cfg.position_scale = 20.0
+        module = StructureModule(cfg)
+
+        expected_frame_translation = torch.tensor(restype_rigid_group_default_frame)[..., :3, 3] / cfg.position_scale
+        expected_lit_positions = torch.tensor(restype_atom14_rigid_group_positions) / cfg.position_scale
+
+        assert torch.allclose(module.default_frames[..., :3, 3], expected_frame_translation)
+        assert torch.allclose(module.lit_positions, expected_lit_positions)
 
 
 class TestHeadZeroInit:

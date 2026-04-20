@@ -4,6 +4,7 @@ import argparse
 import os
 from pathlib import Path
 import subprocess
+from typing import Sequence
 from urllib.error import HTTPError
 from urllib.request import urlopen
 
@@ -12,6 +13,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Download the minimal OpenProteinSet assets used by this repo.")
     parser.add_argument("--data-root", type=str, default="data/openproteinset")
     parser.add_argument("--msa-name", type=str, default="uniref90_hits.a3m")
+    parser.add_argument("--msa-names", type=str, default="")
     parser.add_argument("--template-hhr-name", type=str, default="pdb70_hits.hhr")
     parser.add_argument("--skip-templates", action="store_true")
     parser.add_argument("--full-alignments", action="store_true")
@@ -19,6 +21,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args()
+
+
+def normalize_msa_names(
+    msa_name: str,
+    msa_names: str | Sequence[str] | None = None,
+) -> list[str]:
+    if msa_names is None:
+        return [msa_name]
+    if isinstance(msa_names, str):
+        parsed = [token.strip() for token in msa_names.split(",") if token.strip()]
+    else:
+        parsed = [token.strip() for token in msa_names if token.strip()]
+    return parsed or [msa_name]
 
 
 def run_command(command: list[str], dry_run: bool) -> None:
@@ -53,12 +68,20 @@ def download_url(url: str, destination: Path, dry_run: bool) -> bool:
     return True
 
 
-def subset_alignment_urls(chain_id: str, msa_name: str, template_hhr_name: str, *, skip_templates: bool) -> list[tuple[str, Path]]:
+def subset_alignment_urls(
+    chain_id: str,
+    msa_name: str | Sequence[str],
+    template_hhr_name: str,
+    *,
+    skip_templates: bool,
+) -> list[tuple[str, Path]]:
+    msa_names = [msa_name] if isinstance(msa_name, str) else list(msa_name)
     targets = [
         (
-            f"https://openfold.s3.amazonaws.com/pdb/{chain_id}/a3m/{msa_name}",
-            Path("roda_pdb") / chain_id / "a3m" / msa_name,
-        ),
+            f"https://openfold.s3.amazonaws.com/pdb/{chain_id}/a3m/{name}",
+            Path("roda_pdb") / chain_id / "a3m" / name,
+        )
+        for name in msa_names
     ]
     if not skip_templates:
         targets.append(
@@ -84,13 +107,15 @@ def download_subset(
     msa_name: str,
     template_hhr_name: str,
     *,
+    msa_names: list[str] | tuple[str, ...] | None = None,
     skip_templates: bool,
     dry_run: bool,
 ) -> None:
+    resolved_msa_names = normalize_msa_names(msa_name, msa_names)
     for chain_id in chain_ids:
         for url, relative_destination in subset_alignment_urls(
             chain_id,
-            msa_name,
+            resolved_msa_names,
             template_hhr_name,
             skip_templates=skip_templates,
         ):
@@ -105,6 +130,7 @@ def build_alignment_sync_command(
     msa_name: str,
     template_hhr_name: str,
     *,
+    msa_names: list[str] | tuple[str, ...] | None = None,
     skip_templates: bool,
     full_alignments: bool,
 ) -> list[str]:
@@ -113,20 +139,30 @@ def build_alignment_sync_command(
     if full_alignments:
         return command
 
-    command.extend(["--exclude", "*", "--include", f"*/a3m/{msa_name}"])
+    command.extend(["--exclude", "*"])
+    for name in normalize_msa_names(msa_name, msa_names):
+        command.extend(["--include", f"*/a3m/{name}"])
     if not skip_templates:
         command.extend(["--include", f"*/hhr/{template_hhr_name}"])
     return command
 
 
-def normalize_alignment_layout(data_root: Path, msa_name: str, template_hhr_name: str, *, skip_templates: bool) -> None:
+def normalize_alignment_layout(
+    data_root: Path,
+    msa_name: str,
+    template_hhr_name: str,
+    *,
+    msa_names: list[str] | tuple[str, ...] | None = None,
+    skip_templates: bool,
+) -> None:
     roda_root = data_root / "roda_pdb"
     for chain_dir in sorted(path for path in roda_root.iterdir() if path.is_dir()):
-        msa_path = chain_dir / msa_name
-        if msa_path.exists():
-            target_dir = chain_dir / "a3m"
-            target_dir.mkdir(exist_ok=True)
-            msa_path.rename(target_dir / msa_name)
+        for name in normalize_msa_names(msa_name, msa_names):
+            msa_path = chain_dir / name
+            if msa_path.exists():
+                target_dir = chain_dir / "a3m"
+                target_dir.mkdir(exist_ok=True)
+                msa_path.rename(target_dir / name)
 
         if skip_templates:
             continue
@@ -167,6 +203,7 @@ def expand_duplicate_alignments(roda_root: Path, duplicate_chains_file: Path) ->
 def main() -> None:
     args = parse_args()
     data_root = Path(args.data_root)
+    msa_names = normalize_msa_names(args.msa_name, args.msa_names)
     data_root.mkdir(parents=True, exist_ok=True)
     (data_root / "roda_pdb").mkdir(exist_ok=True)
     (data_root / "pdb_data").mkdir(exist_ok=True)
@@ -178,6 +215,7 @@ def main() -> None:
             chain_ids,
             msa_name=args.msa_name,
             template_hhr_name=args.template_hhr_name,
+            msa_names=msa_names,
             skip_templates=args.skip_templates,
             dry_run=args.dry_run,
         )
@@ -188,6 +226,7 @@ def main() -> None:
             data_root,
             args.msa_name,
             args.template_hhr_name,
+            msa_names=msa_names,
             skip_templates=args.skip_templates,
             full_alignments=args.full_alignments,
         ),
@@ -231,6 +270,7 @@ def main() -> None:
             data_root,
             msa_name=args.msa_name,
             template_hhr_name=args.template_hhr_name,
+            msa_names=msa_names,
             skip_templates=args.skip_templates,
         )
         expand_duplicate_alignments(

@@ -59,6 +59,7 @@ class TMScoreHead(torch.nn.Module):
         super().__init__()
         self.n_pae_bins = config.n_pae_bins  # 64, covering 0–31.75 Å in 0.5 Å bins
         self.linear = torch.nn.Linear(config.c_z, config.n_pae_bins)
+        _zero_init_linear(self.linear)
 
     def forward(self, pair_representation: torch.Tensor):
         # pair_representation: (batch, N_res, N_res, c_z)
@@ -70,8 +71,9 @@ class TMScoreHead(torch.nn.Module):
 class ExperimentallyResolvedHead(torch.nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.linear = torch.nn.Linear(config.c_s, 14)
+        self.linear = torch.nn.Linear(config.c_s, 37)
+        _zero_init_linear(self.linear)
 
     def forward(self, single_representation: torch.Tensor):
         # single_representation: (batch, N_res, c_s)
-        return self.linear(single_representation)  # (batch, N_res, 14)
+        return self.linear(single_representation)  # (batch, N_res, 37)
