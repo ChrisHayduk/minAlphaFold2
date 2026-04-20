@@ -1,3 +1,37 @@
+"""Processed-cache dataset, feature builders, and batch collation.
+
+This module is the bridge from per-chain ``.npz`` caches (produced by
+``scripts/preprocess_openproteinset.py``) to the exact batch dict that
+``AlphaFold2.forward`` and ``AlphaFoldLoss`` consume. It implements:
+
+* ``ProcessedOpenProteinSetDataset`` — a ``torch.utils.data.Dataset`` over
+  chain-level npz files (one per chain, features + labels split).
+* **MSA pre-processing**, per supplement 1.2:
+  - ``block_delete_msa`` (Algorithm 1 / supplement 1.2.6),
+  - ``sample_cluster_and_extra`` (supplement 1.2.7 cluster / extra split),
+  - ``cluster_statistics`` (the cluster profile + deletion-mean features),
+  - ``masked_msa_inputs`` (BERT-style 10/10/10/70 mask per supplement 1.2.7).
+* **Feature builders**, per **Table 1**:
+  - ``build_msa_feat`` — 49-dim msa_feat,
+  - ``build_extra_msa_feat`` — 25-dim extra_msa_feat,
+  - ``build_target_feat`` — target_feat (21-dim aatype + 1-dim
+    ``between_segment_residues``, giving 22 dims per DeepMind's released
+    code; Table 1's printed 21 dims is aatype-only),
+  - ``build_template_pair_feat`` — 88-dim template_pair_feat,
+  - ``build_template_angle_feat`` — 57-dim template_angle_feat.
+* **Ground truth** (``build_supervision``): rigid-group frames (true and
+  "alt truth" per supplement 1.8.5), torsion angles, pseudo-β positions,
+  atom37 existence/resolved masks — everything ``AlphaFoldLoss`` expects.
+* **Cropping** (``crop_example``, supplement 1.2.8), **collation**
+  (``collate_batch``), and optional per-cycle / per-ensemble MSA resampling
+  used by recycling + ensembling (supplement 1.11.2 / Algorithm 2 line 4).
+
+Dimensions of the builder outputs are pinned to the module-level constants
+below; they match Table 1 with the small 57-vs-51 discrepancy on
+``template_angle_feat`` matching DeepMind's released code (7-dim torsion
+mask rather than 14).
+"""
+
 from __future__ import annotations
 
 import math
@@ -32,14 +66,28 @@ except ImportError:  # pragma: no cover - compatibility for direct module import
         torsion_angles,
     )
     from residue_constants import STANDARD_ATOM_MASK, atom_type_num, restype_atom14_to_atom37
-TEMPLATE_PAIR_BINS = 39
-TEMPLATE_PAIR_DIM = 88
-TEMPLATE_ANGLE_DIM = 57
-TARGET_FEAT_DIM = SEQ_ALPHABET_SIZE + 1
+
+# Table 1 feature dimensions.
+TEMPLATE_PAIR_BINS = 39              # distogram: 38 equal-width + 1 catch-all
+TEMPLATE_PAIR_DIM = 88               # 39 distogram + 1 mask + 22+22 aatype + 3 unit-vec + 1 mask
+TEMPLATE_ANGLE_DIM = 57              # 22 aatype + 14 torsion + 14 alt-torsion + 7 torsion mask
+TARGET_FEAT_DIM = SEQ_ALPHABET_SIZE + 1  # 21 aatype + 1 between_segment_residues
+
+# MSA alphabet without the mask token (20 AAs + unknown + gap = 22). Used
+# for the cluster profile and masked MSA replacement distributions, which
+# operate before the mask token is introduced.
 HHBLITS_AA_ALPHABET_SIZE = GAP_ID + 1
+
+# Masked MSA replacement weights (supplement 1.2.7): for each masked
+# position, draw a replacement from a mixture of {MSA profile, original
+# residue, uniform AA, mask token} with weights {0.1, 0.1, 0.1, 0.7}.
 MASKED_MSA_PROFILE_PROB = 0.1
 MASKED_MSA_SAME_PROB = 0.1
 MASKED_MSA_UNIFORM_PROB = 0.1
+
+# Supplement 1.7.1 Table 1 notes "(Current models were trained with this
+# feature set to zero.)" for the template unit vector. Kept on here for
+# completeness; set to False to zero it and replicate the release models.
 USE_TEMPLATE_UNIT_VECTOR = True
 
 
@@ -114,6 +162,20 @@ def split_chain_ids(chain_ids: Sequence[str], split: str, val_fraction: float, s
 
 
 class ProcessedOpenProteinSetDataset(Dataset):
+    """One-chain-per-.npz dataset over a processed OpenProteinSet cache.
+
+    Each chain contributes two files:
+
+    * ``processed_features_dir/<chain_id>.npz`` — MSA, deletions, template
+      atom14s, and metadata produced by
+      ``scripts/preprocess_openproteinset.py``.
+    * ``processed_labels_dir/<chain_id>.npz`` — ground-truth atom14
+      coordinates + mask + resolution (from ``mmcif.extract_chain_atoms``).
+
+    ``split`` takes ``"train"``, ``"val"``, or ``"all"``. The split is a
+    seeded shuffle by chain ID, so train / val stay stable across runs.
+    """
+
     def __init__(
         self,
         processed_features_dir: str | Path,
@@ -182,6 +244,13 @@ def _crop_start(
     *,
     torch_generator: torch.Generator | None = None,
 ) -> int:
+    """Pick the residue index where the crop starts (supplement 1.2.8).
+
+    Training: uniform over all valid positions so every contiguous window
+    is equally likely. Inference: centre the crop deterministically so
+    evaluation is reproducible. Chains shorter than ``crop_size`` return 0
+    (no cropping, handled by ``crop_example``).
+    """
     if length <= crop_size:
         return 0
     if training:
@@ -196,6 +265,13 @@ def crop_example(
     *,
     torch_generator: torch.Generator | None = None,
 ) -> Dict[str, Any]:
+    """Crop every residue-indexed field of ``example`` to ``crop_size``.
+
+    Supplement 1.2.8: during training all per-example fields with a
+    residue axis are cropped to a single contiguous region of ``N_res =
+    crop_size`` residues. The start is picked by ``_crop_start``. Chains
+    shorter than ``crop_size`` pass through unchanged.
+    """
     length = int(example["aatype"].shape[0])
     if length <= crop_size:
         cropped = dict(example)
@@ -233,6 +309,19 @@ def block_delete_msa(
     num_blocks: int = 5,
     torch_generator: torch.Generator | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """MSA block deletion data augmentation (supplement 1.2.6 / Algorithm 1).
+
+    At training time, remove ``num_blocks`` contiguous runs of
+    ``msa_fraction_per_block * (N_seq - 1)`` non-query rows from the MSA.
+    Deleting *contiguous* runs (rather than random rows) exploits the fact
+    that the MSA is grouped by search tool and ordered by e-value — similar
+    sequences tend to cluster, so a block deletion removes whole "branches
+    of the phylogeny" and produces a less correlated sample for the
+    Evoformer (supplement 1.2.6).
+
+    The query (row 0) is always kept. Inference passes through unchanged
+    (``training=False``).
+    """
     if not training or not enabled or msa.shape[0] <= 2:
         return msa, deletions
 
@@ -267,6 +356,22 @@ def sample_cluster_and_extra(
     torch_generator: torch.Generator | None = None,
     python_random: random.Random | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Split an MSA into cluster centres and extras (supplement 1.2.7).
+
+    Supplement 1.2.7: the Evoformer scales as ``N_seq² × N_res``, so we
+    keep a small ``msa_depth`` of cluster centres for the main stack and
+    dump the rest into the shallow extra-MSA stack (supplement 1.7.2).
+
+    * The query (row 0) is always the first cluster centre.
+    * At training, the remaining ``msa_depth - 1`` centres are sampled
+      uniformly without replacement from the non-query rows.
+    * At inference, the first ``msa_depth - 1`` non-query rows win (stable
+      ordering).
+    * The remaining rows become the extra-MSA pool, capped at
+      ``extra_msa_depth``.
+
+    Returns ``(cluster_msa, cluster_deletions, extra_msa, extra_deletions)``.
+    """
     total_rows = msa.shape[0]
     if total_rows == 0:
         raise ValueError("MSA must contain at least the query row.")
@@ -307,6 +412,17 @@ def cluster_statistics(
     extra_msa: torch.Tensor,
     extra_deletions: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-cluster residue profile and mean deletion count (supplement 1.2.7).
+
+    Each extra MSA sequence is soft-assigned to its nearest cluster centre
+    by Hamming-similarity weighted one-hot agreement (ignoring gaps and
+    mask tokens), then the cluster's amino-acid profile and mean deletion
+    count are updated with that sequence's contribution (Table 1 features
+    ``cluster_profile`` and ``cluster_deletion_mean``).
+
+    Returns ``(cluster_profile, cluster_deletion_mean)`` with shapes
+    ``(N_cluster, N_res, 23)`` and ``(N_cluster, N_res)``.
+    """
     n_cluster, n_res = cluster_msa.shape
     del n_res  # Length is implicit in the tensors below.
     cluster_profile = F.one_hot(
@@ -367,6 +483,24 @@ def masked_msa_inputs(
     *,
     torch_generator: torch.Generator | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """BERT-style MSA masking (supplement 1.2.7).
+
+    For each position in ``cluster_msa`` sampled into the mask with
+    probability ``mask_probability`` (default 15% per supplement), draw a
+    replacement token from the mixture:
+
+    * 10% — a residue sampled from the MSA profile at that column,
+    * 10% — keep the original residue,
+    * 10% — a uniformly random AA (20-way uniform over standard AAs),
+    * 70% — the special mask token (``MASK_ID = 22``).
+
+    These weights (``MASKED_MSA_*``) come directly from 1.2.7. Returns
+    ``(corrupted_msa, one_hot_target, mask)`` — the corrupted MSA is fed
+    to the model, the target is the one-hot of the *original* token, and
+    the mask picks out the supervised positions for the masked-MSA loss
+    (equation 42). Inference returns the unmodified MSA with an all-zero
+    mask (no masking loss at inference).
+    """
     target = F.one_hot(cluster_msa.clamp(min=0, max=MSA_ALPHABET_SIZE - 1), num_classes=MSA_ALPHABET_SIZE).float()
     if not training:
         return cluster_msa.clone(), target, torch.zeros_like(cluster_msa, dtype=torch.float32)
@@ -404,6 +538,13 @@ def build_msa_feat(
     cluster_profile: torch.Tensor,
     cluster_deletion_mean: torch.Tensor,
 ) -> torch.Tensor:
+    """Assemble ``msa_feat`` (49-dim, Table 1).
+
+    Concatenates ``cluster_msa`` (23) + ``cluster_has_deletion`` (1) +
+    ``cluster_deletion_value`` (1) + ``cluster_profile`` (23) +
+    ``cluster_deletion_mean`` (1) along the channel axis, giving the
+    final 49-dim feature consumed by ``InputEmbedder``.
+    """
     return torch.cat(
         [
             F.one_hot(masked_cluster_msa.clamp(min=0, max=MSA_ALPHABET_SIZE - 1), num_classes=MSA_ALPHABET_SIZE).float(),
@@ -417,6 +558,14 @@ def build_msa_feat(
 
 
 def build_extra_msa_feat(extra_msa: torch.Tensor, extra_deletions: torch.Tensor) -> torch.Tensor:
+    """Assemble ``extra_msa_feat`` (25-dim, Table 1).
+
+    ``extra_msa`` one-hot (23) + ``extra_msa_has_deletion`` (1) +
+    ``extra_msa_deletion_value`` (1). Unlike ``msa_feat`` there's no
+    cluster profile (each row is its own "cluster") and no masking: the
+    extra MSA feeds the shallow extra-MSA stack (supplement 1.7.2)
+    without a BERT-style prediction target.
+    """
     if extra_msa.shape[0] == 0:
         return extra_msa.new_zeros((0, extra_msa.shape[1], 25), dtype=torch.float32)
 
@@ -434,6 +583,16 @@ def build_target_feat(
     aatype: torch.Tensor,
     between_segment_residues: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    """Assemble ``target_feat`` (22-dim: 1 has-break + 21 one-hot aatype).
+
+    Table 1 lists ``target_feat`` as 21-dim (aatype only), but the DeepMind
+    released code (and this implementation) prepend a 1-dim
+    ``between_segment_residues`` flag indicating a chain break before the
+    residue — used when processing multi-chain inputs. With single-chain
+    training data ``between_segment_residues`` is zero everywhere and the
+    feature reduces to the paper's 21-dim aatype one-hot plus a dead
+    column.
+    """
     if between_segment_residues is None:
         between_segment_residues = torch.zeros_like(aatype)
     has_break = between_segment_residues.float().clamp(min=0.0, max=1.0).unsqueeze(-1)
@@ -448,6 +607,19 @@ def build_atom37_masks(
     aatype: torch.Tensor,
     atom14_mask: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build the atom37 existence and resolved-in-experiment masks.
+
+    The experimentally-resolved head (supplement 1.9.10) predicts per-atom
+    probabilities in the **atom37** layout (37 possible heavy atoms across
+    all standard residues, supplement 1.1 notation), not the per-residue
+    atom14 layout the Structure Module uses. This helper converts:
+
+    * ``atom37_exists`` — which atom37 slots are defined for each residue
+      type (from ``STANDARD_ATOM_MASK``). Used as the mask in the
+      experimentally-resolved BCE so non-existent slots are excluded.
+    * ``atom37_resolved`` — which defined atom37 slots were actually
+      observed in the ground-truth mmCIF. This is the BCE target.
+    """
     atom37_exists_table = torch.as_tensor(
         STANDARD_ATOM_MASK,
         device=aatype.device,
@@ -484,6 +656,27 @@ def build_template_pair_feat(
     template_atom14_positions: torch.Tensor,
     template_atom14_mask: torch.Tensor,
 ) -> torch.Tensor:
+    """Assemble ``template_pair_feat`` (88-dim per pair, Table 1 / supplement 1.7.1).
+
+    For each template t and residue pair (i, j):
+
+    * **template_distogram** (39): one-hot bin of the template's Cβ-Cβ
+      distance, 38 equal-width bins spanning 3.25 Å … 50.75 Å plus one
+      catch-all bin for larger distances (Table 1).
+    * **template_pseudo_beta_mask** (1): 1 iff both template residues have
+      a pseudo-β coordinate.
+    * **template_aatype** i-side + j-side (22+22): residue type one-hots
+      tiled and stacked in both pair-directions.
+    * **template_unit_vector** (3): direction from residue i's backbone
+      frame to the Cα of residue j, expressed in i's local frame.
+      Supplement 1.7.1 notes "(Current models were trained with this
+      feature set to zero.)"; ``USE_TEMPLATE_UNIT_VECTOR`` at the top of
+      this module controls whether we populate it.
+    * **template_backbone_frame_mask** (1): 1 iff both i and j have a valid
+      backbone frame.
+
+    Empty-template case returns an all-zeros tensor with the right shape.
+    """
     if template_aatype.shape[0] == 0:
         length = template_aatype.shape[1]
         return template_atom14_positions.new_zeros((0, length, length, TEMPLATE_PAIR_DIM))
@@ -530,6 +723,20 @@ def build_template_angle_feat(
     template_atom14_positions: torch.Tensor,
     template_atom14_mask: torch.Tensor,
 ) -> torch.Tensor:
+    """Assemble ``template_angle_feat`` (57-dim, supplement 1.7.1 / Table 1).
+
+    For each template t and residue i:
+
+    * **template_aatype** (22): residue-type one-hot.
+    * **template_torsion_angles** (14): 7 torsions × 2 (sin/cos).
+    * **template_alt_torsion_angles** (14): π-periodic alt torsions (see
+      ``geometry.alternative_torsion_angles``) — the 180°-symmetric truth.
+    * **template_torsion_angles_mask** (7): one mask per torsion
+      (independent of sin/cos duplication).
+
+    Totals 57 — matches the DeepMind release (Table 1's printed 51 treats
+    the mask as 14-dim, but the released code uses 7).
+    """
     if template_aatype.shape[0] == 0:
         length = template_aatype.shape[1]
         return template_atom14_positions.new_zeros((0, length, TEMPLATE_ANGLE_DIM))
@@ -554,6 +761,30 @@ def build_supervision(
     atom14_positions: torch.Tensor,
     atom14_mask: torch.Tensor,
 ) -> Dict[str, torch.Tensor]:
+    """Build every ground-truth tensor the loss consumes.
+
+    Returns a dict mapping to every ``true_*`` key ``AlphaFoldLoss.forward``
+    expects:
+
+    * ``true_rotations`` / ``true_translations``: backbone frames for
+      backbone FAPE (supplement 1.8.1).
+    * ``true_atom_positions`` / ``true_atom_mask``: atom14 coords and mask
+      for all-atom FAPE (Algorithm 20 line 28).
+    * ``true_atom_positions_alt`` / ``true_atom_mask_alt`` /
+      ``true_atom_is_ambiguous``: the "alt truth" atom14 layout for the
+      symmetric-rename step (Algorithm 26 / supplement 1.8.5).
+    * ``true_torsion_angles`` / ``true_torsion_angles_alt`` /
+      ``true_torsion_mask``: the 7 torsion labels (+ alt) for the torsion
+      loss (Algorithm 27).
+    * ``true_rigid_group_frames_{R,t}`` and their ``_alt`` variants plus
+      ``true_rigid_group_exists``: the 8-per-residue rigid-group frames
+      used by side-chain FAPE (Algorithm 20 line 28 operates over all
+      groups).
+    * ``atom37_exists`` / ``experimentally_resolved_true``: BCE mask + target
+      for the experimentally-resolved head (1.9.10 / eq 43).
+    * ``res_types``, ``backbone_mask``, ``pseudo_beta_{positions,mask}``:
+      miscellanea consumed by distogram, recycling, and violation losses.
+    """
     (
         true_rigid_group_frames_R,
         true_rigid_group_frames_t,
@@ -776,6 +1007,25 @@ def collate_batch(
     num_recycling_samples: int = 1,
     num_ensemble_samples: int = 1,
 ) -> Dict[str, Any]:
+    """Collate a list of raw examples into a padded batch dict.
+
+    Pipeline per example: crop → build features/labels → pad to batch max.
+    All residue-indexed fields are padded with zeros to ``max_length``
+    (longest crop in the batch), MSA-indexed fields to ``max_cluster`` /
+    ``max_extra``, and template-indexed fields to ``max_templates_in_batch``.
+    Padding masks on ``seq_mask`` / ``msa_mask`` / ``extra_msa_mask`` (set by
+    ``build_processed_example_from_cropped`` before padding) propagate
+    through to the model so the attention and loss layers ignore the padded
+    slots.
+
+    When ``num_recycling_samples > 1`` or ``num_ensemble_samples > 1`` we
+    additionally pre-sample the MSA-derived features ``num_recycling_samples
+    × num_ensemble_samples`` times per example and stack them along two
+    new leading axes of the MSA fields (Algorithm 2 line 4). The model's
+    ``_sampled_feature_slice`` then indexes back into these axes. Deterministic
+    per-example seeding via ``_example_seed`` lets tests assert identical
+    batches across runs.
+    """
     cropped_examples = [
         crop_example(
             example,

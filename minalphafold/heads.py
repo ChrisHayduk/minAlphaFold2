@@ -55,16 +55,25 @@ class MaskedMSAHead(torch.nn.Module):
 
 
 class TMScoreHead(torch.nn.Module):
+    """Predicted aligned error head (supplement 1.9.7).
+
+    Linearly projects the pair representation z_ij to a distribution over
+    ``n_pae_bins`` aligned-error bins, used by ``TMScoreLoss`` during
+    fine-tuning to produce the pTM estimate of equation 39. The bins are
+    non-symmetric: PAE(i, j) != PAE(j, i). Default config uses 64 bins of
+    width 0.5 Å covering [0, 31.5 Å] with the final bin open-ended.
+    """
+
     def __init__(self, config):
         super().__init__()
-        self.n_pae_bins = config.n_pae_bins  # 64, covering 0–31.75 Å in 0.5 Å bins
+        self.n_pae_bins = config.n_pae_bins  # 64 = supplement 1.9.7 default
         self.linear = torch.nn.Linear(config.c_z, config.n_pae_bins)
         _zero_init_linear(self.linear)
 
     def forward(self, pair_representation: torch.Tensor):
         # pair_representation: (batch, N_res, N_res, c_z)
         logits = self.linear(pair_representation)  # (batch, N_res, N_res, n_pae_bins)
-        # No symmetrization — PAE(i, j) != PAE(j, i)
+        # No symmetrization — supplement 1.9.7 defines PAE as non-symmetric.
         return logits
 
 

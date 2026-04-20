@@ -21,6 +21,7 @@ from trainer import (
     default_model_config,
     evaluate,
     fit,
+    learning_rate_at_step,
     learning_rate_for_step,
     main,
     medium_model_config,
@@ -312,6 +313,35 @@ def test_build_optimizer_uses_configured_adam_hyperparameters():
     assert group["betas"] == (0.8, 0.95)
     assert abs(group["eps"] - 1e-6) < 1e-12
     assert abs(group["weight_decay"] - 1e-3) < 1e-12
+
+
+def test_learning_rate_at_step_applies_finetune_scale_without_warmup():
+    """Supplement 1.11.3: fine-tuning has no warmup, half base LR."""
+    training_config = TrainingConfig(
+        learning_rate=1e-3,
+        lr_schedule="warmup_cosine",
+        warmup_steps=10,
+        finetune_lr_scale=0.5,
+    )
+
+    # Step 0 during pre-training is inside the linear warmup → tiny LR.
+    pretrain_lr = learning_rate_at_step(training_config, step=0, total_steps=100, is_finetune=False)
+    assert pretrain_lr < training_config.learning_rate
+
+    # Same step during fine-tuning ignores warmup and returns lr * 0.5.
+    finetune_lr = learning_rate_at_step(training_config, step=0, total_steps=100, is_finetune=True)
+    assert abs(finetune_lr - 5e-4) < 1e-12
+
+
+def test_training_config_defaults_match_supplement_1_11_3():
+    """Supplement 1.11.3 fixes base lr=1e-3, ε=1e-6, clip=0.1, halving at fine-tune."""
+    cfg = TrainingConfig()
+    assert cfg.learning_rate == 1e-3
+    assert cfg.adam_beta1 == 0.9
+    assert cfg.adam_beta2 == 0.999
+    assert cfg.adam_eps == 1e-6
+    assert cfg.grad_clip_norm == 0.1
+    assert cfg.finetune_lr_scale == 0.5
 
 
 def test_use_finetune_loss_supports_two_phase_schedule():

@@ -1,3 +1,30 @@
+"""Training loop and config plumbing for min-AlphaFold2.
+
+Mirrors the setup described in supplement Section 1.11:
+
+* ``DataConfig`` carries the crop / MSA / template sizes from **Table 4**
+  ("Initial training" column). The "Fine-tuning" column uses larger values
+  (crop 384, Nseq 512, N_extra_seq 5120) — the user is expected to override
+  those when entering the fine-tuning stage.
+* ``TrainingConfig`` carries the optimisation hyperparameters from **1.11.3**
+  (Adam + warmup + factor-0.95 decay), the two-stage protocol from **1.11.1**
+  (``finetune`` / ``finetune_start_step``), and a ``finetune_lr_scale``
+  matching the "reduce the base learning rate by half" rule.
+* ``fit`` runs the loop, switching between the pre-training and fine-tuning
+  ``AlphaFoldLoss`` instances via ``use_finetune_loss`` and applying the LR
+  schedule described in 1.11.3.
+
+Deviations from the paper for pedagogical reasons are called out inline:
+
+* ``batch_size`` defaults to 1 (paper uses 128 across TPU cores).
+* Gradient clipping is applied globally over the mini-batch rather than
+  per-example — at ``batch_size=1`` these are identical.
+* The LR schedule offers ``"constant"`` and ``"warmup_cosine"`` variants;
+  the paper's exact schedule is "linear warmup → constant → one-shot
+  ×0.95 decay at 6.4·10⁶ samples", which neither option reproduces — we
+  document the tradeoff here rather than adding a bespoke schedule.
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -28,6 +55,14 @@ def default_device() -> str:
 
 
 def _make_model_config(**overrides: Any) -> SimpleNamespace:
+    """Build a ``SimpleNamespace`` model config from the "tiny" baseline.
+
+    The baseline dict is a shrunk-to-CPU version of the AlphaFold2 monomer
+    config (supplement 1.6 and Table 4): every channel dim, head count, and
+    block count is reduced so ``test_shapes`` runs in seconds. ``overrides``
+    swaps in larger values to produce the ``medium`` and ``alphafold2``
+    profiles below.
+    """
     config = {
         "c_m": 32,
         "c_s": 32,
@@ -79,13 +114,26 @@ def _make_model_config(**overrides: Any) -> SimpleNamespace:
 
 @dataclass
 class DataConfig:
+    """Dataset + feature-sizing configuration (supplement Table 4).
+
+    The defaults below match the **Initial training** column of Table 4:
+    crop 256, Nseq 128, N_extra_seq 1024, Ntempl 4. The **Fine-tuning** column
+    uses 384 / 512 / 5120 / 4 — bump ``crop_size``, ``msa_depth``, and
+    ``extra_msa_depth`` when entering fine-tuning (supplement 1.11.1).
+
+    ``block_delete_*`` controls the MSA block-deletion augmentation from
+    supplement 1.2.6 (Algorithm 1). ``masked_msa_probability = 0.15`` is the
+    BERT-style masking rate from supplement 1.2.7 that produces the targets
+    for the masked-MSA loss (1.9.9 / equation 42).
+    """
+
     processed_features_dir: str | Path = "data/processed_features"
     processed_labels_dir: str | Path = "data/processed_labels"
     val_fraction: float = 0.1
-    crop_size: int = 256
-    msa_depth: int = 128
-    extra_msa_depth: int = 1024
-    max_templates: int = 4
+    crop_size: int = 256          # N_res — Table 4 initial training
+    msa_depth: int = 128          # N_seq — Table 4 initial training
+    extra_msa_depth: int = 1024   # N_extra_seq — Table 4 initial training
+    max_templates: int = 4        # N_templ — Table 4 (both stages)
     block_delete_training_msa: bool = True
     block_delete_msa_fraction: float = 0.3
     block_delete_msa_randomize_num_blocks: bool = False
@@ -96,30 +144,54 @@ class DataConfig:
 
 @dataclass
 class TrainingConfig:
+    """Optimiser, schedule, and recycling settings (supplement 1.11).
+
+    Defaults match supplement 1.11.3 / Table 4 where practical:
+
+    * ``learning_rate = 1e-3``, ``adam_beta{1,2} = (0.9, 0.999)``,
+      ``adam_eps = 1e-6`` per 1.11.3.
+    * ``grad_clip_norm = 0.1`` per 1.11.3 ("clipping value 0.1"). The paper
+      clips per-example; we clip over the full mini-batch, which is
+      equivalent at ``batch_size = 1``.
+    * ``finetune_lr_scale = 0.5`` implements "we reduce the base learning
+      rate by half" (1.11.3) during the fine-tuning stage; matches Table 4's
+      fine-tuning LR of 5·10⁻⁴.
+    * ``batch_size = 1`` deviates from the paper's 128 (one example per
+      TPU-core), since a pedagogical CPU/single-GPU run can't afford 128.
+    * ``lr_schedule`` supports ``"constant"`` or ``"warmup_cosine"``. The
+      paper's exact schedule (warmup → constant → ×0.95 at 6.4·10⁶ samples)
+      is neither; ``warmup_cosine`` is a gentler pedagogical stand-in.
+    * ``n_cycles`` and ``n_ensemble`` default to 1; the paper uses 4 and 1
+      respectively during training (supplement 1.10 and 1.11.2; ensembling
+      is inference-only).
+    """
+
     epochs: int = 1
-    batch_size: int = 1
-    learning_rate: float = 1e-4
+    batch_size: int = 1                       # paper: 128 (TPU mini-batch)
+    learning_rate: float = 1e-3               # supplement 1.11.3
     min_learning_rate: float = 0.0
     weight_decay: float = 0.0
-    adam_beta1: float = 0.9
-    adam_beta2: float = 0.999
-    adam_eps: float = 1e-8
+    adam_beta1: float = 0.9                   # supplement 1.11.3
+    adam_beta2: float = 0.999                 # supplement 1.11.3
+    adam_eps: float = 1e-6                    # supplement 1.11.3
     lr_schedule: str = "constant"
-    warmup_steps: int = 0
-    grad_clip_norm: float | None = 1.0
+    warmup_steps: int = 0                     # paper: 128k samples / batch=128 = 1000 steps
+    grad_clip_norm: float | None = 0.1        # supplement 1.11.3
     device: str = default_device()
     seed: int = 0
     num_workers: int = 0
-    n_cycles: int = 1
-    n_ensemble: int = 1
-    finetune: bool = False
+    n_cycles: int = 1                         # paper: 4 (supplement 1.10)
+    n_ensemble: int = 1                       # paper: 1 at training (1.11.2)
+    finetune: bool = False                    # supplement 1.11.1 stage toggle
     finetune_start_step: int | None = None
+    finetune_lr_scale: float = 0.5            # supplement 1.11.3 ("half the base LR")
     detach_rotations: bool = True
     latest_checkpoint_path: str | Path | None = None
     best_checkpoint_path: str | Path | None = None
 
 
 def default_model_config() -> SimpleNamespace:
+    """Tiny CPU-friendly profile (used as the default model config for tests)."""
     return _make_model_config()
 
 
@@ -161,7 +233,14 @@ def medium_model_config() -> SimpleNamespace:
 
 
 def alphafold2_model_config() -> SimpleNamespace:
-    """Match the official AlphaFold2 monomer model hyperparameters as closely as this repo's schema allows."""
+    """Match the official AlphaFold2 monomer hyperparameters (supplement 1.6).
+
+    Key dims (supplement 1.5 / 1.6): ``c_m = 256``, ``c_z = 128``, ``c_s =
+    384``, ``c_t = 64``, ``c_e = 64``; ``N_block = 48`` Evoformer blocks
+    (Algorithm 6), ``structure_module_layers = 8`` (Algorithm 20),
+    ``ipa_num_heads = 12`` / ``ipa_c = 16`` (Algorithm 22). Dropout rates
+    come from supplement 1.11.6.
+    """
 
     return _make_model_config(
         c_m=256,
@@ -205,6 +284,7 @@ def alphafold2_model_config() -> SimpleNamespace:
 
 
 def model_config_from_name(name: str) -> SimpleNamespace:
+    """Dispatch ``"tiny" / "medium" / "alphafold2"`` to the matching profile."""
     if name == "tiny":
         return default_model_config()
     if name == "medium":
@@ -215,12 +295,19 @@ def model_config_from_name(name: str) -> SimpleNamespace:
 
 
 def copy_model_config(model_config: Any, **overrides: Any) -> SimpleNamespace:
+    """Return a shallow copy of ``model_config`` with the given fields overridden."""
     data = dict(vars(model_config))
     data.update(overrides)
     return SimpleNamespace(**data)
 
 
 def zero_dropout_model_config(model_config: Any) -> SimpleNamespace:
+    """Clone a config with every dropout rate set to 0.
+
+    Used for overfit / memorisation experiments (``scripts/run_*_overfit.py``)
+    where the stochastic regularisation from supplement 1.11.6 would prevent
+    the model from fitting a single example.
+    """
     profile_name = getattr(model_config, "model_profile", "custom")
     return copy_model_config(
         model_config,
@@ -311,6 +398,18 @@ def move_to_device(value: Any, device: torch.device) -> Any:
 
 
 def learning_rate_for_step(training_config: TrainingConfig, step: int, total_steps: int) -> float:
+    """Pre-training learning-rate schedule (supplement 1.11.3).
+
+    * ``"constant"``: base lr every step.
+    * ``"warmup_cosine"``: linear warmup for ``warmup_steps``, then cosine
+      decay from the base lr down to ``min_learning_rate`` over the rest of
+      training. Cosine is a pedagogical stand-in for the paper's exact
+      "constant then one-shot ×0.95 at 6.4·10⁶ samples" rule.
+
+    Fine-tuning uses a separate code path in the training loop that
+    bypasses this schedule (no warmup per 1.11.3, constant
+    ``learning_rate * finetune_lr_scale``).
+    """
     base_lr = training_config.learning_rate
     if training_config.lr_schedule == "constant":
         return base_lr
@@ -335,6 +434,7 @@ def set_optimizer_learning_rate(optimizer: torch.optim.Optimizer, learning_rate:
 
 
 def build_optimizer(model: AlphaFold2, training_config: TrainingConfig) -> torch.optim.Optimizer:
+    """Construct Adam with supplement 1.11.3 hyperparameters."""
     return torch.optim.Adam(
         model.parameters(),
         lr=training_config.learning_rate,
@@ -345,12 +445,39 @@ def build_optimizer(model: AlphaFold2, training_config: TrainingConfig) -> torch
 
 
 def use_finetune_loss(training_config: TrainingConfig, global_step: int) -> bool:
+    """Decide whether to use the fine-tuning loss at the current step.
+
+    Supplement 1.11.1 splits training into two stages. ``finetune_start_step``
+    lets the caller continue a single run into fine-tuning after a warmup of
+    pre-training; ``finetune=True`` starts in fine-tuning from step 0.
+    """
     if training_config.finetune_start_step is not None:
         return global_step >= training_config.finetune_start_step
     return training_config.finetune
 
 
+def learning_rate_at_step(
+    training_config: TrainingConfig,
+    step: int,
+    total_steps: int,
+    *,
+    is_finetune: bool,
+) -> float:
+    """LR for the current step, applying the fine-tuning rule from 1.11.3.
+
+    Pre-training: follow ``learning_rate_for_step`` (warmup / cosine /
+    constant). Fine-tuning: constant ``learning_rate * finetune_lr_scale``
+    with no warmup — supplement 1.11.3 ("during the fine-tuning stage we
+    have no learning rate warm-up, but we reduce the base learning rate by
+    half").
+    """
+    if is_finetune:
+        return training_config.learning_rate * training_config.finetune_lr_scale
+    return learning_rate_for_step(training_config, step, total_steps)
+
+
 def model_inputs_from_batch(batch: dict[str, Any], training_config: TrainingConfig) -> dict[str, torch.Tensor | int]:
+    """Unpack a collated batch into the kwargs ``AlphaFold2.forward`` expects."""
     return {
         "target_feat": batch["target_feat"],
         "residue_index": batch["residue_index"],
@@ -376,6 +503,13 @@ def collapse_sampled_batch_tensor(
     recycle_index: int | None = None,
     ensemble_index: int = 0,
 ) -> torch.Tensor:
+    """Strip the per-cycle / per-ensemble outer dims off a pre-sampled tensor.
+
+    The data pipeline may materialise ``N_cycle × N_ensemble`` samples of the
+    masked-MSA target by prepending two outer axes (supplement 1.11.2). The
+    loss only consumes one sample — by default the last cycle's zeroth
+    ensemble member, which matches the forward pass's final iteration.
+    """
     if tensor.ndim >= 5:
         if recycle_index is None:
             recycle_index = tensor.shape[0] - 1
@@ -384,6 +518,7 @@ def collapse_sampled_batch_tensor(
 
 
 def loss_inputs_from_batch(batch: dict[str, Any], outputs: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """Assemble the kwargs ``AlphaFoldLoss`` expects from a batch + model outputs."""
     recycle_index = max(int(outputs.get("sampled_n_cycles", 1)) - 1, 0)
     ensemble_index = 0
     return {
@@ -420,6 +555,7 @@ def loss_inputs_from_batch(batch: dict[str, Any], outputs: dict[str, torch.Tenso
         ),
         "plddt_pred": outputs["plddt_logits"],
         "distogram_pred": outputs["distogram_logits"],
+        "tm_pred": outputs["tm_logits"],
         "res_types": batch["res_types"],
         "residue_index": batch["residue_index"],
         "seq_mask": batch["seq_mask"],
@@ -433,6 +569,13 @@ def train_step(
     batch: dict[str, Any],
     training_config: TrainingConfig,
 ) -> dict[str, float]:
+    """Single forward/backward/step iteration.
+
+    Gradient clipping follows supplement 1.11.3 (clip by global norm = 0.1
+    by default). The paper clips per-example within a mini-batch; we clip
+    over the whole mini-batch, which is equivalent at ``batch_size = 1``
+    (the default pedagogical setting).
+    """
     device = resolve_device(training_config.device)
     model.train()
     optimizer.zero_grad(set_to_none=True)
@@ -456,6 +599,7 @@ def evaluate(
     dataloader: DataLoader,
     training_config: TrainingConfig,
 ) -> dict[str, float]:
+    """Return mean per-example loss over a dataloader (no gradient updates)."""
     device = resolve_device(training_config.device)
     model.eval()
 
@@ -519,6 +663,24 @@ def fit(
     data_config: DataConfig | None = None,
     training_config: TrainingConfig | None = None,
 ) -> tuple[AlphaFold2, list[dict[str, float | int]]]:
+    """Top-level training loop — mirrors supplement 1.11.1.
+
+    Runs ``epochs`` passes over the training data, applying the optimiser
+    once per mini-batch. Each step:
+
+    1. Decide pre-training vs fine-tuning by ``use_finetune_loss``.
+    2. Pick the LR via ``learning_rate_at_step`` (which handles the "half
+       base lr, no warmup" fine-tuning rule from 1.11.3).
+    3. Select the matching ``AlphaFoldLoss`` instance (pre-training vs
+       fine-tuning differs in which auxiliary losses are active — see
+       equation 7 fine-tuning row).
+    4. Run one ``train_step`` (forward → backward → clip → step).
+
+    Pre-training vs fine-tuning stage transitions (Table 4) — including
+    larger crop sizes and loading a pretrained checkpoint — are the
+    caller's responsibility: swap ``DataConfig``/``TrainingConfig`` and
+    start a new ``fit`` run for the fine-tuning phase.
+    """
     model_config = default_model_config() if model_config is None else model_config
     data_config = DataConfig() if data_config is None else data_config
     training_config = TrainingConfig() if training_config is None else training_config
@@ -568,9 +730,12 @@ def fit(
         total_train_examples = 0
 
         for batch in train_loader:
-            current_lr = learning_rate_for_step(training_config, global_step, total_steps)
+            is_finetune = use_finetune_loss(training_config, global_step)
+            current_lr = learning_rate_at_step(
+                training_config, global_step, total_steps, is_finetune=is_finetune,
+            )
             set_optimizer_learning_rate(optimizer, current_lr)
-            loss_fn = finetune_loss_fn if use_finetune_loss(training_config, global_step) else pretrain_loss_fn
+            loss_fn = finetune_loss_fn if is_finetune else pretrain_loss_fn
             metrics = train_step(model, loss_fn, optimizer, batch, training_config)
             batch_size = int(batch["aatype"].shape[0])
             total_train_loss += metrics["loss"] * batch_size
@@ -649,15 +814,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--fixed-feature-seed", type=int, default=None)
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--batch-size", type=int, default=1)
-    parser.add_argument("--learning-rate", type=float, default=1e-4)
+    # Optimiser defaults mirror supplement 1.11.3 (Adam base lr 10⁻³, ε=10⁻⁶,
+    # β=(0.9, 0.999), gradient-clipping norm 0.1).
+    parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--min-learning-rate", type=float, default=0.0)
     parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument("--adam-beta1", type=float, default=0.9)
     parser.add_argument("--adam-beta2", type=float, default=0.999)
-    parser.add_argument("--adam-eps", type=float, default=1e-8)
+    parser.add_argument("--adam-eps", type=float, default=1e-6)
     parser.add_argument("--lr-schedule", choices=["constant", "warmup_cosine"], default="constant")
     parser.add_argument("--warmup-steps", type=int, default=0)
-    parser.add_argument("--grad-clip-norm", type=float, default=1.0)
+    parser.add_argument("--grad-clip-norm", type=float, default=0.1)
     parser.add_argument("--device", type=str, default=default_device())
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--num-workers", type=int, default=0)
@@ -665,6 +832,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--n-ensemble", type=int, default=1)
     parser.add_argument("--finetune", action="store_true")
     parser.add_argument("--finetune-start-step", type=int, default=None)
+    parser.add_argument("--finetune-lr-scale", type=float, default=0.5)
     parser.add_argument("--latest-checkpoint-path", type=str, default=None)
     parser.add_argument("--best-checkpoint-path", type=str, default=None)
     return parser.parse_args(argv)
@@ -708,6 +876,7 @@ def main(argv: list[str] | None = None) -> tuple[AlphaFold2, list[dict[str, floa
         n_ensemble=args.n_ensemble,
         finetune=args.finetune,
         finetune_start_step=args.finetune_start_step,
+        finetune_lr_scale=args.finetune_lr_scale,
         latest_checkpoint_path=args.latest_checkpoint_path,
         best_checkpoint_path=args.best_checkpoint_path,
     )

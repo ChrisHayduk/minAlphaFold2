@@ -1,3 +1,35 @@
+"""A3M multiple-sequence-alignment parsing and amino-acid tokenisation.
+
+A3M is HHsuite's FASTA-like MSA format. Each record's sequence encodes one
+row of an alignment with three character classes:
+
+* **Uppercase letters** are aligned match states (columns of the MSA).
+* **Lowercase letters** are insertions relative to the query — they carry
+  information but do not occupy an alignment column. The count of lowercase
+  characters preceding each match state becomes the ``deletion`` feature
+  (supplement 1.2.9, Table 1: ``cluster_has_deletion`` /
+  ``cluster_deletion_value``).
+* **Dashes** are deletions relative to the query: they occupy an aligned
+  column but carry no residue.
+
+This file converts raw A3M text into the two arrays the rest of the pipeline
+needs: a ``(N_seq, N_res)`` integer MSA and a matching ``(N_seq, N_res)``
+deletion-count array.
+
+Alphabet conventions (supplement 1.9.9):
+
+* ``target_feat`` uses 21 classes — 20 amino acids + unknown — matching
+  ``SEQ_ALPHABET_SIZE`` and Table 1 ``aatype``.
+* MSA features use 23 classes — 20 amino acids + unknown + gap + mask token
+  — matching ``MSA_ALPHABET_SIZE`` and Table 1 ``cluster_msa`` /
+  ``extra_msa``.
+
+The one-letter ordering in ``RESTYPES`` matches DeepMind's canonical AF2
+alphabet (A, R, N, D, C, Q, E, G, H, I, L, K, M, F, P, S, T, W, Y, V), which
+is what every downstream module assumes. Glycine is index 7 — this is why
+pseudo-β helpers and recycling both use ``aatype == 7`` as the GLY check.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -7,18 +39,23 @@ from typing import List, Tuple
 import numpy as np
 
 
+# Canonical AF2 one-letter alphabet (20 standard amino acids).
 RESTYPES = "ARNDCQEGHILKMFPSTWYV"
 RESTYPE_TO_ID = {aa: idx for idx, aa in enumerate(RESTYPES)}
 
-UNK_ID = 20
-GAP_ID = 21
-MASK_ID = 22
+# Fixed IDs for non-standard tokens (supplement 1.9.9: "20 common amino acid
+# types, an unknown type, a gap token, and a mask token").
+UNK_ID = 20   # any letter outside RESTYPES
+GAP_ID = 21   # alignment gap '-'
+MASK_ID = 22  # BERT-style mask token used by the masked MSA loss
 
-SEQ_ALPHABET_SIZE = 21
-MSA_ALPHABET_SIZE = 23
+# Alphabet sizes used by feature builders (Table 1).
+SEQ_ALPHABET_SIZE = 21  # target_feat: 20 AAs + unknown
+MSA_ALPHABET_SIZE = 23  # cluster_msa / extra_msa: + gap + mask
 
 
 def aa_to_id(aa: str) -> int:
+    """Map a single character (one-letter AA code, '-', or unknown) to an ID."""
     aa = aa.upper()
     if aa == "-":
         return GAP_ID
@@ -26,6 +63,7 @@ def aa_to_id(aa: str) -> int:
 
 
 def sequence_to_ids(sequence: str) -> np.ndarray:
+    """Tokenise an ungapped sequence to an int32 array of AA IDs."""
     return np.fromiter((aa_to_id(aa) for aa in sequence), dtype=np.int32, count=len(sequence))
 
 
@@ -34,6 +72,15 @@ def ungap_query_columns(
     deletions: np.ndarray,
     query_aligned: str,
 ) -> Tuple[np.ndarray, np.ndarray, str]:
+    """Drop columns where the query has a gap, returning the ungapped target.
+
+    In an A3M alignment the query (first row) can contain dashes when other
+    rows inserted residues that couldn't be absorbed as lowercase
+    insertions. These gap columns are not part of the original target
+    sequence, so we strip them before producing the MSA / deletion arrays
+    consumed by the model. Returns (msa without gap columns, deletions
+    without gap columns, concatenated target sequence).
+    """
     query_mask = np.asarray([char != "-" for char in query_aligned], dtype=bool)
     if query_mask.shape[0] != msa.shape[1]:
         raise ValueError(
@@ -46,10 +93,22 @@ def ungap_query_columns(
 
 @dataclass
 class A3M:
+    """One parsed A3M file: FASTA-style headers and raw (mixed-case) sequences."""
+
     headers: List[str]
     seqs_raw: List[str]
 
     def to_aligned_msa(self) -> Tuple[List[str], np.ndarray]:
+        """Split each A3M row into (aligned characters, per-column deletion counts).
+
+        Lowercase characters are insertions relative to the query column grid
+        (the ``deletion`` feature from Table 1). Each uppercase character or
+        dash sits in one alignment column; lowercase characters before it
+        accumulate into that column's deletion count. Returns one
+        ``aligned_sequence`` string per row (all uppercase + dash, all the
+        same length) and a ``(N_seq, N_res)`` integer array of deletion
+        counts.
+        """
         aligned_sequences: List[str] = []
         deletion_rows: List[List[int]] = []
 
@@ -79,6 +138,11 @@ class A3M:
         return aligned_sequences, deletions
 
     def to_tokens(self, max_seqs: int | None = None) -> Tuple[np.ndarray, np.ndarray]:
+        """Integer-tokenise the aligned MSA and return ``(msa, deletions)``.
+
+        Optional ``max_seqs`` truncates to the first N rows (the query is row
+        0 by convention).
+        """
         aligned_sequences, deletions = self.to_aligned_msa()
         if max_seqs is not None:
             aligned_sequences = aligned_sequences[:max_seqs]
@@ -95,6 +159,7 @@ class A3M:
 
 
 def read_a3m(path: str | Path) -> A3M:
+    """Parse an A3M file from disk (FASTA-style: ``>`` headers, sequence lines)."""
     path = Path(path)
 
     headers: List[str] = []

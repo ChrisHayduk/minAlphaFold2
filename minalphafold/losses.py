@@ -104,8 +104,8 @@ class AlphaFoldLoss(torch.nn.Module):
 
     Training:
         L = 0.5 L_FAPE + 0.5 L_aux + 0.3 L_dist + 2.0 L_msa + 0.01 L_conf
-    Fine-tuning:
-        L += 0.01 L_exp_resolved + 1.0 L_viol
+    Fine-tuning (equation 7 fine-tuning row + supplement 1.9.7):
+        L += 0.01 L_exp_resolved + 1.0 L_viol + 0.1 L_pae
 
     Term-by-term mapping (all weights below are *absolute* eq 7 weights, not
     relative fractions):
@@ -120,6 +120,9 @@ class AlphaFoldLoss(torch.nn.Module):
     * `confidence_weight = 0.01` → 0.01 L_conf (supplement 1.9.6, Alg 29).
     * `experimentally_resolved_weight = 0.01` → 0.01 L_exp_resolved (1.9.10).
     * `structural_violation_weight = 1.0` → 1.0 L_viol (1.9.11, eq 47).
+    * `tm_score_weight = 0.1` → 0.1 L_pae (supplement 1.9.7, paragraph
+      following equation 38: "average categorical cross-entropy loss, with
+      weight 0.1"). Requires `tm_pred` to be passed; otherwise skipped.
 
     `TorsionAngleLoss` pre-applies the outer 0.5 factor on L_aux^{torsion}
     and the 0.02 coefficient on L_anglenorm from Algorithm 27, so
@@ -148,6 +151,11 @@ class AlphaFoldLoss(torch.nn.Module):
             max_resolution=3.0,
         )
         self.structural_violation_loss = StructuralViolationLoss()
+        self.tm_score_loss = TMScoreLoss(
+            filter_by_resolution=True,
+            min_resolution=0.1,
+            max_resolution=3.0,
+        )
         self.backbone_loss = BackboneTrajectoryLoss()
         self.sidechain_fape_loss = AllAtomFAPE()
 
@@ -158,6 +166,7 @@ class AlphaFoldLoss(torch.nn.Module):
         self.confidence_weight = 0.01
         self.experimentally_resolved_weight = 0.01
         self.structural_violation_weight = 1.0
+        self.tm_score_weight = 0.1  # supplement 1.9.7 (paragraph after eq 38)
 
         self.finetune = finetune
         self.use_clamped_fape = use_clamped_fape
@@ -193,6 +202,7 @@ class AlphaFoldLoss(torch.nn.Module):
             seq_mask: Optional[torch.Tensor] = None,  # (b, N_res) 1=valid, 0=padding
             return_breakdown: bool = False,
             resolution: Optional[torch.Tensor] = None,
+            tm_pred: Optional[torch.Tensor] = None,  # (b, N_res, N_res, n_pae_bins)
         ):
         loss_terms = self.compute_loss_terms(
             structure_model_prediction=structure_model_prediction,
@@ -223,6 +233,7 @@ class AlphaFoldLoss(torch.nn.Module):
             res_types=res_types,
             residue_index=residue_index,
             seq_mask=seq_mask,
+            tm_pred=tm_pred,
         )
         if return_breakdown:
             return loss_terms["loss"], loss_terms
@@ -258,6 +269,7 @@ class AlphaFoldLoss(torch.nn.Module):
             residue_index: torch.Tensor,
             seq_mask: Optional[torch.Tensor] = None,
             resolution: Optional[torch.Tensor] = None,
+            tm_pred: Optional[torch.Tensor] = None,
         ) -> dict[str, torch.Tensor]:
         pred_all_frames_R = structure_model_prediction["all_frames_R"]  # (batch, N_res, 8, 3, 3)
         pred_all_frames_t = structure_model_prediction["all_frames_t"]  # (batch, N_res, 8, 3)
@@ -427,6 +439,24 @@ class AlphaFoldLoss(torch.nn.Module):
             loss = loss + weighted_exp_resolved_loss
             loss_terms["experimentally_resolved_loss"] = exp_resolved_loss
             loss_terms["weighted_experimentally_resolved_loss"] = weighted_exp_resolved_loss
+
+            # Supplement 1.9.7: predicted aligned error / pTM head, fine-tuning
+            # only, weight 0.1. Skipped silently if tm_pred is not supplied.
+            if tm_pred is not None:
+                tm_score_loss = self.tm_score_loss(
+                    tm_pred,
+                    predicted_rotations=structure_model_prediction["final_rotations"],
+                    predicted_translations=structure_model_prediction["final_translations"],
+                    true_rotations=true_rotations,
+                    true_translations=true_translations,
+                    backbone_mask=backbone_mask,
+                    seq_mask=seq_mask,
+                    resolution=resolution,
+                )
+                weighted_tm_score_loss = self.tm_score_weight * tm_score_loss
+                loss = loss + weighted_tm_score_loss
+                loss_terms["tm_score_loss"] = tm_score_loss
+                loss_terms["weighted_tm_score_loss"] = weighted_tm_score_loss
 
         loss_terms["loss"] = loss
         return loss_terms
@@ -935,6 +965,121 @@ class ExperimentallyResolvedLoss(torch.nn.Module):
 
         return loss
 
+
+
+class TMScoreLoss(torch.nn.Module):
+    """Predicted aligned error / pTM cross-entropy loss (supplement 1.9.7).
+
+    The TM-score head (``TMScoreHead``) linearly projects the pair
+    representation ``z_ij`` to a distribution over ``n_bins`` aligned-error
+    bins. This module trains that head by cross-entropy against a one-hot
+    encoding of the (non-symmetric) pairwise aligned-error matrix
+
+        e_ij = ||T_i^{-1} ∘ x_j − T_i^{true,-1} ∘ x_j^{true}||,
+
+    defined in the paragraph following equation 38 of the supplement.
+    ``T_i = (R_i, t_i)`` is the predicted backbone frame at residue ``i`` and
+    ``x_j`` is the predicted Cα of residue ``j``; since AF2 places Cα at the
+    origin of the backbone frame (Algorithm 20 lines 15-16), ``x_j = t_j``.
+    Primed quantities are the matching ground truth.
+
+    Bins cover ``[0, max_bin]`` Å in ``(n_bins − 1)`` equal-width steps; the
+    final bin is open-ended and catches any larger error. Defaults are 64
+    bins of 0.5 Å covering up to 31.5 Å per supplement 1.9.7 ("we discretize
+    the distribution of e_ij into 64 bins, covering the range from 0 to 31.5
+    Å with 0.5 Å bin width. During training, the final bin also captures any
+    larger errors.").
+
+    Per supplement 1.9.7, this head is trained during **fine-tuning only**,
+    with weight 0.1 ("average categorical cross-entropy loss, with weight
+    0.1 — weights 0.01 and 1.0 were also tried but those weights lowered
+    either pTM accuracy or structure prediction accuracy, respectively"),
+    and with the same resolution filter as pLDDT (supplement 1.9.6): non-NMR
+    examples with resolution in [0.1, 3.0] Å.
+
+    ``e_ij`` is computed under ``torch.no_grad``: it is a fixed target for
+    the head, not a second route by which to supervise the structure module
+    (FAPE already handles structural optimization).
+    """
+
+    def __init__(
+        self,
+        *,
+        max_bin: float = 31.5,
+        n_bins: int = 64,
+        filter_by_resolution: bool = True,
+        min_resolution: float = 0.1,
+        max_resolution: float = 3.0,
+    ):
+        super().__init__()
+        self.max_bin = max_bin
+        self.n_bins = n_bins
+        self.filter_by_resolution = filter_by_resolution
+        self.min_resolution = min_resolution
+        self.max_resolution = max_resolution
+
+    def forward(
+        self,
+        pae_pred: torch.Tensor,                # (b, N_res, N_res, n_bins) logits
+        predicted_rotations: torch.Tensor,     # (b, N_res, 3, 3)
+        predicted_translations: torch.Tensor,  # (b, N_res, 3)  (Cα positions)
+        true_rotations: torch.Tensor,          # (b, N_res, 3, 3)
+        true_translations: torch.Tensor,       # (b, N_res, 3)
+        backbone_mask: Optional[torch.Tensor] = None,  # (b, N_res)
+        seq_mask: Optional[torch.Tensor] = None,       # (b, N_res)
+        resolution: Optional[torch.Tensor] = None,
+    ):
+        # Supplement 1.9.7: e_ij = ||T_i^{-1} ∘ x_j − T_i^{true,-1} ∘ x_j^{true}||.
+        # Using T^{-1} ∘ x = R^T (x − t), and x_j = t_j (Algorithm 20 line 15).
+        with torch.no_grad():
+            pred_diff = predicted_translations[:, None, :, :] - predicted_translations[:, :, None, :]
+            true_diff = true_translations[:, None, :, :] - true_translations[:, :, None, :]
+            pred_R_inv = predicted_rotations.transpose(-1, -2)
+            true_R_inv = true_rotations.transpose(-1, -2)
+            # (b, i, j, m) = Σ_k R_i^T[m,k] · (t_j − t_i)[k]
+            pred_local = torch.einsum("bimk,bijk->bijm", pred_R_inv, pred_diff)
+            true_local = torch.einsum("bimk,bijk->bijm", true_R_inv, true_diff)
+            e_ij = torch.sqrt(torch.sum((pred_local - true_local) ** 2, dim=-1) + 1e-10)
+
+            # ``n_bins − 1`` equal-width interior edges; the final bin is
+            # open-ended (supplement 1.9.7 last paragraph above eq 39). The
+            # paper's bins are left-closed, right-open — bin k = [k·w, (k+1)·w)
+            # — which is PyTorch's ``right=True`` convention (buckets of the
+            # form ``[boundaries[i-1], boundaries[i])``).
+            bin_width = self.max_bin / (self.n_bins - 1)
+            bin_edges = bin_width * torch.arange(
+                1, self.n_bins, device=e_ij.device, dtype=e_ij.dtype,
+            )
+            true_bin = torch.bucketize(e_ij, bin_edges, right=True).clamp_(max=self.n_bins - 1)
+
+        # Average categorical cross-entropy over residue pairs (supplement 1.9.7).
+        log_pred = torch.nn.functional.log_softmax(pae_pred, dim=-1)
+        ce = -torch.gather(log_pred, -1, true_bin[..., None]).squeeze(-1)
+
+        if backbone_mask is not None:
+            pair_mask = backbone_mask[:, :, None] * backbone_mask[:, None, :]
+        else:
+            pair_mask = ce.new_ones(ce.shape)
+        if seq_mask is not None:
+            pair_mask = pair_mask * (seq_mask[:, :, None] * seq_mask[:, None, :])
+
+        ce = ce * pair_mask
+        denom = pair_mask.sum(dim=(1, 2)).clamp(min=1.0)
+        loss = ce.sum(dim=(1, 2)) / denom
+
+        if self.filter_by_resolution and resolution is not None:
+            resolution = resolution.to(loss.device, dtype=loss.dtype).reshape(-1)
+            if resolution.numel() == 1 and loss.numel() != 1:
+                resolution = resolution.expand_as(loss)
+            else:
+                resolution = resolution.reshape(loss.shape)
+            in_range = (
+                (resolution >= self.min_resolution)
+                & (resolution <= self.max_resolution)
+            ).to(loss.dtype)
+            loss = loss * in_range
+
+        return loss
 
 
 class StructuralViolationLoss(torch.nn.Module):

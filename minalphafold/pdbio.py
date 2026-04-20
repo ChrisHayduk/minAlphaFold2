@@ -1,3 +1,20 @@
+"""Minimal PDB writer for serialising atom14 structures.
+
+Converts the model's ``atom14`` output format (``(N_res, 14, 3)`` coordinates
+plus an atom-existence mask) to standard PDB ATOM records so predictions can
+be opened in PyMOL / ChimeraX / a browser. This is purely a visualisation
+helper — not a round-trip structure store. See ``mmcif.py`` for the parsing
+side.
+
+The one non-obvious bit is the pLDDT → B-factor conversion in
+``write_model_output_pdb``: supplement Algorithm 29 line 5 defines the
+scalar per-residue confidence as ``r^pLDDT_i = p^pLDDT_i · v_bins`` with
+``v_bins = [1, 3, 5, ..., 99]`` (bin centres of the 50-bin discretisation,
+spanning [0, 100] lDDT-Cα). Writing that scalar into the B-factor column is
+the convention used by the DeepMind AF2 release and by viewers that
+colour-by-confidence.
+"""
+
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +37,9 @@ def _residue_name_from_aatype(aatype_index: int) -> str:
 
 
 def _element_from_atom_name(atom_name: str) -> str:
+    # PDB convention: the element symbol is the first letter of the atom
+    # name. Good enough for heavy atoms (no 2-letter elements in standard
+    # amino acids).
     for character in atom_name:
         if character.isalpha():
             return character.upper()
@@ -37,7 +57,17 @@ def atom14_to_pdb_string(
     occupancies: Any | None = None,
     serial_start: int = 1,
 ) -> str:
-    """Serialize one atom14 structure to a simple PDB string."""
+    """Serialise one atom14 structure to a minimal PDB string.
+
+    Iterates over residues and emits one ATOM record per existing atom
+    (where ``atom14_mask`` is non-zero). Residues where every atom is masked
+    out are skipped entirely. Appends a ``TER`` / ``END`` terminator pair
+    at the end.
+
+    ``b_factors`` and ``occupancies`` are per-residue (broadcast across all
+    atoms of that residue). ``residue_index`` defaults to ``0..N-1`` → PDB
+    residue numbers ``1..N`` (PDB is 1-indexed).
+    """
 
     if len(chain_id) != 1:
         raise ValueError(f"chain_id must be a single character, got {chain_id!r}")
@@ -145,6 +175,7 @@ def write_atom14_pdb(
     occupancies: Any | None = None,
     serial_start: int = 1,
 ) -> Path:
+    """Write a single atom14 structure to a PDB file. Thin ``atom14_to_pdb_string`` wrapper."""
     output_path = Path(path)
     pdb_text = atom14_to_pdb_string(
         aatype,
@@ -170,9 +201,23 @@ def write_model_output_pdb(
     b_factors: Any | None = None,
     occupancies: Any | None = None,
 ) -> Path:
+    """Write one example from a model output dict to a PDB file.
+
+    Pulls ``atom14_coords``, ``atom14_mask``, ``aatype`` and ``residue_index``
+    from the supplied dicts. If no ``b_factors`` are provided and the model
+    output carries pLDDT logits, the B-factor column is populated with the
+    expected per-residue pLDDT score (Algorithm 29 line 5):
+
+        r^pLDDT_i = p^pLDDT_i · v_bins,    v_bins = [1, 3, ..., 99]
+
+    so the resulting PDB can be coloured by model confidence in PyMOL or
+    ChimeraX.
+    """
     if b_factors is None and "plddt_logits" in model_output:
         plddt_logits = model_output["plddt_logits"][example_index]
         num_bins = plddt_logits.shape[-1]
+        # Bin centres for a 50-bin discretisation of [0, 100] lDDT-Cα are
+        # 1, 3, 5, ..., 99 — (k + 0.5) * 100/num_bins with k in 0..num_bins-1.
         bin_centers = (torch.arange(num_bins, dtype=plddt_logits.dtype, device=plddt_logits.device) + 0.5)
         bin_centers = bin_centers * (100.0 / num_bins)
         b_factors = torch.softmax(plddt_logits, dim=-1) @ bin_centers

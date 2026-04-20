@@ -1,3 +1,31 @@
+"""mmCIF parser → per-chain atom14 structures for ground-truth supervision.
+
+mmCIF is the modern replacement for legacy PDB files that the RCSB / PDBe
+distribute for every deposited structure. It is a flat text format built
+out of two record types:
+
+* **Scalars**: ``_category.tag value`` lines, e.g.
+  ``_refine.ls_d_res_high 2.10``.
+* **Loops**: ``loop_`` + one or more column names + a free-form value table,
+  used for tabular data like atom coordinates (``_atom_site.*``) and
+  residue sequences.
+
+The supplement's data pipeline is described in Section 1.2.1 ("Parsing"):
+*"for mmCIF this is the sequence, atom coordinates, release date, name,
+and resolution. We also resolve alternative locations for atoms/residues,
+taking the one with the largest occupancy"*. This module implements that
+step, extracting a single chain from one mmCIF file into a
+``ChainAtoms`` record carrying ``atom14_positions``, ``atom14_mask``,
+``aatype``, ``residue_index`` (contiguous 0..N-1 per supplement 1.2.9,
+*not* author numbering), and ``resolution`` (for the pLDDT / exp-resolved
+loss resolution filters in supplement 1.9.6 / 1.9.10).
+
+This is a deliberately minimal parser — it assumes single-model
+structures, does not validate against the mmCIF schema, and is not fast.
+For a pedagogical run on a handful of chains that's fine; anything larger
+should switch to BioPython or gemmi.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -52,6 +80,15 @@ def _clean_sequence(raw_sequence: str) -> str:
 
 
 def _tokenize_mmcif(text: str) -> List[str]:
+    """Tokenise raw mmCIF text into a flat list of string tokens.
+
+    Handles three conventions:
+
+    * Blank lines and ``#`` comment lines are dropped.
+    * Multi-line semicolon-delimited values (``; ...\\n...\\n;``) are read
+      back as one token.
+    * Everything else is split by ``shlex`` so quoted strings survive intact.
+    """
     tokens: List[str] = []
     lines = text.splitlines()
     line_index = 0
@@ -81,6 +118,11 @@ def _tokenize_mmcif(text: str) -> List[str]:
 
 
 def _parse_mmcif(text: str) -> Tuple[Dict[str, str], List[Tuple[List[str], List[List[str]]]]]:
+    """Split tokenised mmCIF into ``(scalars, loops)``.
+
+    ``scalars`` is a mapping from ``_category.tag`` to its value. ``loops`` is
+    a list of ``(column_names, rows)`` pairs — one entry per ``loop_`` block.
+    """
     tokens = _tokenize_mmcif(text)
     scalars: Dict[str, str] = {}
     loops: List[Tuple[List[str], List[List[str]]]] = []
@@ -161,6 +203,15 @@ def _select_atom_rows(
     rows: List[List[str]],
     chain_id: str,
 ) -> Tuple[List[List[str]], str]:
+    """Filter ``_atom_site`` rows to one chain, preferring author chain IDs.
+
+    mmCIF carries two chain-ID columns: ``auth_asym_id`` (the author-assigned
+    letter, used in PDB downloads and in the literature) and
+    ``label_asym_id`` (the internal mmCIF ID, which can differ for
+    modified chains). We match against the author IDs first since that's
+    what users normally supply (e.g. ``"A"`` in ``1abc_A``), and fall back
+    to label IDs so we can still parse chains where the two diverge.
+    """
     auth_chain_col = columns.index("_atom_site.auth_asym_id")
     label_chain_col = columns.index("_atom_site.label_asym_id")
 
@@ -176,6 +227,17 @@ def _select_atom_rows(
 
 
 def _best_atom_rows(rows: List[List[str]], columns: List[str]) -> Dict[Tuple[int, str], Tuple[np.ndarray, str]]:
+    """Collapse alternate-location (altloc) rows into one atom per (residue, atom name).
+
+    Many PDB structures record multiple positions for partially-disordered
+    side chains ("A" vs "B" altlocs). Supplement 1.2.1 specifies *"taking
+    the one with the largest occupancy"* — we implement that with the
+    priority tuple ``(preferred_altloc, occupancy)``, where
+    ``preferred_altloc`` flags altloc codes we trust most (``"."``, ``"?"``,
+    or ``"A"``), and ``occupancy`` breaks ties within the same altloc class.
+    This way a missing-altloc row dominates a secondary conformer even if
+    both have occupancy 0.5.
+    """
     label_seq_col = columns.index("_atom_site.label_seq_id")
     label_alt_col = columns.index("_atom_site.label_alt_id")
     label_comp_col = columns.index("_atom_site.label_comp_id")
@@ -237,6 +299,24 @@ def _fallback_sequence(rows: List[List[str]], columns: List[str]) -> str:
 
 @dataclass
 class ChainAtoms:
+    """One parsed chain, ready to become a labelled training example.
+
+    Fields match what the downstream data pipeline (``data.py``) expects:
+
+    * ``aatype``: ``(N_res,)`` int IDs using the alphabet from ``a3m.py``.
+    * ``residue_index``: ``(N_res,)`` contiguous 0..N-1, per supplement
+      1.2.9 — *not* the author numbering from the mmCIF. This is the ID
+      fed into ``RelPos`` / Algorithm 4.
+    * ``atom14_positions``: ``(N_res, 14, 3)`` Å coordinates in the
+      per-residue atom14 slot ordering (from ``residue_constants``).
+    * ``atom14_mask``: ``(N_res, 14)`` 1 where a coordinate was present in
+      the mmCIF, 0 otherwise — atoms missing in the ground truth are masked
+      out of the FAPE / torsion losses.
+    * ``resolution``: Å (0.0 when none was found). Consumed by the pLDDT
+      and experimentally-resolved loss resolution filters (supplement
+      1.9.6 / 1.9.10).
+    """
+
     pdb_id: str
     chain_id: str
     sequence: str
@@ -268,6 +348,16 @@ def _parse_resolution(
     scalars: Dict[str, str],
     loops: Iterable[Tuple[List[str], List[List[str]]]],
 ) -> float:
+    """Extract structure resolution (Å) from mmCIF metadata.
+
+    Different experimental methods record resolution in different tags:
+    X-ray crystallography uses ``_refine.ls_d_res_high`` /
+    ``_reflns.d_resolution_high``; cryo-EM uses
+    ``_em_3d_reconstruction.resolution``. NMR has no resolution — we fall
+    through to 0.0, which the loss resolution filters interpret as
+    "outside [0.1, 3.0]" and zero out the corresponding terms
+    (supplement 1.9.6 / 1.9.10 only train on resolutions in that range).
+    """
     for tag in (
         "_refine.ls_d_res_high",
         "_em_3d_reconstruction.resolution",
@@ -288,6 +378,17 @@ def extract_chain_atoms(
     pdb_id: str,
     chain_id: str,
 ) -> ChainAtoms:
+    """Parse ``mmcif_path`` and return the atom14 structure for ``chain_id``.
+
+    Follows supplement 1.2.1 "Parsing": resolves altlocs by occupancy, uses
+    the first model (rejecting NMR multi-model ensembles), filters to
+    ``ATOM`` records (skipping ``HETATM`` like ligands and water), and
+    derives the one-letter sequence from ``_entity_poly`` where possible,
+    falling back to residue names in ``_atom_site`` if the entity table
+    is missing. Residues with no ATOM coordinates get zeroed positions
+    and an all-zero atom14 mask — the downstream loss masks will drop
+    them automatically.
+    """
     mmcif_path = Path(mmcif_path)
     scalars, loops = _parse_mmcif(mmcif_path.read_text())
     entity_sequences = _entity_sequences(scalars, loops)

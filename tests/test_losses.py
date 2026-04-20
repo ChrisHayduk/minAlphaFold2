@@ -16,6 +16,7 @@ from losses import (
     ExperimentallyResolvedLoss,
     PLDDTLoss,
     StructuralViolationLoss,
+    TMScoreLoss,
     TorsionAngleLoss,
     select_best_atom14_ground_truth,
 )
@@ -115,6 +116,67 @@ def test_backbone_fape_matches_af2_frame_aligned_point_error():
     expected = (error * joint_mask).sum(dim=(-1, -2)) / joint_mask.sum(dim=(-1, -2)).clamp(min=1.0)
 
     assert torch.allclose(loss, expected, atol=1e-6)
+
+
+def test_tm_score_loss_uniform_logits_match_log_nbins_when_prediction_matches_truth():
+    """Supplement 1.9.7: 64-bin cross-entropy on the pairwise aligned error
+    e_ij = ||T_i^{-1} x_j − T_i^{true,-1} x_j^{true}||.
+
+    When prediction equals truth, e_ij = 0 everywhere → target bin 0; with
+    uniform logits, every distribution is uniform over the 64 bins, so the
+    per-pair CE is log(64)."""
+    loss_fn = TMScoreLoss(n_bins=64, filter_by_resolution=False)
+
+    b, n = 2, 5
+    torch.manual_seed(0)
+    R = torch.eye(3).reshape(1, 1, 3, 3).expand(b, n, -1, -1).contiguous()
+    t = torch.randn((b, n, 3), dtype=torch.float32)
+    pae_pred = torch.zeros((b, n, n, 64))  # uniform softmax
+
+    loss = loss_fn(
+        pae_pred,
+        predicted_rotations=R,
+        predicted_translations=t,
+        true_rotations=R,
+        true_translations=t,
+    )
+
+    assert loss.shape == (b,)
+    assert torch.allclose(loss, torch.full((b,), math.log(64.0)), atol=1e-5)
+
+
+def test_tm_score_loss_bucketizes_pairwise_error_into_correct_bin():
+    """Supplement 1.9.7 discretises e_ij into bins of 0.5 Å. A 5 Å shift
+    between predicted and true Cα places residue pair (0, 1) in bin 10
+    ([5.0, 5.5) Å). A one-hot logit at that bin should give near-zero CE
+    for the pair — and only for that pair."""
+    loss_fn = TMScoreLoss(n_bins=64, filter_by_resolution=False)
+
+    b, n = 1, 2
+    R = torch.eye(3).reshape(1, 1, 3, 3).expand(b, n, -1, -1).contiguous()
+    pred_t = torch.tensor([[[0.0, 0.0, 0.0], [5.0, 0.0, 0.0]]], dtype=torch.float32)
+    true_t = torch.zeros_like(pred_t)
+
+    # Make bin 10 one-hot for pair (0, 1); all other pairs use uniform logits.
+    pae_pred = torch.zeros((b, n, n, 64))
+    pae_pred[0, 0, 1, 10] = 1e9
+
+    # By symmetry of translations, pair (1, 0) has the same |t_j − t_i| = 5;
+    # give it the same spike so only the diagonal pairs incur log(n_bins).
+    pae_pred[0, 1, 0, 10] = 1e9
+
+    loss = loss_fn(
+        pae_pred,
+        predicted_rotations=R,
+        predicted_translations=pred_t,
+        true_rotations=R,
+        true_translations=true_t,
+    )
+
+    # Diagonals (0, 0) and (1, 1): e_ii = 0 → bin 0, uniform logits → CE = log(64).
+    # Off-diagonals (0, 1) and (1, 0): correct bin → CE ≈ 0.
+    expected = torch.tensor([2.0 * math.log(64.0) / 4.0])
+    assert torch.allclose(loss, expected, atol=1e-4)
 
 
 def test_select_best_atom14_ground_truth_uses_pairwise_distance_rule():
@@ -399,3 +461,4 @@ def test_alphafold_loss_matches_paper_top_level_weights():
     assert pretrain.confidence_weight == 0.01
     assert finetune.experimentally_resolved_weight == 0.01
     assert finetune.structural_violation_weight == 1.0
+    assert finetune.tm_score_weight == 0.1  # supplement 1.9.7 (paragraph after eq 38)
