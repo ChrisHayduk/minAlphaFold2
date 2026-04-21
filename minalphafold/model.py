@@ -1,4 +1,5 @@
 import torch
+import torch.utils.checkpoint as torch_checkpoint
 import math
 from typing import cast
 
@@ -308,20 +309,44 @@ class AlphaFold2(torch.nn.Module):
 
                     # Algorithm 2 lines 14-16: extra MSA stack updates z_ij
                     # (shallow Evoformer-like blocks, supplement 1.7.2).
+                    #
+                    # Supplement 1.11.8: "we store the activations that are
+                    # passed between the N_block = 48 Evoformer blocks.
+                    # During the backward pass, we recompute all activations
+                    # within the blocks." That's exactly what
+                    # torch.utils.checkpoint does. We apply it only when
+                    # gradients are required — during eval the checkpointed
+                    # path would just add overhead for no memory benefit.
                     if extra_msa_feat_current.shape[1] > 0:
                         extra_msa_repr = self.extra_msa_feat_linear(extra_msa_feat_current)
                         for extra_block in self.extra_msa_blocks:
-                            extra_msa_repr, pair_repr = extra_block(
-                                extra_msa_repr, pair_repr,
-                                extra_msa_mask=extra_msa_mask_current, pair_mask=pair_mask,
-                            )
+                            if self.training:
+                                extra_msa_repr, pair_repr = torch_checkpoint.checkpoint(
+                                    extra_block,
+                                    extra_msa_repr, pair_repr,
+                                    extra_msa_mask=extra_msa_mask_current, pair_mask=pair_mask,
+                                    use_reentrant=False,
+                                )
+                            else:
+                                extra_msa_repr, pair_repr = extra_block(
+                                    extra_msa_repr, pair_repr,
+                                    extra_msa_mask=extra_msa_mask_current, pair_mask=pair_mask,
+                                )
 
                     # Algorithm 2 line 17 (= Algorithm 6 / EvoformerStack).
                     for block in self.evoformer_blocks:
-                        msa_repr, pair_repr = block(
-                            msa_repr, pair_repr,
-                            msa_mask=evo_msa_mask, pair_mask=pair_mask,
-                        )
+                        if self.training:
+                            msa_repr, pair_repr = torch_checkpoint.checkpoint(
+                                block,
+                                msa_repr, pair_repr,
+                                msa_mask=evo_msa_mask, pair_mask=pair_mask,
+                                use_reentrant=False,
+                            )
+                        else:
+                            msa_repr, pair_repr = block(
+                                msa_repr, pair_repr,
+                                msa_mask=evo_msa_mask, pair_mask=pair_mask,
+                            )
 
                     # Algorithm 2 line 18: accumulate m_1i and z_ij only.
                     # Keep the last sample's full MSA rep (real-MSA rows only,

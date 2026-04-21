@@ -238,7 +238,8 @@ The test suite has **130 tests** across parsers (`test_a3m`, `test_mmcif`, `test
 - Ensemble averaging
 - Parameter initialization matching supplement 1.11.4 (centralised sweep in `AlphaFold2._initialize_alphafold_parameters`)
 - Single-protein overfit driver (`scripts/overfit_single_pdb.py`) reaching sub-Å Cα RMSD in ≤1000 CPU steps
-- Amber-style structure relaxation (`scripts/relax_pdb.py`, supplement 1.8.6) — OpenMM + Amber99SB with Cα restraints
+- Iterative restrained Amber relaxation (`scripts/relax_pdb.py`, supplement 1.8.6) — OpenMM + Amber99SB, all heavy atoms restrained, violation detection reuses `StructuralViolationLoss` (§1.9.11 eqs 44-47)
+- Gradient checkpointing / rematerialization on the Evoformer + Extra MSA stacks (supplement 1.11.8) — lets the paper-spec 48-block Evoformer fit in GPU memory at full-chain crop sizes
 - Modal Labs cloud-GPU runners (`scripts/modal_overfit*.py`) for full-scale training
 - 130 parser, shape, semantic, loss, and end-to-end tests
 
