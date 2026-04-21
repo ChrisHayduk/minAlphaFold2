@@ -1,0 +1,63 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "minalphafold"
+version = "0.1.0"
+description = "A minimal, pedagogical PyTorch reimplementation of AlphaFold2."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+authors = [
+    { name = "Chris Hayduk" },
+]
+keywords = [
+    "alphafold",
+    "alphafold2",
+    "protein-structure",
+    "pytorch",
+    "deep-learning",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+]
+# Only two runtime dependencies — matches the project's "pure PyTorch + stdlib"
+# philosophy. Everything else (relaxation, cloud GPUs, tests) is optional.
+dependencies = [
+    "torch>=2.3",
+    "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+# Amber-style structure relaxation (supplement 1.8.6) via OpenMM + PDBFixer.
+# Pulls in C++ extensions unrelated to the model itself — install only when
+# you actually want to clean up predicted PDB bond lengths / clashes.
+relax = [
+    "openmm>=8.0",
+    "pdbfixer>=1.9",
+]
+# Modal Labs cloud-GPU runners (scripts/modal_overfit*.py).
+modal = [
+    "modal>=0.60",
+]
+# Test runner.
+dev = [
+    "pytest>=7.0",
+]
+# One-shot install for everything optional.
+all = [
+    "minalphafold[relax,modal,dev]",
+]
+
+[tool.setuptools.packages.find]
+# The only importable package is `minalphafold/`. scripts/, tests/, configs/,
+# data/, and artifacts/ are intentionally excluded — they are standalone
+# top-level directories, not part of the installable package.
+include = ["minalphafold*"]

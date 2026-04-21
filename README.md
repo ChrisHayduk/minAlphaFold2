@@ -45,6 +45,9 @@ scripts/
     preprocess_openproteinset.py # Raw OpenProteinSet → per-chain NPZ caches
     overfit_single_pdb.py        # Self-contained single-PDB overfit driver (no MSAs/templates)
     overfit_processed_chain.py   # Full-pipeline overfit on one preprocessed chain
+    modal_overfit.py             # Modal Labs GPU wrapper for overfit_processed_chain
+    modal_overfit_single_pdb.py  # Modal Labs GPU wrapper for overfit_single_pdb
+    relax_pdb.py                 # Amber-style structure relaxation (supplement 1.8.6)
 tests/
     conftest.py                  # Adds repo root + scripts/ to sys.path for pytest
     test_shapes.py               # Shape + semantic tests for every module
@@ -112,18 +115,31 @@ Loss terms beyond the algorithm table: `losses.StructuralViolationLoss` implemen
 
 ### Requirements
 
-- Python 3.10+
-- PyTorch 2.0+
-- pytest (for tests)
-- `aws` CLI and `unzip` (for downloading OpenProteinSet)
+- Python 3.11+ (the trainer parses TOML config profiles with stdlib `tomllib`).
+- `aws` CLI and `unzip`, only if you plan to download OpenProteinSet.
 
 ### Install
 
+The project ships a `pyproject.toml` with a minimal core (`torch`, `numpy`) and three opt-in extras so you can install only what you need:
+
 ```bash
-pip install torch pytest
+git clone <this repo>
+cd min-AlphaFold
+
+pip install -e .                  # core: torch, numpy
+pip install -e '.[dev]'           # + pytest (to run the test suite)
+pip install -e '.[relax]'         # + openmm, pdbfixer (Amber relaxation)
+pip install -e '.[modal]'         # + modal (cloud-GPU runners in scripts/modal_*.py)
+pip install -e '.[all]'           # everything at once
 ```
 
-No packaging step is needed — the tests' `conftest.py` and the scripts' short `sys.path` preamble put the repo root on the import path automatically. If you want to import `minalphafold` from elsewhere, add the repo root to `PYTHONPATH`.
+Editable install (`-e`) keeps the source tree live — edits to `minalphafold/*.py` take effect without reinstalling. The test suite's `conftest.py` and the scripts' short `sys.path` preamble also put the repo root on the import path automatically, so most workflows don't strictly *need* `pip install`. The pyproject is mostly there so `pip` can resolve dependencies for you and give you clean extras groups.
+
+OpenMM is easier to install via conda if pip gives trouble (C++ extensions):
+
+```bash
+conda install -c conda-forge openmm pdbfixer
+```
 
 ### Overfit a single protein (no MSA, no templates)
 
@@ -138,6 +154,24 @@ python scripts/overfit_single_pdb.py \
 ```
 
 Artifacts (predicted PDB, ground-truth PDB, PyMOL view script, per-step loss log) land in `artifacts/overfit_single_pdb/<chain_id>/`.
+
+### Relax a predicted structure (supplement 1.8.6)
+
+Per §1.9.11 of the supplement:
+
+> *"The construction of the atom coordinates from independent backbone frames and torsion-angles produces idealized bond lengths and bond angles for most of the atom bonds, but the geometry for inter-residue bonds (peptide bonds) and the avoidance of atom clashes need to be learned."*
+
+In other words, a converged *pre-fine-tuning* prediction typically has the right fold but individually broken peptide bonds and occasional clashes — FAPE is frame-invariant, so it never directly constrains `|C_i → N_{i+1}| ≈ 1.33 Å`. Section 1.8.6 describes the paper's fix: an Amber-based energy minimisation with heavy-atom position restraints, which pulls long bonds back to ideal length and resolves clashes without changing the fold.
+
+`scripts/relax_pdb.py` is a minimal port of that procedure (Amber99SB + GBSA implicit solvent, Cα harmonically restrained at 10 kcal/mol/Å², L-BFGS minimisation to convergence):
+
+```bash
+pip install -e '.[relax]'
+python scripts/relax_pdb.py artifacts/overfit_processed_chain/6m0j_E/predicted_6m0j_E.pdb
+# writes predicted_6m0j_E_relaxed.pdb next to the input
+```
+
+The script logs the initial/final energy and the max Cα displacement so you can sanity-check that the fold didn't drift. Open the relaxed PDB alongside the ground truth in PyMOL to see the cleaned-up peptide bonds.
 
 ### Download OpenProteinSet
 
@@ -197,12 +231,13 @@ The test suite has **130 tests** across parsers (`test_a3m`, `test_mmcif`, `test
 - Ensemble averaging
 - Parameter initialization matching supplement 1.11.4 (centralised sweep in `AlphaFold2._initialize_alphafold_parameters`)
 - Single-protein overfit driver (`scripts/overfit_single_pdb.py`) reaching sub-Å Cα RMSD in ≤1000 CPU steps
+- Amber-style structure relaxation (`scripts/relax_pdb.py`, supplement 1.8.6) — OpenMM + Amber99SB with Cα restraints
+- Modal Labs cloud-GPU runners (`scripts/modal_overfit*.py`) for full-scale training
 - 130 parser, shape, semantic, loss, and end-to-end tests
 
 ### Next steps
 
 - [ ] Train on a small set of proteins and iterate on default hyperparameters
-- [ ] Inference-time Amber relaxation (supplement 1.8.6) for the predicted structures
 - [ ] Self-distillation dataset generation (supplement 1.3)
 
 ## License
