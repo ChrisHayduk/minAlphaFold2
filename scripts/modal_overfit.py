@@ -104,6 +104,8 @@ def main(
     use_clamped_fape: float | None = None,
     violations_after_step: int | None = None,
     fine_tune_lr_scale: float = 0.5,
+    violation_ramp_steps: int = 500,
+    unclamp_fape_on_finetune: bool = False,
     seed: int = 0,
 ) -> None:
     """Translate these Modal-CLI kwargs into the overfit script's argv and ship it."""
@@ -128,7 +130,10 @@ def main(
         argv += [
             "--violations-after-step", str(violations_after_step),
             "--fine-tune-lr-scale", str(fine_tune_lr_scale),
+            "--violation-ramp-steps", str(violation_ramp_steps),
         ]
+        if unclamp_fape_on_finetune:
+            argv.append("--unclamp-fape-on-finetune")
 
     print(f"[modal] remote argv:\n  {' '.join(argv)}")
     run_overfit.remote(argv)

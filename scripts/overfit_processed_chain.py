@@ -567,6 +567,23 @@ def main(argv: list[str] | None = None) -> dict:
                             "LR multiplier applied when `--violations-after-step` fires. "
                             "Default 0.5 mirrors Table 4: initial LR 1e-3 -> fine-tune LR 5e-4."
                         ))
+    parser.add_argument("--violation-ramp-steps", type=int, default=500,
+                        help=(
+                            "Linearly ramp `structural_violation_weight` from 0 -> 1.0 over "
+                            "this many steps after the handoff. Default 500 softens the "
+                            "gradient-dominance shock we observed at a clean handoff (L_viol "
+                            "was 71%% of the total loss in the first step after the flip, "
+                            "because FAPE had already converged and had no gradient to "
+                            "counter-balance). 0 = instant (paper-literal Table 4 behaviour)."
+                        ))
+    parser.add_argument("--unclamp-fape-on-finetune", action="store_true",
+                        help=(
+                            "Set `use_clamped_fape = 0.0` (fully unclamped) at the handoff. "
+                            "Supplement 1.11.5 keeps FAPE clamped-90%% across both stages, "
+                            "but for an already-converged overfit, saturated clamped FAPE "
+                            "leaves no gradient to anchor the fold while violations pull on "
+                            "it. Unclamping at handoff provides a permanent restoring force."
+                        ))
     args = parser.parse_args(argv)
 
     out_dir = args.out_dir or (ARTIFACT_ROOT / args.chain_id)
@@ -696,7 +713,8 @@ def main(argv: list[str] | None = None) -> dict:
     # Two-stage training mirroring supplement 1.11.1 / Table 4: `finetune=False`
     # during initial training (violation weight 0.0, exp-resolved weight 0.0),
     # flipped to True at `--violations-after-step` to enable the fine-tuning
-    # loss terms and halve the LR (Table 4: 1e-3 -> 5e-4).
+    # loss terms and halve the LR (Table 4: 1e-3 -> 5e-4). Violation weight is
+    # then linearly ramped 0 -> 1.0 over `--violation-ramp-steps` steps.
     loss_fn = AlphaFoldLoss(finetune=False, use_clamped_fape=args.use_clamped_fape).to(device)
     set_optimizer_learning_rate(optimizer, args.learning_rate)
     model.train()
@@ -704,6 +722,8 @@ def main(argv: list[str] | None = None) -> dict:
     history: list[dict] = []
     best = {"ca_rmsd_after_alignment": float("inf")}
     best_state: dict | None = None
+    fine_tune_start_step: int | None = None
+    target_violation_weight = loss_fn.structural_violation_weight  # 1.0 per eq 7
     start_time = time.time()
 
     for step in range(1, args.steps + 1):
@@ -713,13 +733,28 @@ def main(argv: list[str] | None = None) -> dict:
             and step > args.violations_after_step
         ):
             loss_fn.finetune = True
+            fine_tune_start_step = step
+            # Start violation weight at 0 and ramp up; see ramp block below.
+            loss_fn.structural_violation_weight = 0.0
             new_lr = args.learning_rate * args.fine_tune_lr_scale
             set_optimizer_learning_rate(optimizer, new_lr)
-            print(
+            msg = (
                 f"[overfit] step {step}: entering fine-tuning stage "
                 f"(supplement 1.11.1) — enabling structural-violation + "
                 f"experimentally-resolved losses, LR {args.learning_rate:.2e} -> {new_lr:.2e}"
+                f", ramping violation weight 0 -> {target_violation_weight:.1f} over "
+                f"{args.violation_ramp_steps} steps"
             )
+            if args.unclamp_fape_on_finetune:
+                loss_fn.use_clamped_fape = 0.0
+                msg += ", FAPE fully unclamped"
+            print(msg)
+
+        # Linearly ramp the violation weight after the handoff. Once the ramp
+        # completes we stop writing (no-op) to avoid redundant attribute sets.
+        if fine_tune_start_step is not None and loss_fn.structural_violation_weight < target_violation_weight:
+            ramp_progress = (step - fine_tune_start_step) / max(args.violation_ramp_steps, 1)
+            loss_fn.structural_violation_weight = min(target_violation_weight, ramp_progress * target_violation_weight)
 
         batch = _next_batch()
 
