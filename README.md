@@ -161,9 +161,14 @@ Per §1.9.11 of the supplement:
 
 > *"The construction of the atom coordinates from independent backbone frames and torsion-angles produces idealized bond lengths and bond angles for most of the atom bonds, but the geometry for inter-residue bonds (peptide bonds) and the avoidance of atom clashes need to be learned."*
 
-In other words, a converged *pre-fine-tuning* prediction typically has the right fold but individually broken peptide bonds and occasional clashes — FAPE is frame-invariant, so it never directly constrains `|C_i → N_{i+1}| ≈ 1.33 Å`. Section 1.8.6 describes the paper's fix: an Amber-based energy minimisation with heavy-atom position restraints, which pulls long bonds back to ideal length and resolves clashes without changing the fold.
+In other words, a converged *pre-fine-tuning* prediction typically has the right fold but individually broken peptide bonds and occasional clashes — FAPE is frame-invariant, so it never directly constrains `|C_i → N_{i+1}| ≈ 1.33 Å`. Section 1.8.6 describes the paper's fix: an **iterative restrained energy minimization** with Amber99SB and per-heavy-atom position restraints. `scripts/relax_pdb.py` is a faithful port of that procedure.
 
-`scripts/relax_pdb.py` is a minimal port of that procedure (Amber99SB + GBSA implicit solvent, Cα harmonically restrained at 10 kcal/mol/Å², L-BFGS minimisation to convergence):
+Each round, per §1.8.6:
+
+1. Minimize the AMBER99SB + GBSA (OBC) implicit-solvent system with a harmonic restraint (`k = 10 kcal/mol/Å²`) on **every heavy atom**, target positions = current positions.
+2. Detect residues still containing violations using the exact training-time criteria from supplement §1.9.11 eqs 44-47 — bond-length ± 12σ, bond-angle cos ± 12σ, clash τ = 1.5 Å. Detection reuses `minalphafold.losses.StructuralViolationLoss` so the rules are bit-identical to the training loss.
+3. **Remove restraints on all atoms within violating residues**; start the next round from the round's minimized structure.
+4. Stop when no residues violate (or no further progress — every violating residue already unrestrained).
 
 ```bash
 pip install -e '.[relax]'
@@ -171,7 +176,9 @@ python scripts/relax_pdb.py artifacts/overfit_processed_chain/6m0j_E/predicted_6
 # writes predicted_6m0j_E_relaxed.pdb next to the input
 ```
 
-The script logs the initial/final energy and the max Cα displacement so you can sanity-check that the fold didn't drift. Open the relaxed PDB alongside the ground truth in PyMOL to see the cleaned-up peptide bonds.
+Per-round output lists how many residues violate each rule (bond/angle, between-residue clash, within-residue bounds), how many were freed for the next round, and the current energy. Final output includes three drift metrics — backbone-only, restrained-heavy, and any-heavy — so you can tell whether the fold was preserved (backbone/restrained-heavy should be sub-Å on realistic predictions).
+
+Caveat, also acknowledged by the paper: this procedure is designed for mildly-violating inputs. §1.8.6 ends with *"In the CASP14 assessment we used a single iteration; targets with unresolved violations were re-run"*. A pre-fine-tuning overfit checkpoint can have 30-40% of residues violating — too many for this loop to resolve without freeing so much of the chain that neighboring bond forces drag the restrained regions with them. The paper's "re-run" escape hatch isn't available here; if you need cleaner chemistry, train with the violation loss enabled (see `--violations-after-step` on `scripts/overfit_processed_chain.py`).
 
 ### Download OpenProteinSet
 
