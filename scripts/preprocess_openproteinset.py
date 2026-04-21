@@ -97,21 +97,28 @@ def project_to_query(
     structure_sequence: str,
     atom14_positions: np.ndarray,
     atom14_mask: np.ndarray,
-    residue_index: np.ndarray | None = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Project a structure's coordinates onto the query sequence.
+
+    ``residue_index`` is generated as a sequential ``np.arange(len(query))``
+    indexed by query position. We intentionally do **not** carry over the
+    structure's own PDB residue numbering: if the structure spans only a
+    subset of the query (common for crystals with disordered termini),
+    writing the structure's residue_index into aligned positions while
+    keeping ``np.arange`` for unaligned positions produces *collisions* —
+    the same residue number gets assigned to two distinct query positions,
+    corrupting RelPos (Algorithm 4) and duplicating residue lines in PDB
+    output. Sequential indexing matches AF2's own internal convention and
+    keeps RelPos distances equal to query-position distances.
+    """
     pairs = global_alignment_pairs(query_sequence, structure_sequence)
     projected_positions = np.zeros((len(query_sequence), 14, 3), dtype=np.float32)
     projected_mask = np.zeros((len(query_sequence), 14), dtype=np.float32)
-    if residue_index is None:
-        projected_residue_index = np.arange(len(query_sequence), dtype=np.int32)
-    else:
-        projected_residue_index = np.arange(len(query_sequence), dtype=residue_index.dtype)
+    projected_residue_index = np.arange(len(query_sequence), dtype=np.int32)
 
     for query_index, structure_index in pairs:
         projected_positions[query_index] = atom14_positions[structure_index]
         projected_mask[query_index] = atom14_mask[structure_index]
-        if residue_index is not None:
-            projected_residue_index[query_index] = residue_index[structure_index]
 
     return projected_positions, projected_mask, projected_residue_index
 
@@ -394,17 +401,18 @@ def preprocess_chain(
     )
 
     structure_chain = extract_chain_atoms(mmcif_path, pdb_id.lower(), auth_chain_id)
+    # Always use query-position sequential residue_index — see docstring of
+    # ``project_to_query`` for why (collision avoidance + correct RelPos).
     if structure_chain.sequence.upper() == query_sequence.upper():
         atom14_positions = structure_chain.atom14_positions.astype(np.float32)
         atom14_mask = structure_chain.atom14_mask.astype(np.float32)
-        residue_index = structure_chain.residue_index.astype(np.int32)
+        residue_index = np.arange(len(query_sequence), dtype=np.int32)
     else:
         atom14_positions, atom14_mask, residue_index = project_to_query(
             query_sequence,
             structure_chain.sequence,
             structure_chain.atom14_positions,
             structure_chain.atom14_mask,
-            residue_index=structure_chain.residue_index,
         )
 
     features = {

@@ -197,6 +197,7 @@ def write_model_output_pdb(
     chain_id: str = "A",
     b_factors: Any | None = None,
     occupancies: Any | None = None,
+    restrict_to_supervised_residues: bool = True,
 ) -> Path:
     """Write one example from a model output dict to a PDB file.
 
@@ -209,6 +210,13 @@ def write_model_output_pdb(
 
     so the resulting PDB can be coloured by model confidence in PyMOL or
     ChimeraX.
+
+    ``restrict_to_supervised_residues`` (default True): intersect the model's
+    atom14-existence mask with ``true_atom_mask`` from the batch, so only
+    residues that had ground-truth supervision end up in the output. This
+    matches what ``ground_truth`` PDBs contain (which emit strictly from
+    ``true_atom_mask``) and removes phantom residues the model predicted at
+    positions with no FAPE signal.
     """
     if b_factors is None and "plddt_logits" in model_output:
         plddt_logits = model_output["plddt_logits"][example_index]
@@ -219,11 +227,15 @@ def write_model_output_pdb(
         bin_centers = bin_centers * (100.0 / num_bins)
         b_factors = torch.softmax(plddt_logits, dim=-1) @ bin_centers
 
+    mask = model_output["atom14_mask"][example_index]
+    if restrict_to_supervised_residues and "true_atom_mask" in batch:
+        mask = mask * batch["true_atom_mask"][example_index].to(mask.dtype)
+
     return write_atom14_pdb(
         path,
         batch["aatype"][example_index],
         model_output["atom14_coords"][example_index],
-        model_output["atom14_mask"][example_index],
+        mask,
         residue_index=batch["residue_index"][example_index],
         chain_id=chain_id,
         b_factors=b_factors,
