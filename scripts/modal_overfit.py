@@ -29,12 +29,24 @@ MSAs and mmCIFs stay local, so the image is small. Run
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import modal
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+
+# GPU selection: Modal supports a fallback list directly in the decorator
+# (https://modal.com/docs/examples/gpu_fallbacks) — it schedules on the first
+# available type. This is the canonical pattern for "prefer X but fall back
+# to Y". H200 (141 GB) is needed for full-chain paper-spec (crop ≥ 200 with
+# 48 Evoformer blocks); A100-80GB works up to crop ~160. Override to force a
+# single type with ``MODAL_GPU_TYPE=H200 modal run ...`` (useful for
+# benchmarking or cost pinning).
+_DEFAULT_GPU_FALLBACK: list[str] = ["H200", "A100-80GB"]
+_GPU_OVERRIDE = os.environ.get("MODAL_GPU_TYPE")
+_GPU_SPEC = _GPU_OVERRIDE if _GPU_OVERRIDE else _DEFAULT_GPU_FALLBACK
 
 app = modal.App("minalphafold-overfit")
 
@@ -64,9 +76,9 @@ artifacts = modal.Volume.from_name("minalphafold-artifacts", create_if_missing=T
 
 @app.function(
     image=image,
-    gpu="A100-80GB",  # 40GB OOMs on crop=256 + 48 Evoformer blocks (triangle attn stores (B,H,N,N,N) across all blocks for backward); 80GB has headroom
+    gpu=_GPU_SPEC,
     volumes={"/root/artifacts": artifacts},
-    timeout=60 * 60 * 12,  # up to 12 hours — 10k steps of alphafold2 fits comfortably
+    timeout=60 * 60 * 12,  # up to 12 hours — 10k steps fits comfortably
 )
 def run_overfit(argv: list[str]) -> None:
     """Invoke ``scripts/overfit_processed_chain.main`` with ``argv`` on a GPU.
@@ -136,4 +148,5 @@ def main(
             argv.append("--unclamp-fape-on-finetune")
 
     print(f"[modal] remote argv:\n  {' '.join(argv)}")
+    print(f"[modal] gpu spec: {_GPU_SPEC}  (set MODAL_GPU_TYPE=<name> to pin a single GPU)")
     run_overfit.remote(argv)
