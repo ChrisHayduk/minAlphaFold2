@@ -6,7 +6,8 @@ Inspired by Andrej Karpathy's [minGPT](https://github.com/karpathy/minGPT).
 
 <p align="center">
   <video src="https://github.com/user-attachments/assets/7bb75c73-1843-452e-9193-ebcb596471f1" width="720" autoplay loop muted playsinline controls></video>
-  <br>
+</p>
+<p align="center">
   <em>minAlphaFold2 prediction (cyan) overlaid with the 6M0J crystal ground truth (magenta) and DeepMind's AlphaFold2 (orange).</em>
 </p>
 
