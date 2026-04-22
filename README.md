@@ -5,7 +5,7 @@ A minimal, pedagogical PyTorch reimplementation of [AlphaFold2](https://www.natu
 Inspired by Andrej Karpathy's [minGPT](https://github.com/karpathy/minGPT).
 
 <p align="center">
-  <video src="assets/minalphafold2.mp4" width="720" autoplay loop muted playsinline controls></video>
+  <video src="https://github.com/ChrisHayduk/minAlphaFold2/raw/main/assets/minalphafold2.mp4" width="720" autoplay loop muted playsinline controls></video>
   <br>
   <em>minAlphaFold2 prediction (cyan) overlaid with the 6M0J crystal ground truth (magenta) and DeepMind's AlphaFold2 (orange).</em>
 </p>
