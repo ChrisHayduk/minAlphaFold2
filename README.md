@@ -65,12 +65,6 @@ af2_paper.pdf                    # AF2 supplement — PRIMARY REFERENCE
 
 ## Supplement Algorithm Mapping
 
-<p align="center">
-  <img src="assets/af2_img.png" alt="AlphaFold 2 architecture diagram" width="600">
-  <br>
-  <em>Diagram of AlphaFold 2 as published in DeepMind's blogpost in November 2020.</em>
-</p>
-
 | Algorithm | Description | Location |
 |-----------|-------------|----------|
 | 1 | MSA Block Deletion | `data.py: block_delete_msa` |
