@@ -1,0 +1,53 @@
+# AlphaFold2 two-stage training protocol — mirrors Supplementary Table 4
+# and §1.11.3 / §1.11.7 of the supplement.
+#
+# Stage 1 ("initial"): train from random init for ~10M samples on a 256-
+# residue crop. Violation loss is OFF — §1.9.11 is only added in stage 2
+# ("the network is trained with the structural violation loss in the fine-
+# tuning stage only"). Linear LR warm-up over the first 128k samples.
+#
+# Stage 2 ("fine-tune"): start from the initial-stage checkpoint, switch
+# to a larger 384-residue crop, half the base LR with no warm-up, enable
+# the structural violation loss to clean up peptide-bond geometry and
+# steric clashes.
+#
+# Shared optimizer settings (§1.11.3): Adam(β1=0.9, β2=0.999, ε=1e-6),
+# per-example global-norm gradient clipping at 0.1, mini-batch 128 (one
+# example per TPU core — requires gradient accumulation on single-GPU
+# hardware), one-shot ×0.95 LR decay at 6.4M samples. Evaluator-side
+# parameter EMA with decay 0.999 (§1.11.7) for checkpoint selection.
+
+protocol = "alphafold2"
+
+[optimizer]
+adam_beta1 = 0.9              # §1.11.3
+adam_beta2 = 0.999            # §1.11.3
+adam_eps = 1e-6               # §1.11.3
+grad_clip_norm = 0.1          # §1.11.3 — global norm, per-example
+ema_decay = 0.999             # §1.11.7 — evaluator-side parameter EMA
+mini_batch_size = 128         # §1.11.3 — 1 example per TPU core
+lr_decay_samples = 6_400_000  # §1.11.3 — one-shot ×0.95 fires once here
+lr_decay_factor = 0.95        # §1.11.3
+
+[initial]
+# Supplementary Table 4, "Initial training" column.
+crop_size = 256               # N_res
+msa_depth = 128               # N_seq
+extra_msa_depth = 1024        # N_extra_seq
+max_templates = 4             # N_templ
+learning_rate = 1e-3          # §1.11.3 base LR
+warmup_samples = 128_000      # §1.11.3 linear warm-up
+violation_loss_weight = 0.0   # §1.9.11 disabled in stage 1
+total_samples = 10_000_000    # Table 4 — ≈ 7 days on TPUv3
+
+[finetune]
+# Supplementary Table 4, "Fine-tuning" column. Initialises from the
+# ``[initial]`` checkpoint, not random.
+crop_size = 384
+msa_depth = 512
+extra_msa_depth = 5120
+max_templates = 4
+learning_rate = 5e-4          # §1.11.3 — half the base LR
+warmup_samples = 0            # §1.11.3 — no warm-up in fine-tuning
+violation_loss_weight = 1.0   # §1.9.11 — adds L_violation
+total_samples = 1_500_000     # Table 4 — ≈ 4 days on TPUv3

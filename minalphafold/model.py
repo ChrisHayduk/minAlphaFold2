@@ -321,11 +321,16 @@ class AlphaFold2(torch.nn.Module):
                         extra_msa_repr = self.extra_msa_feat_linear(extra_msa_feat_current)
                         for extra_block in self.extra_msa_blocks:
                             if self.training:
-                                extra_msa_repr, pair_repr = torch_checkpoint.checkpoint(
-                                    extra_block,
-                                    extra_msa_repr, pair_repr,
-                                    extra_msa_mask=extra_msa_mask_current, pair_mask=pair_mask,
-                                    use_reentrant=False,
+                                # ``checkpoint``'s type stub is ``Any | None`` so the
+                                # tuple unpack fails type-check without the cast.
+                                extra_msa_repr, pair_repr = cast(
+                                    tuple[torch.Tensor, torch.Tensor],
+                                    torch_checkpoint.checkpoint(
+                                        extra_block,
+                                        extra_msa_repr, pair_repr,
+                                        extra_msa_mask=extra_msa_mask_current, pair_mask=pair_mask,
+                                        use_reentrant=False,
+                                    ),
                                 )
                             else:
                                 extra_msa_repr, pair_repr = extra_block(
@@ -336,11 +341,14 @@ class AlphaFold2(torch.nn.Module):
                     # Algorithm 2 line 17 (= Algorithm 6 / EvoformerStack).
                     for block in self.evoformer_blocks:
                         if self.training:
-                            msa_repr, pair_repr = torch_checkpoint.checkpoint(
-                                block,
-                                msa_repr, pair_repr,
-                                msa_mask=evo_msa_mask, pair_mask=pair_mask,
-                                use_reentrant=False,
+                            msa_repr, pair_repr = cast(
+                                tuple[torch.Tensor, torch.Tensor],
+                                torch_checkpoint.checkpoint(
+                                    block,
+                                    msa_repr, pair_repr,
+                                    msa_mask=evo_msa_mask, pair_mask=pair_mask,
+                                    use_reentrant=False,
+                                ),
                             )
                         else:
                             msa_repr, pair_repr = block(

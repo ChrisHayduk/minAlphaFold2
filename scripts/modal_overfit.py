@@ -95,7 +95,10 @@ def run_overfit(argv: list[str]) -> None:
     os.chdir("/root")
     sys.path.insert(0, "/root")
     sys.path.insert(0, "/root/scripts")
-    from overfit_processed_chain import main as overfit_main
+    # The ``scripts/`` path is only on ``sys.path`` inside the container —
+    # pylance can't see it statically, so silence the missing-import warning
+    # without broadening the type-ignore scope.
+    from overfit_processed_chain import main as overfit_main  # pyright: ignore[reportMissingImports]
 
     overfit_main(argv)
     artifacts.commit()

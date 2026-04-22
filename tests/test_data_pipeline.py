@@ -381,6 +381,35 @@ def test_dataset_split_and_collate_build_expected_feature_widths(tmp_path):
     assert batch["template_mask"][1].sum().item() == 0.0
 
 
+def test_dataset_respects_chains_manifest_allowlist(tmp_path):
+    """When ``chains_manifest`` is given, only accepted chains make it in."""
+    import json
+
+    feature_dir = tmp_path / "processed_features"
+    label_dir = tmp_path / "processed_labels"
+    feature_dir.mkdir()
+    label_dir.mkdir()
+
+    write_processed_cache(feature_dir, label_dir, "1abc_A", "AGAGA", include_templates=True)
+    write_processed_cache(feature_dir, label_dir, "2xyz_A", "AGGAA", include_templates=False)
+    write_processed_cache(feature_dir, label_dir, "3noq_A", "AAAGG", include_templates=False)
+
+    manifest_path = tmp_path / "filter.json"
+    manifest_path.write_text(json.dumps({
+        "chains": [
+            {"chain_id": "1abc_A", "accepted": True},
+            {"chain_id": "2xyz_A", "accepted": False, "reject_reasons": ["resolution"]},
+            {"chain_id": "3noq_A", "accepted": True},
+        ],
+    }))
+
+    dataset = ProcessedOpenProteinSetDataset(
+        feature_dir, label_dir, split="all", chains_manifest=manifest_path,
+    )
+    # Only the two accepted chains should have survived.
+    assert sorted(dataset.chain_ids) == ["1abc_A", "3noq_A"]
+
+
 def test_template_feature_builders_return_canonical_widths():
     features, labels = make_feature_and_label_example("AGAGA", include_templates=True)
     template_aatype = torch.from_numpy(features["template_aatype"]).long()

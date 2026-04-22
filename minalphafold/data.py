@@ -138,6 +138,27 @@ def discover_chain_ids(processed_features_dir: str | Path, processed_labels_dir:
     return [chain_id for chain_id in chain_ids if (label_dir / f"{chain_id}.npz").exists()]
 
 
+def load_accepted_chains_from_manifest(manifest_path: str | Path) -> List[str]:
+    """Extract the ``accepted == True`` chain IDs from a filter manifest.
+
+    The manifest is the JSON produced by
+    ``scripts/filter_openproteinset.py`` and encodes supplement §1.2.5
+    filtering decisions. We ignore rejected entries and return a stable
+    alphabetical list — the dataset applies the seeded split on top, so
+    the ordering here doesn't affect reproducibility.
+    """
+    import json
+
+    with Path(manifest_path).open() as handle:
+        manifest = json.load(handle)
+    accepted = [
+        entry["chain_id"]
+        for entry in manifest.get("chains", [])
+        if entry.get("accepted", False)
+    ]
+    return sorted(accepted)
+
+
 def split_chain_ids(chain_ids: Sequence[str], split: str, val_fraction: float, seed: int) -> List[str]:
     if split == "all":
         return list(chain_ids)
@@ -178,10 +199,17 @@ class ProcessedOpenProteinSetDataset(Dataset):
         split: str = "train",
         val_fraction: float = 0.1,
         seed: int = 0,
+        chains_manifest: str | Path | None = None,
     ):
         self.processed_features_dir = Path(processed_features_dir)
         self.processed_labels_dir = Path(processed_labels_dir)
         chain_ids = discover_chain_ids(self.processed_features_dir, self.processed_labels_dir)
+        if chains_manifest is not None:
+            # Restrict to the accepted set from the §1.2.5 filter manifest
+            # before the train/val split runs, so the split is computed on
+            # the post-filter population rather than the raw NPZ listing.
+            allowed = set(load_accepted_chains_from_manifest(chains_manifest))
+            chain_ids = [chain_id for chain_id in chain_ids if chain_id in allowed]
         self.chain_ids = split_chain_ids(chain_ids, split=split, val_fraction=val_fraction, seed=seed)
         self.split = split
 
