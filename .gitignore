@@ -207,7 +207,6 @@ marimo/_lsp/
 __marimo__/
 TODO.md
 *.pml
-*.pdb
 *.json
 artifacts/autoresearch_overfit/results.jsonl
 artifacts/autoresearch_overfit/summary.md
@@ -226,3 +225,6 @@ CLAUDE.md
 /data/processed_features
 /data/processed_labels
 /artifacts_modal
+artifacts/overfit_processed_chain/6m0j_E/ground_truth_6m0j_E.pdb
+artifacts/overfit_processed_chain/6m0j_E/predicted_6m0j_E.pdb
+artifacts/overfit_single_pdb/1a0m_A/predicted_1a0m_A.pdb

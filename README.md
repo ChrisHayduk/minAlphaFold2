@@ -33,7 +33,7 @@ pip install -e '.[dev]'          # core: torch, numpy; + pytest
 
 # 5-minute sanity check: overfit a single PDB on CPU.
 python scripts/overfit_single_pdb.py \
-  --pdb artifacts/overfit_1a0m_A/ground_truth_1a0m_A.pdb \
+  --pdb artifacts/overfit_single_pdb/1a0m_A/ground_truth_1a0m_A.pdb \
   --steps 1000
 ```
 
