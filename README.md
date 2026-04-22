@@ -5,9 +5,9 @@ A minimal, pedagogical PyTorch reimplementation of [AlphaFold2](https://www.natu
 Inspired by Andrej Karpathy's [minGPT](https://github.com/karpathy/minGPT).
 
 <p align="center">
-  <img src="assets/af2_img.png" alt="AlphaFold 2 architecture diagram" width="600">
+  <video src="assets/minalphafold2.mp4" width="720" autoplay loop muted playsinline controls></video>
   <br>
-  <em>Diagram of AlphaFold 2 as published in DeepMind's blogpost in November 2020.</em>
+  <em>minAlphaFold2 prediction (cyan) overlaid with the 6M0J crystal ground truth (magenta) and DeepMind's AlphaFold2 (orange).</em>
 </p>
 
 ## Philosophy
@@ -63,6 +63,12 @@ af2_paper.pdf                    # AF2 supplement — PRIMARY REFERENCE
 ```
 
 ## Supplement Algorithm Mapping
+
+<p align="center">
+  <img src="assets/af2_img.png" alt="AlphaFold 2 architecture diagram" width="600">
+  <br>
+  <em>Diagram of AlphaFold 2 as published in DeepMind's blogpost in November 2020.</em>
+</p>
 
 | Algorithm | Description | Location |
 |-----------|-------------|----------|

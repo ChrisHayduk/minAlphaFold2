@@ -225,3 +225,4 @@ CLAUDE.md
 /data/openproteinset
 /data/processed_features
 /data/processed_labels
+/artifacts_modal
