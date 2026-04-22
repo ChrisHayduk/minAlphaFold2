@@ -59,9 +59,11 @@ python scripts/train_af2.py \
   --checkpoint-dir checkpoints/smoke \
   --processed-features-dir data/processed_features \
   --processed-labels-dir data/processed_labels \
-  --batch-size 1 --grad-accum-steps 4 \
+  --batch-size 1 --grad-accum-steps 1 \
   --epochs 2
 ```
+
+`--grad-accum-steps 1` runs one optimiser step per chain, so this rung works even with a single preprocessed NPZ. Only crank it up to a larger value when you have enough chains per epoch to actually fill the accumulator — at paper scale (Rung 3) the default `batch_size × grad_accum_steps` derived from the training protocol matches the paper's 128-way effective batch.
 
 ### Rung 3: full AF2 reproduction (supplement Table 4)
 
@@ -113,6 +115,14 @@ Three steps, each its own script:
 
 ```bash
 # 1. Download the minimal subset (MSAs + template HHR + mmCIF structures).
+#
+# (a) For Rung 2 — a handful of chains over plain HTTPS (no AWS CLI needed):
+echo -e "1a0m_A\n6m0j_E" > data/chains.txt
+python scripts/download_openproteinset.py \
+  --data-root data/openproteinset \
+  --chain-id-file data/chains.txt
+#
+# (b) For Rung 3 — full corpus via aws s3 sync (~hundreds of GB; requires AWS CLI).
 python scripts/download_openproteinset.py --data-root data/openproteinset
 
 # 2. Normalise to per-chain NPZs: atom14 positions + mask + resolution,
