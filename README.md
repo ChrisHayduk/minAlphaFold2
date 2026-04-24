@@ -273,7 +273,7 @@ af2_paper.pdf                    # AF2 supplement — PRIMARY REFERENCE
 pytest -q
 ```
 
-163 tests cover: parsers (`test_a3m`, `test_mmcif`, `test_pdbio`), geometry, dataset + preprocessing + filter manifest, loss heads, shape/semantic coverage of every model module, training-loop behaviour (grad accumulation, paper LR schedule, EMA, resume, stage derivation), and the OpenProteinSet download + preprocessing scripts.
+169 tests cover: parsers (`test_a3m`, `test_mmcif`, `test_pdbio`), geometry, dataset + preprocessing + filter manifest, loss heads, shape/semantic coverage of every model module, training-loop behaviour (grad accumulation, paper LR schedule, EMA, resume, stage derivation), and the OpenProteinSet download + preprocessing scripts.
 
 ## License
 

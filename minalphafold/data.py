@@ -66,6 +66,8 @@ TEMPLATE_PAIR_BINS = 39              # distogram: 38 equal-width + 1 catch-all
 TEMPLATE_PAIR_DIM = 88               # 39 distogram + 1 mask + 22+22 aatype + 3 unit-vec + 1 mask
 TEMPLATE_ANGLE_DIM = 57              # 22 aatype + 14 torsion + 14 alt-torsion + 7 torsion mask
 TARGET_FEAT_DIM = SEQ_ALPHABET_SIZE + 1  # 21 aatype + 1 between_segment_residues
+MSA_FEAT_DIM = MSA_ALPHABET_SIZE + 1 + 1 + MSA_ALPHABET_SIZE + 1  # 49, Table 1 msa_feat
+EXTRA_MSA_FEAT_DIM = MSA_ALPHABET_SIZE + 1 + 1                    # 25, Table 1 extra_msa_feat
 
 # MSA alphabet without the mask token (20 AAs + unknown + gap = 22). Used
 # for the cluster profile and masked MSA replacement distributions, which
@@ -83,6 +85,19 @@ MASKED_MSA_UNIFORM_PROB = 0.1
 # feature set to zero.)" for the template unit vector. Kept on here for
 # completeness; set to False to zero it and replicate the release models.
 USE_TEMPLATE_UNIT_VECTOR = True
+
+
+# Keys in this set are stochastic MSA features. When recycling / ensembling
+# asks for fresh MSA samples (Algorithm 2 line 4), only these fields gain the
+# extra ``(N_cycle_sample, N_ensemble_sample, batch, ...)`` leading axes.
+MSA_SAMPLE_FEATURE_KEYS = (
+    "msa_feat",
+    "msa_mask",
+    "extra_msa_feat",
+    "extra_msa_mask",
+    "masked_msa_target",
+    "masked_msa_mask",
+)
 
 
 def _example_seed(base_seed: int, example_index: int) -> int:
@@ -116,10 +131,13 @@ def _torch_rand(shape: Sequence[int], generator: torch.Generator | None, device:
 
 
 def transformed_deletions(deletions: torch.Tensor) -> torch.Tensor:
+    # Table 1 deletion transform: atan(d / 3) * 2 / pi keeps large gaps bounded.
     return torch.atan(deletions.float() / 3.0) * (2.0 / math.pi)
 
 
 def hhblits_profile(msa: torch.Tensor) -> torch.Tensor:
+    # msa: (N_seq, N_res), tokens in the HHblits alphabet before masking.
+    assert msa.ndim == 2, f"expected msa shape (N_seq, N_res), got {tuple(msa.shape)}"
     msa_one_hot = F.one_hot(
         msa.clamp(min=0, max=HHBLITS_AA_ALPHABET_SIZE - 1),
         num_classes=HHBLITS_AA_ALPHABET_SIZE,
@@ -176,6 +194,57 @@ def split_chain_ids(chain_ids: Sequence[str], split: str, val_fraction: float, s
     raise ValueError(f"Unsupported split {split!r}. Expected 'train', 'val', or 'all'.")
 
 
+def _load_processed_features(path: Path) -> Dict[str, torch.Tensor]:
+    """Load one feature NPZ in the tensor layout expected downstream.
+
+    Shapes produced by ``scripts/preprocess_openproteinset.py``:
+
+    * ``aatype`` / ``between_segment_residues`` / ``residue_index``:
+      ``(N_res,)``.
+    * ``msa`` / ``deletions``: ``(N_seq, N_res)``.
+    * ``template_*``: ``(N_templ, N_res, ...)``.
+
+    Older local caches may not have ``between_segment_residues`` or
+    ``residue_index``; the defaults here preserve the single-chain behavior
+    that the model already expects.
+    """
+    with np.load(path) as feature_data:
+        aatype = torch.from_numpy(feature_data["aatype"]).long()
+        if "between_segment_residues" in feature_data.files:
+            between_segment_residues = torch.from_numpy(feature_data["between_segment_residues"]).long()
+        else:
+            between_segment_residues = torch.zeros_like(aatype)
+        if "residue_index" in feature_data.files:
+            residue_index = torch.from_numpy(feature_data["residue_index"]).long()
+        else:
+            residue_index = torch.arange(aatype.shape[0], dtype=torch.long)
+
+        return {
+            "aatype": aatype,
+            "msa": torch.from_numpy(feature_data["msa"]).long(),
+            "deletions": torch.from_numpy(feature_data["deletions"]).long(),
+            "between_segment_residues": between_segment_residues,
+            "residue_index": residue_index,
+            "template_aatype": torch.from_numpy(feature_data["template_aatype"]).long(),
+            "template_atom14_positions": torch.from_numpy(feature_data["template_atom14_positions"]).float(),
+            "template_atom14_mask": torch.from_numpy(feature_data["template_atom14_mask"]).float(),
+        }
+
+
+def _load_processed_labels(path: Path) -> Dict[str, torch.Tensor]:
+    """Load one label NPZ: atom14 supervision plus optional resolution."""
+    with np.load(path) as label_data:
+        if "resolution" in label_data.files:
+            resolution = torch.as_tensor(label_data["resolution"]).float()
+        else:
+            resolution = torch.tensor(0.0, dtype=torch.float32)
+        return {
+            "atom14_positions": torch.from_numpy(label_data["atom14_positions"]).float(),
+            "atom14_mask": torch.from_numpy(label_data["atom14_mask"]).float(),
+            "resolution": resolution,
+        }
+
+
 class ProcessedOpenProteinSetDataset(Dataset):
     """One-chain-per-.npz dataset over a processed OpenProteinSet cache.
 
@@ -218,45 +287,10 @@ class ProcessedOpenProteinSetDataset(Dataset):
 
     def __getitem__(self, index: int) -> Dict[str, Any]:
         chain_id = self.chain_ids[index]
-
-        with np.load(self.processed_features_dir / f"{chain_id}.npz") as feature_data:
-            aatype = torch.from_numpy(feature_data["aatype"]).long()
-            msa = torch.from_numpy(feature_data["msa"]).long()
-            deletions = torch.from_numpy(feature_data["deletions"]).long()
-            if "between_segment_residues" in feature_data.files:
-                between_segment_residues = torch.from_numpy(feature_data["between_segment_residues"]).long()
-            else:
-                between_segment_residues = torch.zeros_like(aatype)
-            if "residue_index" in feature_data.files:
-                residue_index = torch.from_numpy(feature_data["residue_index"]).long()
-            else:
-                residue_index = torch.arange(aatype.shape[0], dtype=torch.long)
-            template_aatype = torch.from_numpy(feature_data["template_aatype"]).long()
-            template_atom14_positions = torch.from_numpy(feature_data["template_atom14_positions"]).float()
-            template_atom14_mask = torch.from_numpy(feature_data["template_atom14_mask"]).float()
-
-        with np.load(self.processed_labels_dir / f"{chain_id}.npz") as label_data:
-            atom14_positions = torch.from_numpy(label_data["atom14_positions"]).float()
-            atom14_mask = torch.from_numpy(label_data["atom14_mask"]).float()
-            if "resolution" in label_data.files:
-                resolution = torch.as_tensor(label_data["resolution"]).float()
-            else:
-                resolution = torch.tensor(0.0, dtype=torch.float32)
-
-        return {
-            "chain_id": chain_id,
-            "aatype": aatype,
-            "msa": msa,
-            "deletions": deletions,
-            "between_segment_residues": between_segment_residues,
-            "residue_index": residue_index,
-            "template_aatype": template_aatype,
-            "template_atom14_positions": template_atom14_positions,
-            "template_atom14_mask": template_atom14_mask,
-            "atom14_positions": atom14_positions,
-            "atom14_mask": atom14_mask,
-            "resolution": resolution,
-        }
+        example: Dict[str, Any] = {"chain_id": chain_id}
+        example.update(_load_processed_features(self.processed_features_dir / f"{chain_id}.npz"))
+        example.update(_load_processed_labels(self.processed_labels_dir / f"{chain_id}.npz"))
+        return example
 
 
 def _crop_start(
@@ -295,6 +329,9 @@ def crop_example(
     shorter than ``crop_size`` pass through unchanged.
     """
     length = int(example["aatype"].shape[0])
+    assert example["msa"].shape[1] == length, (
+        f"msa residue axis {example['msa'].shape[1]} must match aatype length {length}"
+    )
     if length <= crop_size:
         cropped = dict(example)
         cropped["crop_start"] = 0
@@ -302,21 +339,26 @@ def crop_example(
 
     start = _crop_start(length, crop_size=crop_size, training=training, torch_generator=torch_generator)
     end = start + crop_size
+    residue_slice = slice(start, end)
 
     cropped = dict(example)
     cropped["crop_start"] = start
-    cropped["aatype"] = example["aatype"][start:end]
-    cropped["msa"] = example["msa"][:, start:end]
-    cropped["deletions"] = example["deletions"][:, start:end]
+    # Residue axis only: (N_res,) -> (crop_size,)
+    cropped["aatype"] = example["aatype"][residue_slice]
+    # MSA residue axis: (N_seq, N_res) -> (N_seq, crop_size)
+    cropped["msa"] = example["msa"][:, residue_slice]
+    cropped["deletions"] = example["deletions"][:, residue_slice]
     if "between_segment_residues" in example:
-        cropped["between_segment_residues"] = example["between_segment_residues"][start:end]
+        cropped["between_segment_residues"] = example["between_segment_residues"][residue_slice]
     if "residue_index" in example:
-        cropped["residue_index"] = example["residue_index"][start:end]
-    cropped["template_aatype"] = example["template_aatype"][:, start:end]
-    cropped["template_atom14_positions"] = example["template_atom14_positions"][:, start:end]
-    cropped["template_atom14_mask"] = example["template_atom14_mask"][:, start:end]
-    cropped["atom14_positions"] = example["atom14_positions"][start:end]
-    cropped["atom14_mask"] = example["atom14_mask"][start:end]
+        cropped["residue_index"] = example["residue_index"][residue_slice]
+    # Template residue axis: (N_templ, N_res, ...) -> (N_templ, crop_size, ...)
+    cropped["template_aatype"] = example["template_aatype"][:, residue_slice]
+    cropped["template_atom14_positions"] = example["template_atom14_positions"][:, residue_slice]
+    cropped["template_atom14_mask"] = example["template_atom14_mask"][:, residue_slice]
+    # Supervision residue axis: (N_res, atom14, ...) -> (crop_size, atom14, ...)
+    cropped["atom14_positions"] = example["atom14_positions"][residue_slice]
+    cropped["atom14_mask"] = example["atom14_mask"][residue_slice]
     return cropped
 
 
@@ -344,6 +386,9 @@ def block_delete_msa(
     The query (row 0) is always kept. Inference passes through unchanged
     (``training=False``).
     """
+    assert msa.shape == deletions.shape, (
+        f"msa and deletions must share shape (N_seq, N_res), got {tuple(msa.shape)} and {tuple(deletions.shape)}"
+    )
     if not training or not enabled or msa.shape[0] <= 2:
         return msa, deletions
 
@@ -394,22 +439,25 @@ def sample_cluster_and_extra(
 
     Returns ``(cluster_msa, cluster_deletions, extra_msa, extra_deletions)``.
     """
+    assert msa.shape == deletions.shape, (
+        f"msa and deletions must share shape (N_seq, N_res), got {tuple(msa.shape)} and {tuple(deletions.shape)}"
+    )
     total_rows = msa.shape[0]
     if total_rows == 0:
         raise ValueError("MSA must contain at least the query row.")
 
-    remaining = torch.arange(1, total_rows, dtype=torch.long)
-    if training and remaining.numel() > 0:
-        remaining = remaining[_torch_randperm(remaining.numel(), torch_generator)]
+    non_query_indices = torch.arange(1, total_rows, dtype=torch.long)
+    if training and non_query_indices.numel() > 0:
+        non_query_indices = non_query_indices[_torch_randperm(non_query_indices.numel(), torch_generator)]
 
-    n_cluster_other = max(0, min(msa_depth - 1, remaining.numel()))
-    cluster_indices = torch.cat([torch.zeros(1, dtype=torch.long), remaining[:n_cluster_other]])
+    num_non_query_clusters = max(0, min(msa_depth - 1, non_query_indices.numel()))
+    cluster_indices = torch.cat([torch.zeros(1, dtype=torch.long), non_query_indices[:num_non_query_clusters]])
 
     cluster_msa = msa[cluster_indices]
     cluster_deletions = deletions[cluster_indices]
 
-    chosen = set(cluster_indices.tolist())
-    extra_candidates = [index for index in range(total_rows) if index not in chosen]
+    chosen_cluster_indices = set(cluster_indices.tolist())
+    extra_candidates = [index for index in range(total_rows) if index not in chosen_cluster_indices]
     if training:
         if python_random is None:
             random.shuffle(extra_candidates)
@@ -445,8 +493,15 @@ def cluster_statistics(
     Returns ``(cluster_profile, cluster_deletion_mean)`` with shapes
     ``(N_cluster, N_res, 23)`` and ``(N_cluster, N_res)``.
     """
+    assert cluster_msa.shape == cluster_deletions.shape, (
+        "cluster_msa and cluster_deletions must share shape (N_cluster, N_res)"
+    )
+    assert extra_msa.shape == extra_deletions.shape, (
+        "extra_msa and extra_deletions must share shape (N_extra, N_res)"
+    )
     n_cluster, n_res = cluster_msa.shape
-    del n_res  # Length is implicit in the tensors below.
+
+    # Start every cluster with its centre sequence, then scatter-add extra rows.
     cluster_profile = F.one_hot(
         cluster_msa.clamp(min=0, max=MSA_ALPHABET_SIZE - 1),
         num_classes=MSA_ALPHABET_SIZE,
@@ -455,25 +510,29 @@ def cluster_statistics(
     counts = torch.ones((n_cluster, 1), dtype=cluster_profile.dtype, device=cluster_profile.device)
 
     if extra_msa.shape[0] > 0:
-        weights = cluster_profile.new_tensor([1.0] * (HHBLITS_AA_ALPHABET_SIZE - 1) + [0.0, 0.0])
+        # Agreement ignores gap and mask tokens, matching the clustering
+        # description in supplement 1.2.7.
+        token_agreement_weights = cluster_profile.new_tensor(
+            [1.0] * (HHBLITS_AA_ALPHABET_SIZE - 1) + [0.0, 0.0]
+        )
         extra_one_hot = F.one_hot(
             extra_msa.clamp(min=0, max=MSA_ALPHABET_SIZE - 1),
             num_classes=MSA_ALPHABET_SIZE,
         ).float()
         agreement = torch.matmul(
             extra_one_hot.reshape(extra_msa.shape[0], -1),
-            (cluster_profile * weights).reshape(n_cluster, -1).transpose(0, 1),
+            (cluster_profile * token_agreement_weights).reshape(n_cluster, -1).transpose(0, 1),
         )
         assignments = agreement.argmax(dim=-1)
 
         cluster_profile.scatter_add_(
             0,
-            assignments[:, None, None].expand(-1, extra_msa.shape[1], MSA_ALPHABET_SIZE),
+            assignments[:, None, None].expand(-1, n_res, MSA_ALPHABET_SIZE),
             extra_one_hot,
         )
         cluster_deletion_mean.scatter_add_(
             0,
-            assignments[:, None].expand(-1, extra_deletions.shape[1]),
+            assignments[:, None].expand(-1, n_res),
             extra_deletions.float(),
         )
         counts.scatter_add_(
@@ -523,11 +582,18 @@ def masked_msa_inputs(
     (equation 42). Inference returns the unmodified MSA with an all-zero
     mask (no masking loss at inference).
     """
-    target = F.one_hot(cluster_msa.clamp(min=0, max=MSA_ALPHABET_SIZE - 1), num_classes=MSA_ALPHABET_SIZE).float()
+    assert cluster_msa.ndim == 2, f"expected cluster_msa shape (N_cluster, N_res), got {tuple(cluster_msa.shape)}"
+    assert hhblits_profile_values.shape == (cluster_msa.shape[1], HHBLITS_AA_ALPHABET_SIZE), (
+        "hhblits_profile_values must have shape (N_res, 22)"
+    )
+    original_msa_target = F.one_hot(
+        cluster_msa.clamp(min=0, max=MSA_ALPHABET_SIZE - 1),
+        num_classes=MSA_ALPHABET_SIZE,
+    ).float()
     if not training:
-        return cluster_msa.clone(), target, torch.zeros_like(cluster_msa, dtype=torch.float32)
+        return cluster_msa.clone(), original_msa_target, torch.zeros_like(cluster_msa, dtype=torch.float32)
 
-    mask = (_torch_rand(cluster_msa.shape, torch_generator, cluster_msa.device) < mask_probability).float()
+    bert_mask = (_torch_rand(cluster_msa.shape, torch_generator, cluster_msa.device) < mask_probability).float()
     corrupted = cluster_msa.clone()
 
     mask_token_prob = 1.0 - (
@@ -546,12 +612,12 @@ def masked_msa_inputs(
     replacement_probs = F.pad(replacement_probs, (0, 1), value=mask_token_prob)
     replacement_probs = replacement_probs / replacement_probs.sum(dim=-1, keepdim=True).clamp(min=1e-8)
 
-    if mask.any():
-        corrupted[mask.bool()] = _sample_categorical(
-            replacement_probs[mask.bool()],
+    if bert_mask.any():
+        corrupted[bert_mask.bool()] = _sample_categorical(
+            replacement_probs[bert_mask.bool()],
             torch_generator=torch_generator,
         )
-    return corrupted, target, mask
+    return corrupted, original_msa_target, bert_mask
 
 
 def build_msa_feat(
@@ -567,7 +633,13 @@ def build_msa_feat(
     ``cluster_deletion_mean`` (1) along the channel axis, giving the
     final 49-dim feature consumed by ``InputEmbedder``.
     """
-    return torch.cat(
+    assert masked_cluster_msa.shape == cluster_deletions.shape == cluster_deletion_mean.shape, (
+        "masked_cluster_msa, cluster_deletions, and cluster_deletion_mean must share shape (N_cluster, N_res)"
+    )
+    assert cluster_profile.shape == (*masked_cluster_msa.shape, MSA_ALPHABET_SIZE), (
+        "cluster_profile must have shape (N_cluster, N_res, 23)"
+    )
+    msa_feat = torch.cat(
         [
             F.one_hot(masked_cluster_msa.clamp(min=0, max=MSA_ALPHABET_SIZE - 1), num_classes=MSA_ALPHABET_SIZE).float(),
             (cluster_deletions > 0).float().unsqueeze(-1),
@@ -577,6 +649,8 @@ def build_msa_feat(
         ],
         dim=-1,
     )
+    assert msa_feat.shape[-1] == MSA_FEAT_DIM
+    return msa_feat
 
 
 def build_extra_msa_feat(extra_msa: torch.Tensor, extra_deletions: torch.Tensor) -> torch.Tensor:
@@ -588,10 +662,13 @@ def build_extra_msa_feat(extra_msa: torch.Tensor, extra_deletions: torch.Tensor)
     extra MSA feeds the shallow extra-MSA stack (supplement 1.7.2)
     without a BERT-style prediction target.
     """
+    assert extra_msa.shape == extra_deletions.shape, (
+        f"extra_msa and extra_deletions must share shape (N_extra, N_res), got {tuple(extra_msa.shape)} and {tuple(extra_deletions.shape)}"
+    )
     if extra_msa.shape[0] == 0:
-        return extra_msa.new_zeros((0, extra_msa.shape[1], 25), dtype=torch.float32)
+        return extra_msa.new_zeros((0, extra_msa.shape[1], EXTRA_MSA_FEAT_DIM), dtype=torch.float32)
 
-    return torch.cat(
+    extra_msa_feat = torch.cat(
         [
             F.one_hot(extra_msa.clamp(min=0, max=MSA_ALPHABET_SIZE - 1), num_classes=MSA_ALPHABET_SIZE).float(),
             (extra_deletions > 0).float().unsqueeze(-1),
@@ -599,6 +676,8 @@ def build_extra_msa_feat(extra_msa: torch.Tensor, extra_deletions: torch.Tensor)
         ],
         dim=-1,
     )
+    assert extra_msa_feat.shape[-1] == EXTRA_MSA_FEAT_DIM
+    return extra_msa_feat
 
 
 def build_target_feat(
@@ -699,17 +778,29 @@ def build_template_pair_feat(
 
     Empty-template case returns an all-zeros tensor with the right shape.
     """
+    assert template_aatype.ndim == 2, (
+        f"expected template_aatype shape (N_templ, N_res), got {tuple(template_aatype.shape)}"
+    )
+    assert template_atom14_positions.shape[:2] == template_aatype.shape, (
+        "template_atom14_positions must start with (N_templ, N_res)"
+    )
+    assert template_atom14_mask.shape[:2] == template_aatype.shape, (
+        "template_atom14_mask must start with (N_templ, N_res)"
+    )
     if template_aatype.shape[0] == 0:
         length = template_aatype.shape[1]
         return template_atom14_positions.new_zeros((0, length, length, TEMPLATE_PAIR_DIM))
 
+    # pseudo_beta: (N_templ, N_res, 3); pseudo_beta_mask: (N_templ, N_res)
     pseudo_beta, pseudo_beta_mask = pseudo_beta_positions(template_atom14_positions, template_atom14_mask, template_aatype)
+    # rotations / translations: backbone frames for each template residue.
     rotations, translations, frame_mask = backbone_frames(
         template_atom14_positions,
         template_atom14_mask,
         template_aatype,
     )
 
+    # Pair features live on (N_templ, N_res, N_res, channels).
     pair_mask = pseudo_beta_mask[:, :, None] * pseudo_beta_mask[:, None, :]
     distances = torch.cdist(pseudo_beta, pseudo_beta)
     distogram = _pair_distance_bins(distances) * pair_mask[..., None]
@@ -759,10 +850,14 @@ def build_template_angle_feat(
     Totals 57 — matches the DeepMind release (Table 1's printed 51 treats
     the mask as 14-dim, but the released code uses 7).
     """
+    assert template_aatype.ndim == 2, (
+        f"expected template_aatype shape (N_templ, N_res), got {tuple(template_aatype.shape)}"
+    )
     if template_aatype.shape[0] == 0:
         length = template_aatype.shape[1]
         return template_atom14_positions.new_zeros((0, length, TEMPLATE_ANGLE_DIM))
 
+    # torsion_values: (N_templ, N_res, 7, 2); torsion_mask: (N_templ, N_res, 7)
     torsion_values, torsion_mask = torsion_angles(template_atom14_positions, template_atom14_mask, template_aatype)
     torsion_alt = alternative_torsion_angles(torsion_values, template_aatype)
     one_hot = F.one_hot(template_aatype.clamp(min=0, max=21), num_classes=22).float()
@@ -892,6 +987,13 @@ def build_supervision(
 
 
 def pad_tensor(tensor: torch.Tensor, target_shape: Sequence[int], value: float = 0.0) -> torch.Tensor:
+    """Right-pad ``tensor`` with ``value`` up to ``target_shape``.
+
+    Every axis is copied from index 0, so residue/MSA/template order is
+    preserved and padding lives only at the tail of each dimension. This is
+    the convention expected by the explicit masks emitted alongside the
+    padded tensors.
+    """
     output = tensor.new_full(tuple(target_shape), value)
     slices = tuple(slice(0, size) for size in tensor.shape)
     output[slices] = tensor
@@ -911,9 +1013,20 @@ def build_msa_features(
     masked_msa_probability: float = 0.15,
     random_seed: int | None = None,
 ) -> Dict[str, Any]:
+    """Build the stochastic MSA side of Table 1 for one cropped example.
+
+    The sequence of operations mirrors supplement 1.2:
+
+    1. Compute the HHblits profile from the cropped full MSA.
+    2. Apply Algorithm 1 block deletion at training time.
+    3. Split rows into cluster centres and extra-MSA rows.
+    4. Apply BERT-style masking to cluster centres.
+    5. Build cluster statistics using the masked centres (the model sees
+       the same centres that define ``cluster_profile``).
+    """
     torch_generator = _make_torch_generator(random_seed)
     python_random = random.Random(random_seed) if random_seed is not None else None
-    msa_profile = hhblits_profile(cropped["msa"])
+    full_msa_profile = hhblits_profile(cropped["msa"])
 
     msa, deletions = block_delete_msa(
         cropped["msa"],
@@ -937,7 +1050,7 @@ def build_msa_features(
 
     masked_cluster_msa, masked_msa_target, masked_msa_mask = masked_msa_inputs(
         cluster_msa,
-        msa_profile,
+        full_msa_profile,
         training=training,
         mask_probability=masked_msa_probability,
         torch_generator=torch_generator,
@@ -956,6 +1069,95 @@ def build_msa_features(
         "masked_msa_target": masked_msa_target,
         "masked_msa_mask": masked_msa_mask.float(),
     }
+
+
+def _residue_index_for_example(example: Dict[str, Any]) -> torch.Tensor:
+    """Return explicit residue indices, or reconstruct them from the crop."""
+    residue_index = example.get("residue_index")
+    if residue_index is not None:
+        return residue_index.long()
+    return torch.arange(
+        example["crop_start"],
+        example["crop_start"] + example["aatype"].shape[0],
+        dtype=torch.long,
+    )
+
+
+def _build_template_features(example: Dict[str, Any], max_templates: int) -> Dict[str, torch.Tensor]:
+    """Build all template-derived tensors for one cropped example.
+
+    Inputs are already cropped on the residue axis. We cap only the leading
+    template axis here; batch padding happens later in ``collate_batch``.
+    """
+    # (N_templ, N_res), (N_templ, N_res, 14, 3), (N_templ, N_res, 14)
+    template_aatype = example["template_aatype"][:max_templates]
+    template_positions = example["template_atom14_positions"][:max_templates]
+    template_atom14_mask = example["template_atom14_mask"][:max_templates]
+
+    # A template exists if any residue has any resolved atom14 slot.
+    template_residue_mask = template_atom14_mask.amax(dim=-1)  # (N_templ, N_res)
+    template_mask = (template_residue_mask.sum(dim=-1) > 0).float()  # (N_templ,)
+
+    return {
+        "template_pair_feat": build_template_pair_feat(template_aatype, template_positions, template_atom14_mask),
+        "template_angle_feat": build_template_angle_feat(template_aatype, template_positions, template_atom14_mask),
+        "template_mask": template_mask,
+        "template_residue_mask": template_residue_mask,
+    }
+
+
+def _build_sampled_msa_features(
+    cropped_examples: List[Dict[str, Any]],
+    *,
+    num_recycling_samples: int,
+    num_ensemble_samples: int,
+    msa_depth: int,
+    extra_msa_depth: int,
+    training: bool,
+    block_delete_training_msa: bool,
+    block_delete_msa_fraction: float,
+    block_delete_msa_randomize_num_blocks: bool,
+    block_delete_msa_num_blocks: int,
+    masked_msa_probability: float,
+    random_seed: int | None,
+) -> list[list[list[Dict[str, Any]]]]:
+    """Pre-sample MSA features for recycling / ensembling.
+
+    Return shape is nested as
+    ``[recycle_sample][ensemble_sample][batch_example][feature_key]``.
+    The actual tensor axes are added later by padding + stacking in
+    ``collate_batch``. This keeps Algorithm 2 line 4's stochastic MSA
+    resampling isolated from the deterministic template/supervision path.
+    """
+    if num_recycling_samples <= 1 and num_ensemble_samples <= 1:
+        return []
+
+    sampled_msa_features: list[list[list[Dict[str, Any]]]] = []
+    for recycle_index in range(num_recycling_samples):
+        recycle_samples: list[list[Dict[str, Any]]] = []
+        for ensemble_index in range(num_ensemble_samples):
+            sample_index = recycle_index * num_ensemble_samples + ensemble_index
+            recycle_samples.append(
+                [
+                    build_msa_features(
+                        cropped,
+                        msa_depth=msa_depth,
+                        extra_msa_depth=extra_msa_depth,
+                        training=training,
+                        block_delete_training_msa=block_delete_training_msa,
+                        block_delete_msa_fraction=block_delete_msa_fraction,
+                        block_delete_msa_randomize_num_blocks=block_delete_msa_randomize_num_blocks,
+                        block_delete_msa_num_blocks=block_delete_msa_num_blocks,
+                        masked_msa_probability=masked_msa_probability,
+                        random_seed=None
+                        if random_seed is None
+                        else _example_seed(random_seed + 1000 * sample_index, example_index),
+                    )
+                    for example_index, cropped in enumerate(cropped_examples)
+                ]
+            )
+        sampled_msa_features.append(recycle_samples)
+    return sampled_msa_features
 
 
 def build_processed_example(
@@ -1004,19 +1206,8 @@ def build_processed_example_from_cropped(
     masked_msa_probability: float = 0.15,
     random_seed: int | None = None,
 ) -> Dict[str, Any]:
-    residue_index = example.get("residue_index")
-    if residue_index is None:
-        residue_index = torch.arange(
-            example["crop_start"],
-            example["crop_start"] + example["aatype"].shape[0],
-            dtype=torch.long,
-        )
-
-    template_aatype = example["template_aatype"][:max_templates]
-    template_positions = example["template_atom14_positions"][:max_templates]
-    template_atom14_mask = example["template_atom14_mask"][:max_templates]
-    template_residue_mask = template_atom14_mask.amax(dim=-1)
-    template_mask = (template_residue_mask.sum(dim=-1) > 0).float()
+    """Convert one cropped raw example into model inputs plus supervision."""
+    n_res = example["aatype"].shape[0]
 
     processed = {
         "chain_id": example["chain_id"],
@@ -1026,13 +1217,10 @@ def build_processed_example_from_cropped(
             example["aatype"],
             example.get("between_segment_residues"),
         ),
-        "residue_index": residue_index.long(),
-        "template_pair_feat": build_template_pair_feat(template_aatype, template_positions, template_atom14_mask),
-        "template_angle_feat": build_template_angle_feat(template_aatype, template_positions, template_atom14_mask),
-        "template_mask": template_mask,
-        "template_residue_mask": template_residue_mask,
-        "seq_mask": torch.ones(example["aatype"].shape[0], dtype=torch.float32),
+        "residue_index": _residue_index_for_example(example),
+        "seq_mask": torch.ones(n_res, dtype=torch.float32),
     }
+    processed.update(_build_template_features(example, max_templates=max_templates))
     processed.update(
         build_msa_features(
             example,
@@ -1113,32 +1301,20 @@ def collate_batch(
         for index, cropped in enumerate(cropped_examples)
     ]
 
-    sampled_msa_features: list[list[list[Dict[str, Any]]]] = []
-    if num_recycling_samples > 1 or num_ensemble_samples > 1:
-        for recycle_index in range(num_recycling_samples):
-            recycle_samples: list[list[Dict[str, Any]]] = []
-            for ensemble_index in range(num_ensemble_samples):
-                sample_index = recycle_index * num_ensemble_samples + ensemble_index
-                recycle_samples.append(
-                    [
-                        build_msa_features(
-                            cropped,
-                            msa_depth=msa_depth,
-                            extra_msa_depth=extra_msa_depth,
-                            training=training,
-                            block_delete_training_msa=block_delete_training_msa,
-                            block_delete_msa_fraction=block_delete_msa_fraction,
-                            block_delete_msa_randomize_num_blocks=block_delete_msa_randomize_num_blocks,
-                            block_delete_msa_num_blocks=block_delete_msa_num_blocks,
-                            masked_msa_probability=masked_msa_probability,
-                            random_seed=None
-                            if random_seed is None
-                            else _example_seed(random_seed + 1000 * sample_index, example_index),
-                        )
-                        for example_index, cropped in enumerate(cropped_examples)
-                    ]
-                )
-            sampled_msa_features.append(recycle_samples)
+    sampled_msa_features = _build_sampled_msa_features(
+        cropped_examples,
+        num_recycling_samples=num_recycling_samples,
+        num_ensemble_samples=num_ensemble_samples,
+        msa_depth=msa_depth,
+        extra_msa_depth=extra_msa_depth,
+        training=training,
+        block_delete_training_msa=block_delete_training_msa,
+        block_delete_msa_fraction=block_delete_msa_fraction,
+        block_delete_msa_randomize_num_blocks=block_delete_msa_randomize_num_blocks,
+        block_delete_msa_num_blocks=block_delete_msa_num_blocks,
+        masked_msa_probability=masked_msa_probability,
+        random_seed=random_seed,
+    )
 
     max_length = max(item["aatype"].shape[0] for item in processed)
     max_cluster = max(item["msa_feat"].shape[0] for item in processed)
@@ -1172,42 +1348,50 @@ def collate_batch(
             dim=0,
         )
 
-    stack("aatype", target_shape=(max_length,))
-    stack("resolution", target_shape=())
-    stack("target_feat", target_shape=(max_length, TARGET_FEAT_DIM))
-    stack("residue_index", target_shape=(max_length,))
-    stack("seq_mask", target_shape=(max_length,))
-    stack("msa_feat", target_shape=(max_cluster, max_length, 49))
-    stack("msa_mask", target_shape=(max_cluster, max_length))
-    stack("extra_msa_feat", target_shape=(max_extra, max_length, 25))
-    stack("extra_msa_mask", target_shape=(max_extra, max_length))
-    stack("template_pair_feat", target_shape=(max_templates_in_batch, max_length, max_length, TEMPLATE_PAIR_DIM))
-    stack("template_angle_feat", target_shape=(max_templates_in_batch, max_length, TEMPLATE_ANGLE_DIM))
-    stack("template_mask", target_shape=(max_templates_in_batch,))
-    stack("template_residue_mask", target_shape=(max_templates_in_batch, max_length))
-    stack("true_rotations", target_shape=(max_length, 3, 3))
-    stack("true_translations", target_shape=(max_length, 3))
-    stack("true_atom_positions", target_shape=(max_length, 14, 3))
-    stack("true_atom_mask", target_shape=(max_length, 14))
-    stack("true_atom_positions_alt", target_shape=(max_length, 14, 3))
-    stack("true_atom_mask_alt", target_shape=(max_length, 14))
-    stack("true_atom_is_ambiguous", target_shape=(max_length, 14))
-    stack("true_torsion_angles", target_shape=(max_length, 7, 2))
-    stack("true_torsion_angles_alt", target_shape=(max_length, 7, 2))
-    stack("true_torsion_mask", target_shape=(max_length, 7))
-    stack("true_rigid_group_frames_R", target_shape=(max_length, 8, 3, 3))
-    stack("true_rigid_group_frames_t", target_shape=(max_length, 8, 3))
-    stack("true_rigid_group_frames_R_alt", target_shape=(max_length, 8, 3, 3))
-    stack("true_rigid_group_frames_t_alt", target_shape=(max_length, 8, 3))
-    stack("true_rigid_group_exists", target_shape=(max_length, 8))
-    stack("atom37_exists", target_shape=(max_length, atom_type_num))
-    stack("experimentally_resolved_true", target_shape=(max_length, atom_type_num))
-    stack("res_types", target_shape=(max_length,))
-    stack("backbone_mask", target_shape=(max_length,))
-    stack("pseudo_beta_mask", target_shape=(max_length,))
-    stack("pseudo_beta_positions", target_shape=(max_length, 3))
-    stack("masked_msa_target", target_shape=(max_cluster, max_length, MSA_ALPHABET_SIZE))
-    stack("masked_msa_mask", target_shape=(max_cluster, max_length))
+    padding_shapes = {
+        # Model inputs.
+        "aatype": (max_length,),
+        "resolution": (),
+        "target_feat": (max_length, TARGET_FEAT_DIM),
+        "residue_index": (max_length,),
+        "seq_mask": (max_length,),
+        # MSA inputs and masked-MSA supervision.
+        "msa_feat": (max_cluster, max_length, MSA_FEAT_DIM),
+        "msa_mask": (max_cluster, max_length),
+        "extra_msa_feat": (max_extra, max_length, EXTRA_MSA_FEAT_DIM),
+        "extra_msa_mask": (max_extra, max_length),
+        "masked_msa_target": (max_cluster, max_length, MSA_ALPHABET_SIZE),
+        "masked_msa_mask": (max_cluster, max_length),
+        # Template inputs.
+        "template_pair_feat": (max_templates_in_batch, max_length, max_length, TEMPLATE_PAIR_DIM),
+        "template_angle_feat": (max_templates_in_batch, max_length, TEMPLATE_ANGLE_DIM),
+        "template_mask": (max_templates_in_batch,),
+        "template_residue_mask": (max_templates_in_batch, max_length),
+        # Structure and auxiliary-head supervision.
+        "true_rotations": (max_length, 3, 3),
+        "true_translations": (max_length, 3),
+        "true_atom_positions": (max_length, 14, 3),
+        "true_atom_mask": (max_length, 14),
+        "true_atom_positions_alt": (max_length, 14, 3),
+        "true_atom_mask_alt": (max_length, 14),
+        "true_atom_is_ambiguous": (max_length, 14),
+        "true_torsion_angles": (max_length, 7, 2),
+        "true_torsion_angles_alt": (max_length, 7, 2),
+        "true_torsion_mask": (max_length, 7),
+        "true_rigid_group_frames_R": (max_length, 8, 3, 3),
+        "true_rigid_group_frames_t": (max_length, 8, 3),
+        "true_rigid_group_frames_R_alt": (max_length, 8, 3, 3),
+        "true_rigid_group_frames_t_alt": (max_length, 8, 3),
+        "true_rigid_group_exists": (max_length, 8),
+        "atom37_exists": (max_length, atom_type_num),
+        "experimentally_resolved_true": (max_length, atom_type_num),
+        "res_types": (max_length,),
+        "backbone_mask": (max_length,),
+        "pseudo_beta_mask": (max_length,),
+        "pseudo_beta_positions": (max_length, 3),
+    }
+    for key, target_shape in padding_shapes.items():
+        stack(key, target_shape=target_shape)
 
     if sampled_msa_features:
         def stack_sampled(key: str, *, fill_value: float = 0.0, target_shape: Sequence[int]) -> None:
@@ -1227,11 +1411,15 @@ def collate_batch(
                 recycle_batches.append(torch.stack(ensemble_batches, dim=0))
             batch[key] = torch.stack(recycle_batches, dim=0)
 
-        stack_sampled("msa_feat", target_shape=(max_cluster, max_length, 49))
-        stack_sampled("msa_mask", target_shape=(max_cluster, max_length))
-        stack_sampled("extra_msa_feat", target_shape=(max_extra, max_length, 25))
-        stack_sampled("extra_msa_mask", target_shape=(max_extra, max_length))
-        stack_sampled("masked_msa_target", target_shape=(max_cluster, max_length, MSA_ALPHABET_SIZE))
-        stack_sampled("masked_msa_mask", target_shape=(max_cluster, max_length))
+        sampled_padding_shapes = {
+            "msa_feat": (max_cluster, max_length, MSA_FEAT_DIM),
+            "msa_mask": (max_cluster, max_length),
+            "extra_msa_feat": (max_extra, max_length, EXTRA_MSA_FEAT_DIM),
+            "extra_msa_mask": (max_extra, max_length),
+            "masked_msa_target": (max_cluster, max_length, MSA_ALPHABET_SIZE),
+            "masked_msa_mask": (max_cluster, max_length),
+        }
+        for key in MSA_SAMPLE_FEATURE_KEYS:
+            stack_sampled(key, target_shape=sampled_padding_shapes[key])
 
     return batch

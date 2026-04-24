@@ -10,8 +10,11 @@ from minalphafold.a3m import MASK_ID, MSA_ALPHABET_SIZE, sequence_to_ids
 from minalphafold.data import (
     ProcessedOpenProteinSetDataset,
     TARGET_FEAT_DIM,
+    block_delete_msa,
     build_msa_features,
     build_processed_example,
+    cluster_statistics,
+    crop_example,
     sample_cluster_and_extra,
     build_target_feat,
     build_supervision,
@@ -19,6 +22,7 @@ from minalphafold.data import (
     build_template_pair_feat,
     collate_batch,
     discover_chain_ids,
+    masked_msa_inputs,
     split_chain_ids,
 )
 from minalphafold.losses import AlphaFoldLoss, select_best_atom14_ground_truth
@@ -235,6 +239,24 @@ def write_processed_cache(
     np.savez_compressed(label_dir / f"{chain_id}.npz", **labels)
 
 
+def torch_example_from_npz_parts(
+    chain_id: str,
+    features: dict[str, np.ndarray],
+    labels: dict[str, np.ndarray],
+) -> dict[str, torch.Tensor | str]:
+    example: dict[str, torch.Tensor | str] = {"chain_id": chain_id}
+    for key, value in features.items():
+        tensor = torch.from_numpy(value)
+        example[key] = (
+            tensor.long()
+            if key.endswith("aatype") or key in {"msa", "deletions", "between_segment_residues", "residue_index"}
+            else tensor.float()
+        )
+    for key, value in labels.items():
+        example[key] = torch.as_tensor(value).float()
+    return example
+
+
 def test_preprocess_chain_projects_query_and_template_features(tmp_path):
     raw_root = tmp_path / "openproteinset"
     chain_dir = raw_root / "roda_pdb" / "1abc_A"
@@ -408,6 +430,127 @@ def test_dataset_respects_chains_manifest_allowlist(tmp_path):
     )
     # Only the two accepted chains should have survived.
     assert sorted(dataset.chain_ids) == ["1abc_A", "3noq_A"]
+
+
+def test_dataset_loads_legacy_cache_defaults(tmp_path):
+    feature_dir = tmp_path / "processed_features"
+    label_dir = tmp_path / "processed_labels"
+    feature_dir.mkdir()
+    label_dir.mkdir()
+
+    features, labels = make_feature_and_label_example("AGAGA", include_templates=False)
+    features.pop("between_segment_residues")
+    features.pop("residue_index")
+    labels.pop("resolution")
+    np.savez_compressed(feature_dir / "1abc_A.npz", **features)
+    np.savez_compressed(label_dir / "1abc_A.npz", **labels)
+
+    dataset = ProcessedOpenProteinSetDataset(feature_dir, label_dir, split="all")
+    example = dataset[0]
+
+    assert torch.equal(example["between_segment_residues"], torch.zeros(5, dtype=torch.long))
+    assert torch.equal(example["residue_index"], torch.arange(5, dtype=torch.long))
+    assert example["resolution"].shape == ()
+    assert example["resolution"].item() == 0.0
+
+
+def test_crop_example_crops_all_residue_axes_together():
+    features, labels = make_feature_and_label_example("AGAGAG", include_templates=True)
+    example = torch_example_from_npz_parts("1abc_A", features, labels)
+
+    cropped = crop_example(example, crop_size=4, training=False)
+
+    assert cropped["crop_start"] == 1
+    assert torch.equal(cropped["aatype"], example["aatype"][1:5])
+    assert torch.equal(cropped["msa"], example["msa"][:, 1:5])
+    assert torch.equal(cropped["deletions"], example["deletions"][:, 1:5])
+    assert torch.equal(cropped["between_segment_residues"], example["between_segment_residues"][1:5])
+    assert torch.equal(cropped["residue_index"], example["residue_index"][1:5])
+    assert torch.equal(cropped["template_aatype"], example["template_aatype"][:, 1:5])
+    assert torch.equal(cropped["template_atom14_positions"], example["template_atom14_positions"][:, 1:5])
+    assert torch.equal(cropped["template_atom14_mask"], example["template_atom14_mask"][:, 1:5])
+    assert torch.equal(cropped["atom14_positions"], example["atom14_positions"][1:5])
+    assert torch.equal(cropped["atom14_mask"], example["atom14_mask"][1:5])
+
+
+def test_block_delete_msa_removes_the_same_rows_from_msa_and_deletions():
+    msa = torch.arange(21, dtype=torch.long).reshape(7, 3)
+    deletions = torch.arange(100, 121, dtype=torch.long).reshape(7, 3)
+
+    expected_generator = torch.Generator().manual_seed(13)
+    block_start = int(torch.randint(1, msa.shape[0], (1,), generator=expected_generator).item())
+    block_end = min(msa.shape[0], block_start + 3)
+    keep_mask = torch.ones(msa.shape[0], dtype=torch.bool)
+    keep_mask[block_start:block_end] = False
+    keep_mask[0] = True
+
+    generator = torch.Generator().manual_seed(13)
+    kept_msa, kept_deletions = block_delete_msa(
+        msa,
+        deletions,
+        training=True,
+        msa_fraction_per_block=0.5,
+        num_blocks=1,
+        torch_generator=generator,
+    )
+
+    assert torch.equal(kept_msa, msa[keep_mask])
+    assert torch.equal(kept_deletions, deletions[keep_mask])
+    assert torch.equal(kept_msa[0], msa[0])
+
+
+def test_cluster_statistics_assigns_extras_to_nearest_cluster_centres():
+    cluster_msa = torch.tensor([[0, 0], [1, 1]], dtype=torch.long)
+    cluster_deletions = torch.tensor([[0, 3], [2, 0]], dtype=torch.long)
+    extra_msa = torch.tensor([[0, 0], [1, 1]], dtype=torch.long)
+    extra_deletions = torch.tensor([[4, 6], [8, 10]], dtype=torch.long)
+
+    cluster_profile, cluster_deletion_mean = cluster_statistics(
+        cluster_msa,
+        cluster_deletions,
+        extra_msa,
+        extra_deletions,
+    )
+
+    assert torch.equal(cluster_profile[0, :, 0], torch.ones(2))
+    assert torch.equal(cluster_profile[1, :, 1], torch.ones(2))
+    assert torch.allclose(cluster_deletion_mean[0], torch.tensor([2.0, 4.5]))
+    assert torch.allclose(cluster_deletion_mean[1], torch.tensor([5.0, 5.0]))
+
+
+def test_masked_msa_inputs_inference_keeps_tokens_and_zeroes_loss_mask():
+    cluster_msa = torch.tensor([[0, 1, 2], [3, 4, 5]], dtype=torch.long)
+    profile = torch.full((3, 22), 1.0 / 22.0, dtype=torch.float32)
+
+    corrupted_msa, target, mask = masked_msa_inputs(cluster_msa, profile, training=False)
+
+    assert torch.equal(corrupted_msa, cluster_msa)
+    assert target.shape == (2, 3, MSA_ALPHABET_SIZE)
+    assert torch.equal(target.argmax(dim=-1), cluster_msa)
+    assert torch.equal(mask, torch.zeros_like(cluster_msa, dtype=torch.float32))
+
+
+def test_collate_batch_pads_variable_length_examples_and_masks():
+    features_1, labels_1 = make_feature_and_label_example("AGAGA", include_templates=False)
+    features_2, labels_2 = make_feature_and_label_example("AGA", include_templates=False)
+    example_1 = torch_example_from_npz_parts("1abc_A", features_1, labels_1)
+    example_2 = torch_example_from_npz_parts("2xyz_A", features_2, labels_2)
+
+    batch = collate_batch(
+        [example_1, example_2],
+        crop_size=8,
+        msa_depth=3,
+        extra_msa_depth=1,
+        max_templates=0,
+        training=False,
+    )
+
+    assert batch["aatype"].shape == (2, 5)
+    assert torch.equal(batch["seq_mask"], torch.tensor([[1, 1, 1, 1, 1], [1, 1, 1, 0, 0]], dtype=torch.float32))
+    assert torch.equal(batch["msa_mask"][1, :, 3:], torch.zeros_like(batch["msa_mask"][1, :, 3:]))
+    assert torch.equal(batch["residue_index"][0], torch.arange(5, dtype=torch.long))
+    assert torch.equal(batch["residue_index"][1], torch.tensor([0, 1, 2, 0, 0], dtype=torch.long))
+    assert batch["template_pair_feat"].shape == (2, 0, 5, 5, 88)
 
 
 def test_template_feature_builders_return_canonical_widths():
