@@ -39,7 +39,6 @@ from pathlib import Path
 
 import modal
 
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 # See modal_overfit.py for the GPU-fallback rationale. The fine-tune
@@ -97,7 +96,8 @@ def run_train(argv: list[str], auto_resume_stage: str | None = None) -> None:
     sys.path.insert(0, "/root/scripts")
 
     if auto_resume_stage is not None and "--resume" not in argv:
-        candidate = Path(f"/root/checkpoints/{auto_resume_stage}_latest.pt")
+        checkpoint_dir = argv[argv.index("--checkpoint-dir") + 1]
+        candidate = Path(checkpoint_dir) / f"{auto_resume_stage}_latest.pt"
         if candidate.exists():
             print(f"[auto-resume] found {candidate}, appending --resume")
             argv = [*argv, "--resume", str(candidate)]
@@ -106,10 +106,12 @@ def run_train(argv: list[str], auto_resume_stage: str | None = None) -> None:
 
     from train_af2 import main as train_main
 
-    train_main(argv)
+    try:
+        train_main(argv)
+    finally:
+        checkpoints_volume.commit()
     # Commit the checkpoint volume so the latest state is visible to the
     # next run (auto-resume) and to ``modal volume get`` locally.
-    checkpoints_volume.commit()
 
 
 @app.local_entrypoint()
@@ -121,6 +123,9 @@ def main(
     processed_features_dir: str = "/root/data/processed_features",
     processed_labels_dir: str = "/root/data/processed_labels",
     val_fraction: float = 0.0,
+    chains_manifest: str | None = None,
+    train_chains_manifest: str | None = None,
+    val_chains_manifest: str | None = None,
     batch_size: int = 1,
     grad_accum_steps: int | None = None,
     num_workers: int = 4,
@@ -160,6 +165,12 @@ def main(
         "--n-cycles", str(n_cycles),
         "--n-ensemble", str(n_ensemble),
     ]
+    if chains_manifest is not None:
+        argv += ["--chains-manifest", chains_manifest]
+    if train_chains_manifest is not None:
+        argv += ["--train-chains-manifest", train_chains_manifest]
+    if val_chains_manifest is not None:
+        argv += ["--val-chains-manifest", val_chains_manifest]
     if grad_accum_steps is not None:
         argv += ["--grad-accum-steps", str(grad_accum_steps)]
     if epochs is not None:

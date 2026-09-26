@@ -63,7 +63,7 @@ python scripts/train_af2.py \
   --epochs 2
 ```
 
-`--grad-accum-steps 1` runs one optimiser step per chain, so this rung works even with a single preprocessed NPZ. Only crank it up to a larger value when you have enough chains per epoch to actually fill the accumulator — at paper scale (Rung 3) the default `batch_size × grad_accum_steps` derived from the training protocol matches the paper's 128-way effective batch.
+`--grad-accum-steps 1` runs one optimiser step per chain. Larger values accumulate clipped micro-batch gradients, weighted by actual sample count. A partial window at the end of an epoch is also updated; it has a smaller effective batch. At paper scale (Rung 3), the default `batch_size × grad_accum_steps` matches the protocol's 128-way effective batch.
 
 ### Rung 3: full AF2 reproduction (supplement Table 4)
 
@@ -107,6 +107,24 @@ modal run scripts/modal_train_af2.py --stage finetune \
 
 Pull the final checkpoints back with `modal volume get minalphafold-checkpoints ./checkpoints`.
 
+### Splits, sample budgets, and continuation
+
+For held-out experiments, supply the exact role manifests and set `--val-fraction 0`:
+
+```bash
+python scripts/train_af2.py --stage initial --checkpoint-dir checkpoints/run-01 \
+  --train-chains-manifest data/train.json --val-chains-manifest data/val.json \
+  --val-fraction 0
+```
+
+A role manifest can contain `{"chains": [{"chain_id": "1abc_A", "full_group_id": "group-1"}]}`. Include the authoritative group ID on every entry in both files to check group separation; `cluster_id` is also supported. IDs must be present in the cache, train/validation overlap is rejected, and supplied feature/label hashes are verified. `--chains-manifest` is an additional shared quality allowlist. Without explicit roles, `--val-fraction` performs a seeded chain split for pedagogical runs; it does not establish homology separation. Modal exposes the same three manifest options using remote paths.
+
+With no `--epochs` override, the stage stops at its exact `total_samples` target, using the actual filtered training population. `--epochs` selects an explicit epoch count instead. Samples-based schedules use consumed examples; the cosine schedule also binds its original total epoch horizon.
+
+Resume an existing run with `--resume checkpoints/run-01/initial_latest.pt`. Checkpoints contain optimizer/EMA state, epoch/step/sample counters, random states and DataLoader generator states. Continuation requires matching code, model/training settings, manifests, and selected cache bytes. It restarts at the next completed epoch boundary; interruption during an epoch repeats that epoch from the prior checkpoint. Changing the experiment requires a fresh output directory; `--init-from` is the separate fine-tuning weight-initialization path, with fresh optimizer/counters. Legacy checkpoints are not accepted as exact training continuations.
+
+Fresh training runs refuse existing checkpoint outputs. Overfit scripts likewise require an empty `--out-dir` for each attempt; both Modal overfit wrappers expose this option. This preserves earlier artifacts instead of mixing a new attempt with stale results. Native preprocessing requires `--overwrite` to explicitly regenerate existing cache names, and a mismatched feature/label generation fails during loading.
+
 ## Data pipeline
 
 Training consumes [OpenProteinSet](https://registry.opendata.aws/openfold/) — the community reproduction of AlphaFold2's unreleased training set (MSAs + templates for ~140k PDB chains, same JackHMMER / HHBlits / HHSearch pipeline as the supplement §1.2.2–1.2.3). Credit to the OpenFold team for making this corpus public; we consume it directly rather than re-running external MSA tools.
@@ -130,7 +148,12 @@ python scripts/download_openproteinset.py --data-root data/openproteinset
 python scripts/preprocess_openproteinset.py \
   --raw-root data/openproteinset \
   --processed-features-dir data/processed_features \
-  --processed-labels-dir data/processed_labels
+  --processed-labels-dir data/processed_labels \
+  --skip-templates
+
+# To enable templates, replace --skip-templates with --max-template-date YYYY-MM-DD,
+# using the prespecified cutoff for your experiment. Unknown or later original
+# release dates and every same-PDB template are excluded.
 
 # 3. Apply supplement §1.2.5 deterministic filters — resolution < 9 Å,
 #    no single amino acid > 80 % of the sequence, minimum length.

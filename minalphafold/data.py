@@ -165,19 +165,60 @@ def load_accepted_chains_from_manifest(manifest_path: str | Path) -> List[str]:
     alphabetical list — the dataset applies the seeded split on top, so
     the ordering here doesn't affect reproducibility.
     """
-    import json
+    return sorted(_manifest_records(manifest_path))
 
-    with Path(manifest_path).open() as handle:
-        manifest = json.load(handle)
-    accepted = [
-        entry["chain_id"]
-        for entry in manifest.get("chains", [])
-        if entry.get("accepted", False)
-    ]
-    return sorted(accepted)
+
+def _manifest_records(path: str | Path) -> Dict[str, Dict[str, Any]]:
+    import json
+    import re
+
+    text = Path(path).read_text()
+    if text.lstrip().startswith(("{", "[")):
+        payload = json.loads(text)
+        entries = payload.get("chains") if isinstance(payload, dict) else payload
+        if not isinstance(entries, list):
+            raise ValueError("A JSON split/filter manifest must contain a chains list.")
+    else:
+        entries = [{"chain_id": line.strip()} for line in text.splitlines() if line.strip() and not line.lstrip().startswith("#")]
+    records: Dict[str, Dict[str, Any]] = {}
+    seen = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise ValueError("Manifest chain entries must be objects.")
+        chain_id = entry.get("chain_id")
+        if not isinstance(chain_id, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", chain_id) or chain_id in seen:
+            raise ValueError(f"Invalid or duplicate manifest chain ID: {chain_id!r}")
+        seen.add(chain_id)
+        if type(entry.get("accepted", True)) is not bool:
+            raise ValueError("Manifest accepted flags must be boolean.")
+        if entry.get("accepted", True):
+            records[chain_id] = entry
+    if not records:
+        raise ValueError(f"Manifest selects no chains: {path}")
+    return records
+
+
+def validate_split_manifests(train_path: str | Path, val_path: str | Path) -> None:
+    """Reject overlapping explicit roles and shared supplied homology groups.
+
+    Plain ID lists provide exact cohort selection, not homology evidence. When
+    groups are supplied, each supplied grouping must cover both entire roles.
+    """
+    train, val = _manifest_records(train_path), _manifest_records(val_path)
+    if train.keys() & val.keys():
+        raise ValueError("Train and validation manifests contain overlapping chain IDs.")
+    for field in ("full_group_id", "cluster_id"):
+        entries = list(train.values()) + list(val.values())
+        if any(field in entry for entry in entries):
+            if any(type(entry.get(field)) not in (str, int) or str(entry[field]).strip() == "" for entry in entries):
+                raise ValueError(f"Every selected train/validation chain must have {field}.")
+            if {str(entry[field]) for entry in train.values()} & {str(entry[field]) for entry in val.values()}:
+                raise ValueError(f"Train and validation share {field} groups.")
 
 
 def split_chain_ids(chain_ids: Sequence[str], split: str, val_fraction: float, seed: int) -> List[str]:
+    if not isinstance(val_fraction, (int, float)) or isinstance(val_fraction, bool) or not 0 <= val_fraction < 1:
+        raise ValueError("val_fraction must be in [0,1).")
     if split == "all":
         return list(chain_ids)
 
@@ -194,7 +235,7 @@ def split_chain_ids(chain_ids: Sequence[str], split: str, val_fraction: float, s
     raise ValueError(f"Unsupported split {split!r}. Expected 'train', 'val', or 'all'.")
 
 
-def _load_processed_features(path: Path) -> Dict[str, torch.Tensor]:
+def _load_processed_features(path: Path) -> Dict[str, Any]:
     """Load one feature NPZ in the tensor layout expected downstream.
 
     Shapes produced by ``scripts/preprocess_openproteinset.py``:
@@ -220,6 +261,7 @@ def _load_processed_features(path: Path) -> Dict[str, torch.Tensor]:
             residue_index = torch.arange(aatype.shape[0], dtype=torch.long)
 
         return {
+            "_cache_generation": str(feature_data["cache_generation"].item()) if "cache_generation" in feature_data.files else None,
             "aatype": aatype,
             "msa": torch.from_numpy(feature_data["msa"]).long(),
             "deletions": torch.from_numpy(feature_data["deletions"]).long(),
@@ -231,7 +273,7 @@ def _load_processed_features(path: Path) -> Dict[str, torch.Tensor]:
         }
 
 
-def _load_processed_labels(path: Path) -> Dict[str, torch.Tensor]:
+def _load_processed_labels(path: Path) -> Dict[str, Any]:
     """Load one label NPZ: atom14 supervision plus optional resolution."""
     with np.load(path) as label_data:
         if "resolution" in label_data.files:
@@ -239,6 +281,7 @@ def _load_processed_labels(path: Path) -> Dict[str, torch.Tensor]:
         else:
             resolution = torch.tensor(0.0, dtype=torch.float32)
         return {
+            "_cache_generation": str(label_data["cache_generation"].item()) if "cache_generation" in label_data.files else None,
             "atom14_positions": torch.from_numpy(label_data["atom14_positions"]).float(),
             "atom14_mask": torch.from_numpy(label_data["atom14_mask"]).float(),
             "resolution": resolution,
@@ -269,16 +312,33 @@ class ProcessedOpenProteinSetDataset(Dataset):
         val_fraction: float = 0.1,
         seed: int = 0,
         chains_manifest: str | Path | None = None,
+        split_manifest: str | Path | None = None,
     ):
         self.processed_features_dir = Path(processed_features_dir)
         self.processed_labels_dir = Path(processed_labels_dir)
         chain_ids = discover_chain_ids(self.processed_features_dir, self.processed_labels_dir)
+        self._manifest_records: Dict[str, Dict[str, Any]] = {}
         if chains_manifest is not None:
             # Restrict to the accepted set from the §1.2.5 filter manifest
             # before the train/val split runs, so the split is computed on
             # the post-filter population rather than the raw NPZ listing.
-            allowed = set(load_accepted_chains_from_manifest(chains_manifest))
+            self._manifest_records = _manifest_records(chains_manifest)
+            allowed = set(self._manifest_records)
             chain_ids = [chain_id for chain_id in chain_ids if chain_id in allowed]
+        if split_manifest is not None:
+            if split != "all":
+                raise ValueError("An explicit split_manifest requires split='all'; do not split twice.")
+            selected = _manifest_records(split_manifest)
+            if set(selected) - set(chain_ids):
+                raise ValueError("An explicit split chain lacks its feature/label pair or fails the quality allowlist.")
+            for chain_id, record in selected.items():
+                merged = dict(self._manifest_records.get(chain_id, {}))
+                for key, value in record.items():
+                    if key in merged and merged[key] != value:
+                        raise ValueError(f"Conflicting manifests for {chain_id}: {key}")
+                    merged[key] = value
+                self._manifest_records[chain_id] = merged
+            chain_ids = list(selected)
         self.chain_ids = split_chain_ids(chain_ids, split=split, val_fraction=val_fraction, seed=seed)
         self.split = split
 
@@ -287,9 +347,23 @@ class ProcessedOpenProteinSetDataset(Dataset):
 
     def __getitem__(self, index: int) -> Dict[str, Any]:
         chain_id = self.chain_ids[index]
+        record = self._manifest_records.get(chain_id, {})
+        for field, directory in (("features_sha256", self.processed_features_dir), ("labels_sha256", self.processed_labels_dir)):
+            if field in record:
+                import hashlib
+                with (directory / f"{chain_id}.npz").open("rb") as handle:
+                    actual = hashlib.file_digest(handle, "sha256").hexdigest()
+                if record[field] != actual:
+                    raise ValueError(f"Stale manifest {field} for {chain_id}.")
         example: Dict[str, Any] = {"chain_id": chain_id}
-        example.update(_load_processed_features(self.processed_features_dir / f"{chain_id}.npz"))
-        example.update(_load_processed_labels(self.processed_labels_dir / f"{chain_id}.npz"))
+        features = _load_processed_features(self.processed_features_dir / f"{chain_id}.npz")
+        labels = _load_processed_labels(self.processed_labels_dir / f"{chain_id}.npz")
+        feature_generation = features.pop("_cache_generation")
+        label_generation = labels.pop("_cache_generation")
+        if feature_generation != label_generation or feature_generation == "":
+            raise ValueError(f"Mismatched cache generations for {chain_id}; regenerate both files")
+        example.update(features)
+        example.update(labels)
         return example
 
 
@@ -746,6 +820,17 @@ def build_atom37_masks(
     return atom37_exists, atom37_resolved
 
 
+def _observed_atom14_positions(positions: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """Reject invalid observed atoms and neutralize absent coordinates before geometry."""
+    if positions.shape != (*mask.shape, 3) or mask.shape[-1] != 14:
+        raise ValueError("Expected atom14 positions [...,14,3] and mask [...,14].")
+    if not torch.isfinite(mask).all() or not ((mask == 0) | (mask == 1)).all():
+        raise ValueError("Atom masks must contain only finite zero/one values.")
+    if not torch.isfinite(positions[mask.bool()]).all():
+        raise ValueError("Observed atom coordinates must be finite.")
+    return torch.where(mask[..., None].bool(), positions, torch.zeros_like(positions))
+
+
 def _pair_distance_bins(distances: torch.Tensor, num_bins: int = TEMPLATE_PAIR_BINS) -> torch.Tensor:
     bin_edges = torch.linspace(3.25, 50.75, num_bins - 1, device=distances.device, dtype=distances.dtype)
     indices = torch.bucketize(distances, bin_edges)
@@ -778,6 +863,7 @@ def build_template_pair_feat(
 
     Empty-template case returns an all-zeros tensor with the right shape.
     """
+    template_atom14_positions = _observed_atom14_positions(template_atom14_positions, template_atom14_mask)
     assert template_aatype.ndim == 2, (
         f"expected template_aatype shape (N_templ, N_res), got {tuple(template_aatype.shape)}"
     )
@@ -850,6 +936,7 @@ def build_template_angle_feat(
     Totals 57 — matches the DeepMind release (Table 1's printed 51 treats
     the mask as 14-dim, but the released code uses 7).
     """
+    template_atom14_positions = _observed_atom14_positions(template_atom14_positions, template_atom14_mask)
     assert template_aatype.ndim == 2, (
         f"expected template_aatype shape (N_templ, N_res), got {tuple(template_aatype.shape)}"
     )
@@ -873,10 +960,28 @@ def build_template_angle_feat(
     )
 
 
+def loss_residue_index(
+    residue_index: torch.Tensor,
+    between_segment_residues: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Encode peptide adjacency for losses without changing model indices."""
+    if residue_index.ndim != 1:
+        raise ValueError("residue_index must be one dimensional.")
+    connected = residue_index[1:] - residue_index[:-1] == 1
+    if between_segment_residues is not None:
+        if between_segment_residues.shape != residue_index.shape:
+            raise ValueError("between_segment_residues must match residue_index shape.")
+        connected &= between_segment_residues[1:] == 0
+    increments = torch.cat((residue_index.new_zeros(1), 2 - connected.long()))
+    return increments.cumsum(dim=0)
+
+
 def build_supervision(
     aatype: torch.Tensor,
     atom14_positions: torch.Tensor,
     atom14_mask: torch.Tensor,
+    residue_index: torch.Tensor | None = None,
+    between_segment_residues: torch.Tensor | None = None,
 ) -> Dict[str, torch.Tensor]:
     """Build every ground-truth tensor the loss consumes.
 
@@ -902,6 +1007,7 @@ def build_supervision(
     * ``res_types``, ``backbone_mask``, ``pseudo_beta_{positions,mask}``:
       miscellanea consumed by distogram, recycling, and violation losses.
     """
+    atom14_positions = _observed_atom14_positions(atom14_positions, atom14_mask)
     # Backbone (group 0) and group-existence mask come from Gram-Schmidt on real atoms
     # — the backbone adaptation inside ``atom14_to_rigid_group_frames`` puts this
     # frame in the paper's +x = Cα→C convention, matching the Structure Module's
@@ -923,6 +1029,18 @@ def build_supervision(
     true_translations = _gs_frames_t[:, 0]
     backbone_mask = true_rigid_group_exists[:, 0]
     true_torsion_angles, true_torsion_mask = torsion_angles(atom14_positions, atom14_mask, aatype)
+    # Omega and phi use the preceding residue; gaps and chain breaks must
+    # not turn nonbonded atoms into supervised peptide torsions.
+    consecutive = torch.ones_like(aatype[1:], dtype=torch.bool)
+    if residue_index is not None:
+        if residue_index.shape != aatype.shape:
+            raise ValueError("residue_index must match aatype shape.")
+        consecutive &= residue_index[1:] - residue_index[:-1] == 1
+    if between_segment_residues is not None:
+        if between_segment_residues.shape != aatype.shape:
+            raise ValueError("between_segment_residues must match aatype shape.")
+        consecutive &= between_segment_residues[1:] == 0
+    true_torsion_mask[1:, :2] *= consecutive[:, None]
     true_torsion_angles_alt = alternative_torsion_angles(true_torsion_angles, aatype)
 
     # Parametric ground-truth rigid-group frames: backbone ∘ T^lit ∘ makeRotX(torsion)
@@ -1235,7 +1353,15 @@ def build_processed_example_from_cropped(
             random_seed=random_seed,
         )
     )
-    processed.update(build_supervision(example["aatype"], example["atom14_positions"], example["atom14_mask"]))
+    residue_index = processed["residue_index"]
+    segment_starts = example.get("between_segment_residues")
+    # Violation losses need the break information without changing relative
+    # positional inputs to the model.
+    processed["loss_residue_index"] = loss_residue_index(residue_index, segment_starts)
+    processed.update(build_supervision(
+        example["aatype"], example["atom14_positions"], example["atom14_mask"],
+        residue_index=residue_index, between_segment_residues=segment_starts,
+    ))
     return processed
 
 
@@ -1354,6 +1480,7 @@ def collate_batch(
         "resolution": (),
         "target_feat": (max_length, TARGET_FEAT_DIM),
         "residue_index": (max_length,),
+        "loss_residue_index": (max_length,),
         "seq_mask": (max_length,),
         # MSA inputs and masked-MSA supervision.
         "msa_feat": (max_cluster, max_length, MSA_FEAT_DIM),

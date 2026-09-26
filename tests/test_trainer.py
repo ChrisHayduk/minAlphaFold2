@@ -902,7 +902,7 @@ def test_load_checkpoint_for_resume_restores_counters(tmp_path):
         model=model,
         optimizer=optimizer,
         best_val_loss=None,
-        history=[{"epoch": 3, "global_step": 42}],
+        history=[{"epoch": 3, "global_step": 42, "global_samples": 42 * 128}],
         data_config=DataConfig(
             processed_features_dir=feature_dir,
             processed_labels_dir=label_dir,

@@ -1,11 +1,17 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
-from pathlib import Path
+import hashlib
+import json
+import os
 import re
 import sys
-from typing import Iterable, List, Sequence, Tuple
+import tempfile
+import uuid
+from collections.abc import Iterable, Sequence
+from dataclasses import dataclass
+from datetime import date
+from pathlib import Path
 
 import numpy as np
 
@@ -18,13 +24,17 @@ from minalphafold.mmcif import extract_chain_atoms
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Preprocess OpenProteinSet chains into per-chain caches.")
+    parser = argparse.ArgumentParser(
+        description="Preprocess OpenProteinSet chains into per-chain caches."
+    )
     parser.add_argument("--raw-root", type=str, default="data/openproteinset")
-    parser.add_argument("--processed-features-dir", type=str, default="data/processed_features")
-    parser.add_argument("--processed-labels-dir", type=str, default="data/processed_labels")
+    parser.add_argument(
+        "--processed-features-dir", type=str, default="data/processed_features"
+    )
+    parser.add_argument(
+        "--processed-labels-dir", type=str, default="data/processed_labels"
+    )
     parser.add_argument("--max-msa-seqs", type=int, default=2048)
-    parser.add_argument("--msa-depth", type=int, default=192)
-    parser.add_argument("--extra-msa-depth", type=int, default=1024)
     parser.add_argument("--max-templates", type=int, default=1)
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--overwrite", action="store_true")
@@ -32,6 +42,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--msa-names", type=str, default="")
     parser.add_argument("--template-hhr-name", type=str, default="pdb70_hits.hhr")
     parser.add_argument("--skip-templates", action="store_true")
+    parser.add_argument(
+        "--max-template-date",
+        help="Required with templates: latest allowed original release date (YYYY-MM-DD).",
+    )
     return parser.parse_args()
 
 
@@ -40,11 +54,17 @@ class HHRHit:
     pdb_id: str
     chain_id: str
     aligned_pairs: tuple[tuple[int, int], ...]
+    aligned_residues: tuple[tuple[str, str], ...] = ()
 
 
-def global_alignment_pairs(query: str, target: str) -> List[Tuple[int, int]]:
+def global_alignment_pairs(
+    query: str, target: str, *, require_unique: bool = False
+) -> list[tuple[int, int]]:
     if not query or not target:
         return []
+    query, target = query.upper(), target.upper()
+    if query == target:
+        return list(enumerate(range(len(query))))
 
     match_score = 2
     mismatch_score = -1
@@ -62,7 +82,9 @@ def global_alignment_pairs(query: str, target: str) -> List[Tuple[int, int]]:
 
     for i in range(1, len(query) + 1):
         for j in range(1, len(target) + 1):
-            diag = scores[i - 1][j - 1] + (match_score if query[i - 1] == target[j - 1] else mismatch_score)
+            diag = scores[i - 1][j - 1] + (
+                match_score if query[i - 1] == target[j - 1] else mismatch_score
+            )
             up = scores[i - 1][j] + gap_score
             left = scores[i][j - 1] + gap_score
             best = max(diag, up, left)
@@ -74,7 +96,37 @@ def global_alignment_pairs(query: str, target: str) -> List[Tuple[int, int]]:
             else:
                 trace[i][j] = "L"
 
-    pairs: List[Tuple[int, int]] = []
+    if require_unique:
+        # Walk the optimal-alignment DAG, not exponentially many alignments.
+        # Repeated motifs must not assign the same query residue to an arbitrary
+        # deposited position just because traceback tie-breaking is deterministic.
+        options = [set() for _ in query]
+        pending, visited = [(len(query), len(target))], set()
+        while pending:
+            i, j = pending.pop()
+            if (i, j) in visited:
+                continue
+            visited.add((i, j))
+            if (
+                i
+                and j
+                and scores[i][j]
+                == scores[i - 1][j - 1]
+                + (match_score if query[i - 1] == target[j - 1] else mismatch_score)
+            ):
+                options[i - 1].add(j - 1 if query[i - 1] == target[j - 1] else None)
+                pending.append((i - 1, j - 1))
+            if i and scores[i][j] == scores[i - 1][j] + gap_score:
+                options[i - 1].add(None)
+                pending.append((i - 1, j))
+            if j and scores[i][j] == scores[i][j - 1] + gap_score:
+                pending.append((i, j - 1))
+        if any(len(candidates) > 1 for candidates in options):
+            raise ValueError(
+                "Ambiguous query-to-polymer alignment needs an explicit residue mapping"
+            )
+
+    pairs: list[tuple[int, int]] = []
     i = len(query)
     j = len(target)
     while i > 0 or j > 0:
@@ -97,7 +149,7 @@ def project_to_query(
     structure_sequence: str,
     atom14_positions: np.ndarray,
     atom14_mask: np.ndarray,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Project a structure's coordinates onto the query sequence.
 
     ``residue_index`` is generated as a sequential ``np.arange(len(query))``
@@ -111,12 +163,19 @@ def project_to_query(
     output. Sequential indexing matches AF2's own internal convention and
     keeps RelPos distances equal to query-position distances.
     """
-    pairs = global_alignment_pairs(query_sequence, structure_sequence)
+    pairs = global_alignment_pairs(
+        query_sequence, structure_sequence, require_unique=True
+    )
     projected_positions = np.zeros((len(query_sequence), 14, 3), dtype=np.float32)
     projected_mask = np.zeros((len(query_sequence), 14), dtype=np.float32)
     projected_residue_index = np.arange(len(query_sequence), dtype=np.int32)
 
     for query_index, structure_index in pairs:
+        if (
+            query_sequence[query_index].upper()
+            != structure_sequence[structure_index].upper()
+        ):
+            continue
         projected_positions[query_index] = atom14_positions[structure_index]
         projected_mask[query_index] = atom14_mask[structure_index]
 
@@ -140,11 +199,13 @@ def alignment_pairs_with_offsets(
     query_aligned: str,
     template_start: int,
     template_aligned: str,
-) -> List[Tuple[int, int]]:
+) -> list[tuple[int, int]]:
     if len(query_aligned) != len(template_aligned):
-        raise ValueError("Aligned query and template strings must have the same length.")
+        raise ValueError(
+            "Aligned query and template strings must have the same length."
+        )
 
-    pairs: List[Tuple[int, int]] = []
+    pairs: list[tuple[int, int]] = []
     query_index = query_start - 1
     template_index = template_start - 1
     for query_char, template_char in zip(query_aligned, template_aligned):
@@ -159,18 +220,24 @@ def alignment_pairs_with_offsets(
     return pairs
 
 
-def parse_hhr_hits(hhr_path: Path) -> List[HHRHit]:
-    hits: List[HHRHit] = []
+def parse_hhr_hits(hhr_path: Path) -> list[HHRHit]:
+    hits: list[HHRHit] = []
     current_template: tuple[str, str] | None = None
-    chunk_pairs: List[tuple[int, str, int, str]] = []
+    chunk_pairs: list[tuple[int, str, int, str]] = []
     pending_query: tuple[int, str] | None = None
 
     def flush() -> None:
         nonlocal current_template, chunk_pairs, pending_query
         if current_template is None:
             return
-        aligned_pairs: List[Tuple[int, int]] = []
+        aligned_pairs: list[tuple[int, int]] = []
+        aligned_residues = []
         for query_start, query_aligned, template_start, template_aligned in chunk_pairs:
+            aligned_residues.extend(
+                (q.upper(), t.upper())
+                for q, t in zip(query_aligned, template_aligned)
+                if q != "-" and t != "-"
+            )
             aligned_pairs.extend(
                 alignment_pairs_with_offsets(
                     query_start=query_start,
@@ -185,6 +252,7 @@ def parse_hhr_hits(hhr_path: Path) -> List[HHRHit]:
                     pdb_id=current_template[0],
                     chain_id=current_template[1],
                     aligned_pairs=tuple(aligned_pairs),
+                    aligned_residues=tuple(aligned_residues),
                 )
             )
         current_template = None
@@ -211,7 +279,12 @@ def parse_hhr_hits(hhr_path: Path) -> List[HHRHit]:
                 pending_query = (int(parts[2]), parts[3].strip())
             except ValueError:
                 pending_query = None
-        elif parts[0] == "T" and parts[1] not in {"Consensus", "ss_dssp", "ss_pred", "ss_conf"}:
+        elif parts[0] == "T" and parts[1] not in {
+            "Consensus",
+            "ss_dssp",
+            "ss_pred",
+            "ss_conf",
+        }:
             if pending_query is None:
                 continue
             try:
@@ -221,7 +294,9 @@ def parse_hhr_hits(hhr_path: Path) -> List[HHRHit]:
             query_start, query_aligned = pending_query
             template_aligned = parts[3].strip()
             if len(query_aligned) == len(template_aligned):
-                chunk_pairs.append((query_start, query_aligned, template_start, template_aligned))
+                chunk_pairs.append(
+                    (query_start, query_aligned, template_start, template_aligned)
+                )
 
     flush()
     return hits
@@ -235,6 +310,14 @@ def empty_templates(length: int) -> dict[str, np.ndarray]:
     }
 
 
+def _template_cutoff(value: str | None) -> str:
+    if value is None or not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", value):
+        raise ValueError(
+            "Templates require an explicit max_template_date in YYYY-MM-DD format"
+        )
+    return date.fromisoformat(value).isoformat()
+
+
 def template_features(
     chain_dir: Path,
     mmcif_root: Path,
@@ -244,26 +327,67 @@ def template_features(
     query_length: int,
     template_hhr_name: str,
     max_templates: int,
+    max_template_date: str | None = None,
 ) -> dict[str, np.ndarray]:
-    hhr_path = chain_dir / "hhr" / template_hhr_name
-    if not hhr_path.exists() or max_templates <= 0:
+    if max_templates <= 0:
         return empty_templates(query_length)
+    cutoff = _template_cutoff(max_template_date)
+    hhr_path = chain_dir / "hhr" / template_hhr_name
+    provenance = {
+        "policy": "original_release_on_or_before",
+        "max_template_date": cutoff,
+        "templates": [],
+    }
+    result = empty_templates(query_length)
+    if not hhr_path.exists():
+        result["template_provenance"] = np.asarray(
+            json.dumps(provenance, sort_keys=True)
+        )
+        return result
+    provenance["hhr_sha256"] = hashlib.sha256(hhr_path.read_bytes()).hexdigest()
 
-    template_aatype_list: List[np.ndarray] = []
-    template_positions_list: List[np.ndarray] = []
-    template_mask_list: List[np.ndarray] = []
+    template_aatype_list: list[np.ndarray] = []
+    template_positions_list: list[np.ndarray] = []
+    template_mask_list: list[np.ndarray] = []
 
     for hit in parse_hhr_hits(hhr_path):
-        if hit.pdb_id == target_pdb_id and hit.chain_id == target_chain_id:
+        if hit.pdb_id.lower() == target_pdb_id.lower():
             continue
 
         template_path = mmcif_root / f"{hit.pdb_id}.cif"
         if not template_path.exists():
             continue
 
+        source_sha = hashlib.sha256(template_path.read_bytes()).hexdigest()
         try:
-            template_chain = extract_chain_atoms(template_path, hit.pdb_id, hit.chain_id)
-        except Exception:
+            template_chain = extract_chain_atoms(
+                template_path, hit.pdb_id, hit.chain_id
+            )
+        except (KeyError, ValueError) as exc:
+            print(f"Skipping invalid template {hit.pdb_id}_{hit.chain_id}: {exc}")
+            continue
+
+        if not template_chain.polymer_sequence_complete:
+            continue
+        if template_chain.release_date is None or template_chain.release_date > cutoff:
+            continue
+        if hashlib.sha256(template_path.read_bytes()).hexdigest() != source_sha:
+            raise ValueError("Template source changed during extraction")
+        # HHR offsets address the full deposited polymer sequence. A stale hit
+        # must not project unrelated residues just because its indices fit.
+        if hit.aligned_residues and (
+            len(hit.aligned_residues) != len(hit.aligned_pairs)
+            or any(
+                not (0 <= q < query_length and 0 <= t < len(template_chain.sequence))
+                or query_sequence[q].upper() != qr
+                or template_chain.sequence[t].upper() != tr
+                for (q, t), (qr, tr) in zip(hit.aligned_pairs, hit.aligned_residues)
+            )
+        ):
+            continue
+        if len({q for q, _ in hit.aligned_pairs}) != len(hit.aligned_pairs) or len(
+            {t for _, t in hit.aligned_pairs}
+        ) != len(hit.aligned_pairs):
             continue
 
         template_aatype = np.full((query_length,), fill_value=20, dtype=np.int32)
@@ -271,10 +395,14 @@ def template_features(
         template_mask = np.zeros((query_length, 14), dtype=np.float32)
 
         for query_index, template_index in hit.aligned_pairs:
-            if query_index >= query_length or template_index >= len(template_chain.sequence):
+            if not 0 <= query_index < query_length or not 0 <= template_index < len(
+                template_chain.sequence
+            ):
                 continue
             template_aatype[query_index] = template_chain.aatype[template_index]
-            template_positions[query_index] = template_chain.atom14_positions[template_index]
+            template_positions[query_index] = template_chain.atom14_positions[
+                template_index
+            ]
             template_mask[query_index] = template_chain.atom14_mask[template_index]
 
         if float(template_mask[:, 1].sum()) < 1:
@@ -283,18 +411,32 @@ def template_features(
         template_aatype_list.append(template_aatype)
         template_positions_list.append(template_positions)
         template_mask_list.append(template_mask)
+        provenance["templates"].append(
+            {
+                "pdb_id": hit.pdb_id,
+                "chain_id": hit.chain_id,
+                "release_date": template_chain.release_date,
+                "sha256": source_sha,
+            }
+        )
 
         if len(template_aatype_list) >= max_templates:
             break
 
-    if not template_aatype_list:
-        return empty_templates(query_length)
-
-    return {
-        "template_aatype": np.stack(template_aatype_list).astype(np.int32),
-        "template_atom14_positions": np.stack(template_positions_list).astype(np.float32),
-        "template_atom14_mask": np.stack(template_mask_list).astype(np.float32),
-    }
+    if hashlib.sha256(hhr_path.read_bytes()).hexdigest() != provenance["hhr_sha256"]:
+        raise ValueError("Template alignment changed during extraction")
+    if template_aatype_list:
+        result.update(
+            {
+                "template_aatype": np.stack(template_aatype_list).astype(np.int32),
+                "template_atom14_positions": np.stack(template_positions_list).astype(
+                    np.float32
+                ),
+                "template_atom14_mask": np.stack(template_mask_list).astype(np.float32),
+            }
+        )
+    result["template_provenance"] = np.asarray(json.dumps(provenance, sort_keys=True))
+    return result
 
 
 def iter_chain_dirs(roda_root: Path) -> Iterable[Path]:
@@ -367,7 +509,9 @@ def read_merged_msa(
             break
 
     if not loaded_paths:
-        expected = ", ".join(str(chain_dir / "a3m" / name) for name in resolved_msa_names)
+        expected = ", ".join(
+            str(chain_dir / "a3m" / name) for name in resolved_msa_names
+        )
         raise FileNotFoundError(f"Missing MSA files: {expected}")
     if query_sequence is None or not merged_rows:
         raise ValueError(f"No usable MSA rows found for {chain_dir.name}.")
@@ -385,7 +529,10 @@ def preprocess_chain(
     msa_names: str | Sequence[str] | None = None,
     template_hhr_name: str,
     skip_templates: bool,
+    max_template_date: str | None = None,
 ) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
+    if not skip_templates and max_templates > 0:
+        _template_cutoff(max_template_date)
     chain_id = chain_dir.name
     pdb_id, auth_chain_id = chain_id.split("_", 1)
     mmcif_path = mmcif_root / f"{pdb_id.lower()}.cif"
@@ -393,6 +540,15 @@ def preprocess_chain(
     if not mmcif_path.exists():
         raise FileNotFoundError(f"Missing mmCIF file: {mmcif_path}")
 
+    source_paths = [mmcif_path] + [
+        chain_dir / "a3m" / name
+        for name in resolve_msa_names(msa_name, msa_names)
+        if (chain_dir / "a3m" / name).exists()
+    ]
+    source_hashes = {
+        str(path.resolve()): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in source_paths
+    }
     msa, deletions, query_sequence = read_merged_msa(
         chain_dir,
         msa_name=msa_name,
@@ -401,6 +557,8 @@ def preprocess_chain(
     )
 
     structure_chain = extract_chain_atoms(mmcif_path, pdb_id.lower(), auth_chain_id)
+    if not structure_chain.polymer_sequence_complete:
+        raise ValueError("Preprocessing requires a complete deposited polymer sequence")
     # Always use query-position sequential residue_index — see docstring of
     # ``project_to_query`` for why (collision avoidance + correct RelPos).
     if structure_chain.sequence.upper() == query_sequence.upper():
@@ -415,11 +573,28 @@ def preprocess_chain(
             structure_chain.atom14_mask,
         )
 
+    # Only adjacent query positions mapping to adjacent deposited positions
+    # with intact source continuity can contribute inter-residue supervision.
+    mapping = dict(
+        global_alignment_pairs(
+            query_sequence, structure_chain.sequence, require_unique=True
+        )
+    )
+    segments = np.zeros(len(query_sequence), dtype=np.int32)
+    for index in range(1, len(query_sequence)):
+        prev, current = mapping.get(index - 1), mapping.get(index)
+        segments[index] = int(
+            prev is None
+            or current is None
+            or current != prev + 1
+            or structure_chain.between_segment_residues[current] != 0
+        )
+
     features = {
         "aatype": sequence_to_ids(query_sequence).astype(np.int32),
         "msa": msa.astype(np.int32),
         "deletions": deletions.astype(np.int32),
-        "between_segment_residues": np.zeros((len(query_sequence),), dtype=np.int32),
+        "between_segment_residues": segments,
         "residue_index": residue_index.astype(np.int32),
     }
     labels = {
@@ -441,14 +616,66 @@ def preprocess_chain(
                 query_length=len(query_sequence),
                 template_hhr_name=template_hhr_name,
                 max_templates=max_templates,
+                max_template_date=max_template_date,
             )
         )
 
+    for path in source_paths:
+        if (
+            hashlib.sha256(path.read_bytes()).hexdigest()
+            != source_hashes[str(path.resolve())]
+        ):
+            raise ValueError("Target structure or MSA changed during preprocessing")
+    features["preprocessing_provenance"] = np.asarray(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "sources": source_hashes,
+                "parser_policy": "first_model_full_polymer_residue_conformer_v2",
+                "model_id": structure_chain.model_id,
+                "label_chain_id": structure_chain.label_chain_id,
+                "release_date": structure_chain.release_date,
+                "polymer_sequence_complete": structure_chain.polymer_sequence_complete,
+                "max_msa_seqs": max_msa_seqs,
+                "max_templates": max_templates,
+                "skip_templates": skip_templates,
+                "max_template_date": max_template_date,
+            },
+            sort_keys=True,
+        )
+    )
     return features, labels
+
+
+def write_cache_pair(
+    feature_path: Path, label_path: Path, features: dict, labels: dict
+) -> None:
+    """Atomic per-file writes; shared generation detects a crash between replaces."""
+    generation = np.asarray(uuid.uuid4().hex)
+    temporary_paths = []
+    try:
+        for destination, arrays in ((feature_path, features), (label_path, labels)):
+            fd, temporary = tempfile.mkstemp(
+                prefix=f".{destination.name}.", dir=destination.parent
+            )
+            temporary_paths.append((Path(temporary), destination))
+            with os.fdopen(fd, "wb") as handle:
+                np.savez_compressed(handle, **arrays, cache_generation=generation)
+                handle.flush()
+                os.fsync(handle.fileno())
+        for temporary, destination in temporary_paths:
+            os.replace(temporary, destination)
+    finally:
+        for temporary, _ in temporary_paths:
+            temporary.unlink(missing_ok=True)
 
 
 def main() -> None:
     args = parse_args()
+    if args.max_msa_seqs < 1 or args.max_templates < 0 or args.limit < 0:
+        raise ValueError("Invalid MSA/template count or limit")
+    if not args.skip_templates and args.max_templates > 0:
+        _template_cutoff(args.max_template_date)
     raw_root = Path(args.raw_root)
     roda_root = raw_root / "roda_pdb"
     mmcif_root = raw_root / "pdb_data" / "mmcif_files"
@@ -468,9 +695,10 @@ def main() -> None:
         chain_id = chain_dir.name
         feature_path = processed_features_dir / f"{chain_id}.npz"
         label_path = processed_labels_dir / f"{chain_id}.npz"
-        if not args.overwrite and feature_path.exists() and label_path.exists():
-            ok += 1
-            continue
+        if not args.overwrite and (feature_path.exists() or label_path.exists()):
+            raise FileExistsError(
+                f"Existing cache for {chain_id}; use --overwrite to explicitly regenerate"
+            )
 
         try:
             features, labels = preprocess_chain(
@@ -482,15 +710,19 @@ def main() -> None:
                 msa_names=args.msa_names,
                 template_hhr_name=args.template_hhr_name,
                 skip_templates=args.skip_templates,
+                max_template_date=args.max_template_date,
             )
-            np.savez_compressed(feature_path, **features)
-            np.savez_compressed(label_path, **labels)
+            write_cache_pair(feature_path, label_path, features, labels)
             ok += 1
-        except Exception as exc:
+        except (KeyError, ValueError, OSError) as exc:
             failed += 1
             print(f"Failed to preprocess {chain_id}: {exc}")
 
     print(f"Preprocess complete: ok={ok}, failed={failed}")
+    if failed:
+        raise RuntimeError(
+            f"Preprocessing failed for {failed} chains; outputs are incomplete"
+        )
 
 
 if __name__ == "__main__":

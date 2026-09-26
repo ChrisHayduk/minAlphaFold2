@@ -287,6 +287,9 @@ class StructureModule(torch.nn.Module):
 
         # Convert internal structure-module units back to angstroms.
         # Rotations are unitless — no conversion needed
+        if seq_mask is not None:
+            mask = mask * seq_mask[..., None].to(mask)
+        atom_coords = torch.where(mask[..., None].bool(), atom_coords, torch.zeros_like(atom_coords))
         predictions = {
             # Per-layer backbone frames for auxiliary FAPE loss
             "traj_rotations": all_rotations,               # (num_layers, batch, N_res, 3, 3)

@@ -30,7 +30,6 @@ from pathlib import Path
 
 import modal
 
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 app = modal.App("minalphafold-overfit-single-pdb")
@@ -88,6 +87,7 @@ def main(
     use_clamped_fape: float | None = None,
     violations_after_step: int | None = None,
     seed: int = 0,
+    out_dir: str | None = None,
 ) -> None:
     """Stream a local PDB to Modal and run the single-PDB overfit on GPU."""
     pdb_path = Path(pdb).expanduser().resolve()
@@ -109,7 +109,7 @@ def main(
         "--resolution", str(resolution),
         "--seed", str(seed),
         "--device", "cuda",
-        "--out-dir", f"/root/artifacts/overfit_single_pdb/{stem}",
+        "--out-dir", out_dir or f"/root/artifacts/overfit_single_pdb/{stem}",
     ]
     if chain_id is not None:
         argv += ["--chain-id", chain_id]

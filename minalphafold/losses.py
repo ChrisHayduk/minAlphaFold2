@@ -675,6 +675,7 @@ class TorsionAngleLoss(torch.nn.Module):
         alt_dist_sq = torch.sum((true_alt - torsion_angles) ** 2, dim=-1)
         torsion_dist_sq = torch.minimum(true_dist_sq, alt_dist_sq)
 
+        mask = mask.expand_as(torsion_dist_sq)
         torsion_normalizer = mask.sum(dim=(0, 2, 3)).clamp(min=1.0)
         torsion_loss = torch.sum(torsion_dist_sq * mask, dim=(0, 2, 3)) / torsion_normalizer
 

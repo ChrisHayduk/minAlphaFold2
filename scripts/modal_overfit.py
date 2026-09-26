@@ -34,7 +34,6 @@ from pathlib import Path
 
 import modal
 
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 # GPU selection: Modal supports a fallback list directly in the decorator
@@ -98,7 +97,9 @@ def run_overfit(argv: list[str]) -> None:
     # The ``scripts/`` path is only on ``sys.path`` inside the container —
     # pylance can't see it statically, so silence the missing-import warning
     # without broadening the type-ignore scope.
-    from overfit_processed_chain import main as overfit_main  # pyright: ignore[reportMissingImports]
+    from overfit_processed_chain import (
+        main as overfit_main,  # pyright: ignore[reportMissingImports]
+    )
 
     overfit_main(argv)
     artifacts.commit()
@@ -122,6 +123,7 @@ def main(
     violation_ramp_steps: int = 500,
     unclamp_fape_on_finetune: bool = False,
     seed: int = 0,
+    out_dir: str | None = None,
 ) -> None:
     """Translate these Modal-CLI kwargs into the overfit script's argv and ship it."""
     argv = [
@@ -135,7 +137,7 @@ def main(
         "--extra-msa-depth", str(extra_msa_depth),
         "--max-templates", str(max_templates),
         "--seed", str(seed),
-        "--out-dir", f"/root/artifacts/overfit_processed_chain/{chain_id}",
+        "--out-dir", out_dir or f"/root/artifacts/overfit_processed_chain/{chain_id}",
     ]
     if freeze_crop_and_cluster:
         argv.append("--freeze-crop-and-cluster")

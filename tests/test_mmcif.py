@@ -4,7 +4,7 @@ from minalphafold.a3m import sequence_to_ids
 from minalphafold.mmcif import extract_chain_atoms
 
 
-def test_extract_chain_atoms_uses_label_chain_fallback_and_altloc_priority(tmp_path):
+def test_extract_chain_atoms_uses_label_chain_fallback_and_largest_occupancy(tmp_path):
     mmcif_path = tmp_path / "toy.cif"
     mmcif_path.write_text(
         "data_toy\n"
@@ -49,7 +49,7 @@ def test_extract_chain_atoms_uses_label_chain_fallback_and_altloc_priority(tmp_p
     assert chain.resolution == 1.25
     assert chain.atom14_positions.shape == (2, 14, 3)
     assert chain.atom14_mask.shape == (2, 14)
-    assert np.allclose(chain.atom14_positions[0, 4], np.asarray([1.0, 2.0, 3.0], dtype=np.float32))
+    assert np.allclose(chain.atom14_positions[0, 4], np.asarray([9.0, 9.0, 9.0], dtype=np.float32))
     assert chain.atom14_mask[1, 4] == 0.0
 
 

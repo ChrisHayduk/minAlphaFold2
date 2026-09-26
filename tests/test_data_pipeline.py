@@ -152,6 +152,7 @@ def write_simple_mmcif(
 
     text = (
         f"data_{pdb_id}\n"
+        "_database_PDB_rev.date_original 2000-01-01\n"
         "_entity_poly.entity_id 1\n"
         f"_entity_poly.pdbx_seq_one_letter_code_can {sequence}\n"
         f"_refine.ls_d_res_high {resolution:.2f}\n"
@@ -285,9 +286,12 @@ def test_preprocess_chain_projects_query_and_template_features(tmp_path):
         msa_name="uniref90_hits.a3m",
         template_hhr_name="pdb70_hits.hhr",
         skip_templates=False,
+        max_template_date="2020-01-01",
     )
 
     assert set(features) == {
+        "preprocessing_provenance",
+        "template_provenance",
         "aatype",
         "msa",
         "deletions",

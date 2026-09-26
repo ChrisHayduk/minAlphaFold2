@@ -45,7 +45,9 @@ The produced manifest is compatible with
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import math
 import sys
 from collections import Counter
 from datetime import datetime, timezone
@@ -57,7 +59,6 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from minalphafold.data import discover_chain_ids
-
 
 DEFAULT_MAX_RESOLUTION_ANGSTROMS = 9.0  # §1.2.5 bullet 1
 DEFAULT_MAX_SINGLE_AA_FRACTION = 0.8    # §1.2.5 bullet 3
@@ -86,9 +87,13 @@ def load_cluster_tsv(path: Path) -> dict[str, tuple[str, int]]:
     with path.open() as handle:
         for line in handle:
             parts = line.strip().split("\t")
-            if len(parts) < 2:
+            if not line.strip():
                 continue
-            representative, member = parts[0], parts[1]
+            if len(parts) != 2 or not all(parts):
+                raise ValueError("Cluster TSV requires exactly representative and member")
+            representative, member = parts
+            if member in members:
+                raise ValueError(f"Duplicate cluster member: {member}")
             members[member] = representative
             cluster_sizes[representative] += 1
     return {
@@ -111,30 +116,31 @@ def _evaluate_chain(
     features_path = processed_features_dir / f"{chain_id}.npz"
     labels_path = processed_labels_dir / f"{chain_id}.npz"
 
-    features = np.load(features_path, allow_pickle=True)
-    labels = np.load(labels_path, allow_pickle=True)
-
-    aatype = np.asarray(features["aatype"])
-    length = int(aatype.shape[0])
-    resolution = (
-        float(labels["resolution"].item())
-        if "resolution" in labels.files
-        else float("nan")
-    )
+    with np.load(features_path, allow_pickle=False) as features, np.load(labels_path, allow_pickle=False) as labels:
+        aatype = np.asarray(features["aatype"])
+        if aatype.ndim != 1 or not np.issubdtype(aatype.dtype, np.integer) or np.any((aatype < 0) | (aatype > 20)):
+            raise ValueError(f"Invalid aatype for {chain_id}")
+        length = int(aatype.shape[0])
+        resolution = float(labels["resolution"].item()) if "resolution" in labels.files else float("nan")
+        generations = [str(cache["cache_generation"].item()) if "cache_generation" in cache.files else None for cache in (features, labels)]
+        if generations[0] != generations[1]:
+            raise ValueError(f"Mismatched cache generations for {chain_id}")
     single_aa_fraction = max_single_aa_fraction(aatype)
 
     reject_reasons: list[str] = []
     if length < min_length:
         reject_reasons.append("min_length")
-    if not np.isnan(resolution) and resolution >= max_resolution:
+    if not np.isnan(resolution) and (not np.isfinite(resolution) or resolution < 0 or resolution >= max_resolution):
         reject_reasons.append("resolution")
     if single_aa_fraction > max_single_aa_fraction_threshold:
         reject_reasons.append("single_aa")
 
     entry: dict[str, Any] = {
         "chain_id": chain_id,
+        "features_sha256": hashlib.sha256(features_path.read_bytes()).hexdigest(),
+        "labels_sha256": hashlib.sha256(labels_path.read_bytes()).hexdigest(),
         "length": length,
-        "resolution": resolution,
+        "resolution": resolution if np.isfinite(resolution) else None,
         "max_single_aa_fraction": round(single_aa_fraction, 4),
         "accepted": not reject_reasons,
         "reject_reasons": reject_reasons,
@@ -157,6 +163,12 @@ def build_manifest(
     sample_limit: int | None = None,
 ) -> dict[str, Any]:
     """Scan all NPZs under the processed directories and return a manifest dict."""
+    if not math.isfinite(max_resolution) or max_resolution < 0:
+        raise ValueError("max_resolution must be finite and positive")
+    if not 0 <= max_single_aa_fraction_threshold <= 1 or min_length < 1:
+        raise ValueError("Invalid sequence filter thresholds")
+    if sample_limit is not None and sample_limit < 1:
+        raise ValueError("sample_limit must be positive")
     chain_ids = discover_chain_ids(processed_features_dir, processed_labels_dir)
     if sample_limit is not None:
         chain_ids = chain_ids[:sample_limit]
@@ -178,6 +190,8 @@ def build_manifest(
         for chain_id in chain_ids
     ]
 
+    if mmseqs_cluster_tsv is not None and {entry["chain_id"] for entry in entries if entry["accepted"]} - set(cluster_info):
+        raise ValueError("Cluster TSV does not cover every accepted chain")
     summary: dict[str, int] = {
         "total": len(entries),
         "accepted": sum(1 for entry in entries if entry["accepted"]),
@@ -248,7 +262,7 @@ def main(argv: list[str] | None = None) -> None:
         sample_limit=args.sample_limit,
     )
     args.manifest_out.parent.mkdir(parents=True, exist_ok=True)
-    args.manifest_out.write_text(json.dumps(manifest, indent=2))
+    args.manifest_out.write_text(json.dumps(manifest, indent=2, allow_nan=False))
 
     summary = manifest["summary"]
     print(

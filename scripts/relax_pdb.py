@@ -63,9 +63,10 @@ def _openmm_positions_to_atom14(topology, positions):
     """
     import numpy as np
     from openmm import unit
+
     from minalphafold.residue_constants import (
-        restype_name_to_atom14_names,
         restype_3to1,
+        restype_name_to_atom14_names,
         restype_order,
     )
 
@@ -76,9 +77,17 @@ def _openmm_positions_to_atom14(topology, positions):
     aatype = np.full(n_res, 20, dtype=np.int64)  # UNK default
     residue_index = np.zeros(n_res, dtype=np.int64)
 
+    peptide_edges = set()
+    for left, right in topology.bonds():
+        if left.name == "N" and right.name == "C":
+            left, right = right, left
+        if left.name == "C" and right.name == "N" and left.residue.chain is right.residue.chain:
+            peptide_edges.add((left.residue.index, right.residue.index))
     for i, residue in enumerate(residues_list):
         resname = residue.name
-        residue_index[i] = int(residue.id)
+        if i:
+            bonded = (residues_list[i - 1].index, residue.index) in peptide_edges
+            residue_index[i] = residue_index[i - 1] + (1 if bonded else 2)
         if resname not in restype_3to1:
             continue  # Leave as UNK + all-zero mask; violation loss will skip it.
         aatype[i] = restype_order[restype_3to1[resname]]
@@ -105,8 +114,8 @@ def _detect_violating_residues(topology, positions, violation_tolerance_factor=1
     (between-residue), and within-residue bounds — are OR-combined to a
     single per-residue flag: True iff any violation type fires.
     """
-    import numpy as np
     import torch
+
     from minalphafold.losses import StructuralViolationLoss
 
     atom14_pos, atom_mask, aatype, residue_index = _openmm_positions_to_atom14(
@@ -203,6 +212,14 @@ def relax_pdb(
 
     Returns a dict with per-round stats.
     """
+    if max_rounds < 1 or max_iterations_per_round < 0:
+        raise ValueError("Invalid relaxation iteration limits")
+    for value in (restraint_k_kcal_per_mol_angstrom_sq, force_tolerance_kj_per_mol_nm,
+                  violation_tolerance_factor, clash_overlap_tolerance):
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError("Relaxation constants must be finite and positive")
+    if input_pdb.resolve() == output_pdb.resolve() or output_pdb.exists():
+        raise FileExistsError("Relaxation requires a fresh output path, distinct from its input")
     try:
         import openmm
         import openmm.app as app
@@ -433,6 +450,10 @@ def relax_pdb(
     # fold was preserved (backbone-restrained drift should be ~sub-Å).
     # ------------------------------------------------------------------
     final_positions = simulation.context.getState(getPositions=True).getPositions()
+    if not math.isfinite(final_energy):
+        raise RuntimeError("Non-finite relaxed energy")
+    if not all(math.isfinite(float(value)) for position in final_positions.value_in_unit(unit.angstrom) for value in position):
+        raise RuntimeError("Non-finite relaxed coordinates")
     max_backbone_drift_angstrom = 0.0
     max_restrained_heavy_drift_angstrom = 0.0
     max_any_heavy_drift_angstrom = 0.0

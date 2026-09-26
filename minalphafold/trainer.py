@@ -19,33 +19,39 @@ Deviations from the paper for pedagogical reasons are called out inline:
 * ``batch_size`` defaults to 1 (paper uses 128 across TPU cores).
 * Gradient clipping is applied globally over the mini-batch rather than
   per-example — at ``batch_size=1`` these are identical.
-* The LR schedule offers ``"constant"`` and ``"warmup_cosine"`` variants;
-  the paper's exact schedule is "linear warmup → constant → one-shot
-  ×0.95 decay at 6.4·10⁶ samples", which neither option reproduces — we
-  document the tradeoff here rather than adding a bespoke schedule.
+* Step schedules support constant/cosine variants; samples-based warmup
+  and one-shot decay are available for the paper protocol.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
+import math
+import os
+import random
+import tempfile
 import tomllib
+import uuid
 from collections.abc import Sized
 from dataclasses import asdict, dataclass, is_dataclass, replace
 from functools import partial
-import math
 from pathlib import Path
-import random
 from typing import Any, cast
 
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from .data import ProcessedOpenProteinSetDataset, collate_batch
+from .data import (
+    MSA_SAMPLE_FEATURE_KEYS,
+    ProcessedOpenProteinSetDataset,
+    collate_batch,
+    validate_split_manifests,
+)
 from .losses import AlphaFoldLoss
 from .model import AlphaFold2
 from .model_config import ModelConfig
-
 
 # Model profiles live in ``configs/<name>.toml`` at the repo root; see
 # :func:`load_model_config`. Keeping them as data (not code) means
@@ -116,6 +122,10 @@ class DataConfig:
     # filters (resolution, single-AA dominance, min length). ``None``
     # (default) means use every chain that has a feature + label NPZ.
     chains_manifest: str | Path | None = None
+    # Exact role lists require both paths and val_fraction=0. Supplied
+    # group annotations are checked for complete, disjoint ownership.
+    train_chains_manifest: str | Path | None = None
+    val_chains_manifest: str | Path | None = None
     block_delete_training_msa: bool = True
     block_delete_msa_fraction: float = 0.3
     block_delete_msa_randomize_num_blocks: bool = False
@@ -153,14 +163,18 @@ class TrainingConfig:
       selection, while ``model.state_dict()`` continues to hold the
       live training params. ``None`` disables EMA entirely.
     * ``resume_from_checkpoint`` points to a previously-saved checkpoint;
-      when set, ``fit`` restores model + optimizer + EMA state and
-      continues from the stored ``global_step`` / ``global_samples``.
+      when set, ``fit`` restores model + optimizer + EMA, random states,
+      DataLoader generators and exposure counters at an epoch boundary.
+      Code, configuration, role manifests and selected cache hashes must
+      match. Output paths cannot overwrite another run's identity.
     * ``n_cycles`` and ``n_ensemble`` default to 1; the paper uses 4 and 1
       respectively during training (supplement 1.10 and 1.11.2; ensembling
       is inference-only).
     """
 
     epochs: int = 1
+    max_samples: int | None = None
+    structural_violation_weight: float = 1.0
     batch_size: int = 1                       # paper: 128 (TPU mini-batch)
     grad_accum_steps: int = 1                 # multiply with batch_size for effective batch
     learning_rate: float = 1e-3               # supplement 1.11.3
@@ -195,8 +209,7 @@ class TrainingConfig:
     resume_from_checkpoint: str | Path | None = None
     # Seed model weights from a previous run without restoring optimizer
     # / EMA / counter state — exactly what the paper does at the start
-    # of fine-tuning (§1.11.1). Ignored when ``resume_from_checkpoint``
-    # is set, since resume already handles model weights.
+    # of fine-tuning (§1.11.1). Mutually exclusive with exact resume.
     init_weights_from_checkpoint: str | Path | None = None
 
 
@@ -323,6 +336,8 @@ def load_training_protocol(name_or_path: str | Path) -> TrainingProtocol:
             )
     with path.open("rb") as f:
         data = tomllib.load(f)
+    if set(data) != {"protocol", "optimizer", "initial", "finetune"}:
+        raise ValueError("Training protocol requires only protocol/optimizer/initial/finetune")
     return TrainingProtocol(
         protocol=data["protocol"],
         optimizer=OptimizerConfig(**data["optimizer"]),
@@ -383,10 +398,27 @@ def build_dataloader(
     n_cycles: int = 1,
     n_ensemble: int = 1,
 ) -> DataLoader:
+    if not 0 <= data_config.val_fraction < 1:
+        raise ValueError("val_fraction must lie in [0, 1)")
+    if data_config.crop_size < 1 or data_config.msa_depth < 1 or data_config.extra_msa_depth < 0 or data_config.max_templates < 0:
+        raise ValueError("Invalid feature dimensions")
+    if not 0 <= data_config.masked_msa_probability <= 1 or not 0 <= data_config.block_delete_msa_fraction <= 1 or data_config.block_delete_msa_num_blocks < 0:
+        raise ValueError("Invalid MSA augmentation settings")
+    role_manifest = None
+    if data_config.train_chains_manifest is not None or data_config.val_chains_manifest is not None:
+        if data_config.train_chains_manifest is None or data_config.val_chains_manifest is None:
+            raise ValueError("Explicit splitting requires both train and validation manifests")
+        if data_config.val_fraction != 0:
+            raise ValueError("Use val_fraction=0 with explicit split manifests")
+        validate_split_manifests(data_config.train_chains_manifest, data_config.val_chains_manifest)
+        if split not in ("train", "val"):
+            raise ValueError("Explicit split manifests require a train or val role")
+        role_manifest = data_config.train_chains_manifest if split == "train" else data_config.val_chains_manifest
     dataset = ProcessedOpenProteinSetDataset(
         data_config.processed_features_dir,
         data_config.processed_labels_dir,
-        split=split,
+        split="all" if role_manifest is not None else split,
+        split_manifest=role_manifest,
         val_fraction=data_config.val_fraction,
         seed=seed,
         chains_manifest=data_config.chains_manifest,
@@ -551,9 +583,13 @@ def load_checkpoint_for_resume(
     offset by one — the caller starts the next epoch, not the saved one.
     """
     checkpoint = torch.load(path, map_location=map_location, weights_only=False)
+    _validate_resume_metadata(checkpoint)
+    require_finite_state(checkpoint)
     model.load_state_dict(checkpoint["model_state_dict"])
     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-    if ema_model is not None and "ema_state_dict" in checkpoint:
+    if (ema_model is not None) != ("ema_state_dict" in checkpoint):
+        raise ValueError("Checkpoint EMA configuration differs")
+    if ema_model is not None:
         ema_model.load_state_dict(checkpoint["ema_state_dict"])
     history_raw = checkpoint.get("history", [])
     return {
@@ -714,9 +750,161 @@ def loss_inputs_from_batch(batch: dict[str, Any], outputs: dict[str, Any]) -> di
         "distogram_pred": outputs["distogram_logits"],
         "tm_pred": outputs["tm_logits"],
         "res_types": batch["res_types"],
-        "residue_index": batch["residue_index"],
+        "residue_index": batch.get("loss_residue_index", batch["residue_index"]),
         "seq_mask": batch["seq_mask"],
     }
+
+
+def require_finite_state(value: Any) -> None:
+    """Reject poisoned model/optimizer state before publishing a checkpoint."""
+    tensors = []
+    def collect(item):
+        if torch.is_tensor(item) and (item.is_floating_point() or item.is_complex()):
+            tensors.append(item)
+        elif isinstance(item, dict):
+            for child in item.values():
+                collect(child)
+        elif isinstance(item, (tuple, list)):
+            for child in item:
+                collect(child)
+    collect(value)
+    devices = {tensor.device for tensor in tensors}
+    for device in devices:
+        if not torch.stack([torch.isfinite(t).all() for t in tensors if t.device == device]).all():
+            raise ValueError("Non-finite model or optimizer state")
+
+
+def _validate_resume_metadata(checkpoint: dict) -> None:
+    for name in ("epoch", "global_step", "global_samples"):
+        value = checkpoint.get(name)
+        if type(value) is not int or value < 0:
+            raise ValueError(f"Checkpoint {name} must be a nonnegative integer")
+    history = checkpoint.get("history")
+    if not isinstance(history, list) or not history:
+        raise ValueError("Checkpoint requires completed-epoch history")
+    last = history[-1]
+    if any(last.get(name) != checkpoint[name] for name in ("epoch", "global_step", "global_samples")):
+        raise ValueError("Checkpoint counters disagree with completed history")
+    cap = checkpoint.get("training_config", {}).get("max_samples")
+    if cap is not None and checkpoint["global_samples"] > cap:
+        raise ValueError("Checkpoint exceeds its sample budget")
+    for entry in history:
+        if any(not math.isfinite(value) for value in entry.values() if isinstance(value, (float, int))):
+            raise ValueError("Checkpoint history contains non-finite metrics")
+    best = checkpoint.get("best_val_loss")
+    if best is not None and (not isinstance(best, (float, int)) or not math.isfinite(best)):
+        raise ValueError("Invalid best validation loss")
+
+
+def checked_loss(per_example_loss: torch.Tensor) -> torch.Tensor:
+    if per_example_loss.ndim != 1 or per_example_loss.numel() == 0:
+        raise ValueError("Expected a nonempty per-example loss vector")
+    if not torch.isfinite(per_example_loss).all():
+        raise ValueError("Non-finite loss; refusing an optimizer update")
+    return per_example_loss.mean()
+
+
+def clip_gradients(model: torch.nn.Module, max_norm: float | None) -> None:
+    # Even unclipped runs must not silently poison weights/checkpoints.
+    torch.nn.utils.clip_grad_norm_(
+        model.parameters(), float("inf") if max_norm is None else max_norm,
+        error_if_nonfinite=True,
+    )
+
+
+def _limit_batch(batch: dict[str, Any], count: int) -> dict[str, Any]:
+    sampled = batch["msa_feat"].ndim == 6
+    return {
+        key: (value[:, :, :count] if sampled and key in MSA_SAMPLE_FEATURE_KEYS else value[:count])
+        for key, value in batch.items()
+    }
+
+
+def validate_training_config(config: TrainingConfig) -> None:
+    for name in ("epochs", "batch_size", "grad_accum_steps", "n_cycles", "n_ensemble"):
+        value = getattr(config, name)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+            raise ValueError(f"{name} must be a positive integer")
+    for name in ("num_workers", "warmup_steps", "warmup_samples"):
+        if getattr(config, name) < 0:
+            raise ValueError(f"{name} must be nonnegative")
+    for name in ("max_samples", "lr_decay_samples", "finetune_start_step"):
+        value = getattr(config, name)
+        if value is not None and (not isinstance(value, int) or value < (1 if name == "max_samples" else 0)):
+            raise ValueError(f"Invalid {name}")
+    for name in ("learning_rate", "adam_eps", "finetune_lr_scale", "lr_decay_factor"):
+        if not math.isfinite(getattr(config, name)) or getattr(config, name) <= 0:
+            raise ValueError(f"{name} must be finite and positive")
+    for name in ("min_learning_rate", "weight_decay", "structural_violation_weight"):
+        if not math.isfinite(getattr(config, name)) or getattr(config, name) < 0:
+            raise ValueError(f"{name} must be finite and nonnegative")
+    for name in ("adam_beta1", "adam_beta2", "ema_decay"):
+        value = getattr(config, name)
+        if value is not None and not (0 <= value < 1):
+            raise ValueError(f"Invalid {name}")
+    if config.grad_clip_norm is not None and (not math.isfinite(config.grad_clip_norm) or config.grad_clip_norm <= 0):
+        raise ValueError("grad_clip_norm must be finite and positive, or None")
+    if config.lr_schedule not in ("constant", "warmup_cosine"):
+        raise ValueError("Unsupported learning-rate schedule")
+    if config.resume_from_checkpoint and config.init_weights_from_checkpoint:
+        raise ValueError("Choose either resume or weight initialization")
+
+
+def _file_digest(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _resume_contract(model_config, data_config, training_config, train_loader, val_loader):
+    settings = config_to_dict(training_config)
+    for name in ("latest_checkpoint_path", "best_checkpoint_path", "resume_from_checkpoint", "init_weights_from_checkpoint"):
+        settings.pop(name)
+    # A cosine schedule's horizon is scientific state; constant/sample schedules
+    # can be extended by increasing the epoch limit.
+    if training_config.lr_schedule != "warmup_cosine" or _uses_samples_schedule(training_config):
+        settings.pop("epochs")
+    data = config_to_dict(data_config)
+    data["manifest_sha256"] = {
+        name: _file_digest(Path(getattr(data_config, name)))
+        for name in ("chains_manifest", "train_chains_manifest", "val_chains_manifest")
+        if getattr(data_config, name) is not None
+    }
+    for name in ("processed_features_dir", "processed_labels_dir", "chains_manifest", "train_chains_manifest", "val_chains_manifest"):
+        data.pop(name)
+    datasets = {}
+    for split, loader in (("train", train_loader), ("val", val_loader)):
+        dataset = loader.dataset
+        datasets[split] = [
+            (chain, _file_digest(dataset.processed_features_dir / f"{chain}.npz"),
+             _file_digest(dataset.processed_labels_dir / f"{chain}.npz"))
+            for chain in dataset.chain_ids
+        ]
+    return {"model": config_to_dict(model_config), "data": data, "training": settings,
+            "datasets": datasets, "implementation": {
+                path.name: _file_digest(path) for path in sorted(Path(__file__).parent.iterdir())
+                if path.is_file() and path.suffix in {".py", ".txt"}}}
+
+
+def _rng_state(train_loader=None, val_loader=None):
+    return {"python": random.getstate(), "numpy": np.random.get_state(),
+            "torch": torch.get_rng_state(),
+            "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+            "loaders": [loader.generator.get_state() for loader in (train_loader, val_loader) if loader is not None]}
+
+
+def _restore_rng(state, train_loader, val_loader):
+    random.setstate(state["python"])
+    np.random.set_state(state["numpy"])
+    torch.set_rng_state(state["torch"].cpu())
+    if state["cuda"] is not None:
+        torch.cuda.set_rng_state_all([value.cpu() for value in state["cuda"]])
+    if len(state["loaders"]) != 2:
+        raise ValueError("Checkpoint lacks train/validation loader random state")
+    for loader, value in zip((train_loader, val_loader), state["loaders"]):
+        loader.generator.set_state(value.cpu())
 
 
 def train_step(
@@ -740,13 +928,13 @@ def train_step(
     batch = move_to_device(batch, device)
     outputs = model(**model_inputs_from_batch(batch, training_config))
     per_example_loss = loss_fn(**loss_inputs_from_batch(batch, outputs))
-    loss = per_example_loss.mean()
+    loss = checked_loss(per_example_loss)
     loss.backward()
 
-    if training_config.grad_clip_norm is not None:
-        torch.nn.utils.clip_grad_norm_(model.parameters(), training_config.grad_clip_norm)
+    clip_gradients(model, training_config.grad_clip_norm)
 
     optimizer.step()
+    require_finite_state((model.state_dict(), optimizer.state_dict()))
     return {"loss": float(loss.item())}
 
 
@@ -765,22 +953,28 @@ def evaluate(
     call site is identical.
     """
     device = resolve_device(training_config.device)
+    was_training = model.training
     model.eval()
 
-    total_loss = 0.0
-    total_examples = 0
-    with torch.no_grad():
-        for batch in dataloader:
-            batch = move_to_device(batch, device)
-            outputs = model(**model_inputs_from_batch(batch, training_config))
-            per_example_loss = loss_fn(**loss_inputs_from_batch(batch, outputs))
-            total_loss += float(per_example_loss.sum().item())
-            total_examples += int(per_example_loss.shape[0])
+    try:
+        total_loss = 0.0
+        total_examples = 0
+        with torch.no_grad():
+            for batch in dataloader:
+                batch = move_to_device(batch, device)
+                outputs = model(**model_inputs_from_batch(batch, training_config))
+                per_example_loss = loss_fn(**loss_inputs_from_batch(batch, outputs))
+                checked_loss(per_example_loss)
+                total_loss += float(per_example_loss.sum().item())
+                total_examples += int(per_example_loss.shape[0])
 
-    if total_examples == 0:
-        raise ValueError("Cannot evaluate an empty dataloader.")
+        if total_examples == 0:
+            raise ValueError("Cannot evaluate an empty dataloader.")
 
-    return {"loss": total_loss / total_examples}
+        return {"loss": total_loss / total_examples}
+
+    finally:
+        model.train(was_training)
 
 
 def config_to_dict(config: Any) -> Any:
@@ -814,19 +1008,23 @@ def save_checkpoint(
     global_step: int = 0,
     global_samples: int = 0,
     ema_model: torch.optim.swa_utils.AveragedModel | None = None,
+    resume_contract: dict | None = None,
+    rng_state: dict | None = None,
+    run_id: str | None = None,
 ) -> None:
     """Persist training state to ``path``.
 
     ``global_step`` / ``global_samples`` are the counters needed to resume
     a samples-based LR schedule correctly; ``ema_state_dict`` carries the
     EMA shadow parameters and is only included when an EMA is in use.
-    Older checkpoints without these keys are still loadable via
-    :func:`load_checkpoint_for_resume` — the loader defaults to zero
-    counters and no EMA restore in their absence.
+    ``fit`` also stores and checks the data/config/code contract and RNG
+    state. Legacy files are usable for explicit weight initialization,
+    not exact training continuation.
     """
     checkpoint_path = Path(path)
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     payload: dict[str, Any] = {
+        "run_id": run_id,
         "epoch": epoch,
         "global_step": global_step,
         "global_samples": global_samples,
@@ -837,10 +1035,23 @@ def save_checkpoint(
         "data_config": config_to_dict(data_config),
         "training_config": config_to_dict(training_config),
         "model_config": config_to_dict(model_config),
+        "resume_contract": resume_contract,
+        "rng_state": _rng_state() if rng_state is None else rng_state,
     }
     if ema_model is not None:
         payload["ema_state_dict"] = ema_model.state_dict()
-    torch.save(payload, checkpoint_path)
+    require_finite_state(payload)
+    # Never leave a partially serialized file at the resumable path.
+    fd, temporary = tempfile.mkstemp(prefix=f".{checkpoint_path.name}.", dir=checkpoint_path.parent)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            torch.save(payload, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, checkpoint_path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
 
 
 def fit(
@@ -853,28 +1064,34 @@ def fit(
     Each training iteration:
 
     1. Decide pre-training vs fine-tuning by ``use_finetune_loss``.
-    2. Forward + backward one micro-batch; divide loss by
-       ``grad_accum_steps`` so the accumulated gradient has the same
-       expected scale as a single full-batch backward.
+    2. Forward + backward the unscaled micro-batch mean.
     3. Clip the micro-batch's gradient by global-norm (§1.11.3). At
        ``batch_size=1`` this matches the paper's per-example clipping;
        at larger batch sizes it's per-micro-batch and slightly
        different. See :class:`TrainingConfig` for the caveat.
     4. Either accumulate into a dedicated buffer (when
-       ``grad_accum_steps > 1``) and continue, or copy the clipped
-       gradient into ``.grad``, set the LR via
+       ``grad_accum_steps > 1``) and continue, or average clipped
+       gradients weighted by actual sample count, including the final
+       partial window, set the LR via
        :func:`learning_rate_at_step` (samples-based schedule when
        configured), call ``optimizer.step``, and update the EMA
        (§1.11.7) if one is active.
 
     Stage transitions (Table 4) — crop-size bump, LR halving, violation
     loss on — are the caller's responsibility: swap the configs and
-    either resume from the previous checkpoint or start a new ``fit``.
+    initialize the new stage from the previous checkpoint's weights.
+    Exact resume is for continuation of the same stage/configuration.
     """
     model_config = load_model_config("tiny") if model_config is None else model_config
     data_config = DataConfig() if data_config is None else data_config
     training_config = TrainingConfig() if training_config is None else training_config
 
+    validate_training_config(training_config)
+    output_paths = [Path(p).resolve() for p in (training_config.latest_checkpoint_path, training_config.best_checkpoint_path) if p is not None]
+    if len(output_paths) != len(set(output_paths)):
+        raise ValueError("Latest and best checkpoint paths must differ")
+    if training_config.resume_from_checkpoint is None and any(p.exists() for p in output_paths):
+        raise FileExistsError("Checkpoint output already exists; explicitly resume or choose a new directory")
     set_seed(training_config.seed)
     device = resolve_device(training_config.device)
 
@@ -906,18 +1123,20 @@ def fit(
         n_cycles=training_config.n_cycles,
         n_ensemble=training_config.n_ensemble,
     )
-    has_validation = data_config.val_fraction > 0.0 and len(cast(Sized, val_loader.dataset)) > 0
+    has_validation = (data_config.val_fraction > 0.0 or data_config.val_chains_manifest is not None) and len(cast(Sized, val_loader.dataset)) > 0
 
+    resume_contract = _resume_contract(model_config, data_config, training_config, train_loader, val_loader)
     model = AlphaFold2(model_config).to(device)
     pretrain_loss_fn = AlphaFoldLoss(finetune=False).to(device)
     finetune_loss_fn = AlphaFoldLoss(finetune=True).to(device)
+    finetune_loss_fn.structural_violation_weight = training_config.structural_violation_weight
     optimizer = build_optimizer(model, training_config)
 
     # --- Cross-stage weight init (supplement 1.11.1) --------------------
     # Fine-tuning starts from the initial-stage checkpoint's weights but
     # with a fresh optimizer, zero counters, and (when enabled) a fresh
-    # EMA seeded from the just-loaded weights. Ignored when resuming,
-    # since resume's own restore covers the model weights.
+    # EMA seeded from the just-loaded weights. Configuration validation
+    # rejects using weight initialization and exact resume together.
     if (
         training_config.init_weights_from_checkpoint is not None
         and training_config.resume_from_checkpoint is None
@@ -944,7 +1163,20 @@ def fit(
     global_step = 0
     global_samples = 0
     start_epoch = 1
+    run_id = uuid.uuid4().hex
     if training_config.resume_from_checkpoint is not None:
+        saved = torch.load(training_config.resume_from_checkpoint, map_location="cpu", weights_only=False)
+        if saved.get("resume_contract") != resume_contract or "rng_state" not in saved:
+            raise ValueError("Resume checkpoint does not match data, code, configuration, or RNG contract; use weight initialization for a new run")
+        run_id = saved.get("run_id")
+        if not isinstance(run_id, str) or not run_id:
+            raise ValueError("Resume checkpoint lacks run identity")
+        for output_path in output_paths:
+            if output_path.exists() and output_path != Path(training_config.resume_from_checkpoint).resolve():
+                existing = torch.load(output_path, map_location="cpu", weights_only=False)
+                if existing.get("run_id") != run_id or existing.get("global_step", math.inf) > saved.get("global_step", -1):
+                    raise FileExistsError("Checkpoint output belongs to another run or a later continuation")
+                del existing
         restored = load_checkpoint_for_resume(
             training_config.resume_from_checkpoint,
             model,
@@ -952,6 +1184,7 @@ def fit(
             ema_model,
             map_location=device,
         )
+        _restore_rng(saved["rng_state"], train_loader, val_loader)
         start_epoch = restored["epoch"]
         global_step = restored["global_step"]
         global_samples = restored["global_samples"]
@@ -962,99 +1195,69 @@ def fit(
             f"global_samples={global_samples}"
         )
 
-    # --- Gradient accumulation ------------------------------------------
-    # The buffer doubles gradient memory (one extra param-sized float
-    # tensor) but is the only way to clip per-micro-batch before summing,
-    # which in turn approximates the paper's per-example clipping rule at
-    # batch_size=1. At grad_accum_steps=1 the buffer is unused.
-    grad_accum_steps = max(training_config.grad_accum_steps, 1)
-    grad_accumulator: list[torch.Tensor] | None = None
-    if grad_accum_steps > 1:
-        grad_accumulator = [torch.zeros_like(p) for p in model.parameters()]
-
-    steps_per_epoch = max(len(train_loader) // grad_accum_steps, 1)
+    parameters = list(model.parameters())
+    grad_accum_steps = training_config.grad_accum_steps
+    steps_per_epoch = math.ceil(len(train_loader) / grad_accum_steps)
     total_steps = training_config.epochs * steps_per_epoch
 
     for epoch in range(start_epoch, training_config.epochs + 1):
+        if training_config.max_samples is not None and global_samples >= training_config.max_samples:
+            break
         total_train_loss = 0.0
         total_train_examples = 0
         accum_count = 0
-        optimizer.zero_grad(set_to_none=True)
-
-        # Seed ``current_lr`` before the inner loop so an empty
-        # ``train_loader`` still leaves a valid LR for ``epoch_metrics``.
-        current_lr = learning_rate_at_step(
-            training_config,
-            global_step,
-            total_steps,
-            is_finetune=use_finetune_loss(training_config, global_step),
-            samples_seen=global_samples,
-        )
-
-        for batch in train_loader:
+        accum_samples = 0
+        # None preserves Adam's distinction between unused parameters and a
+        # used parameter whose derivative happens to be zero.
+        accumulator: list[torch.Tensor | None] = [None] * len(parameters)
+        current_lr = 0.0
+        for batch_index, batch in enumerate(train_loader):
+            if training_config.max_samples is not None:
+                remaining = training_config.max_samples - global_samples
+                if int(batch["aatype"].shape[0]) > remaining:
+                    batch = _limit_batch(batch, remaining)
             is_finetune = use_finetune_loss(training_config, global_step)
             loss_fn = finetune_loss_fn if is_finetune else pretrain_loss_fn
-
             model.train()
+            optimizer.zero_grad(set_to_none=True)
             batch = move_to_device(batch, device)
             outputs = model(**model_inputs_from_batch(batch, training_config))
             per_example_loss = loss_fn(**loss_inputs_from_batch(batch, outputs))
-            micro_batch_loss = per_example_loss.mean()
-            (micro_batch_loss / grad_accum_steps).backward()
-
+            micro_batch_loss = checked_loss(per_example_loss)
+            micro_batch_loss.backward()
+            clip_gradients(model, training_config.grad_clip_norm)
             batch_size = int(batch["aatype"].shape[0])
+            for index, parameter in enumerate(parameters):
+                if parameter.grad is not None:
+                    weighted = parameter.grad.detach() * batch_size
+                    previous = accumulator[index]
+                    accumulator[index] = weighted if previous is None else previous + weighted
             total_train_loss += float(micro_batch_loss.item()) * batch_size
             total_train_examples += batch_size
             global_samples += batch_size
+            accum_samples += batch_size
             accum_count += 1
-
-            # Per-micro-batch clip (§1.11.3). At batch_size=1 this is
-            # per-example; at larger batches it approximates.
-            if training_config.grad_clip_norm is not None:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), training_config.grad_clip_norm)
-
-            if grad_accumulator is not None:
-                for accum, parameter in zip(grad_accumulator, model.parameters()):
-                    if parameter.grad is not None:
-                        accum.add_(parameter.grad)
-                optimizer.zero_grad(set_to_none=True)
-
-            if accum_count < grad_accum_steps:
+            reached_budget = training_config.max_samples is not None and global_samples >= training_config.max_samples
+            if accum_count < grad_accum_steps and batch_index + 1 < len(train_loader) and not reached_budget:
                 continue
-
-            # --- End of accumulation window: step the optimizer --------
-            if grad_accumulator is not None:
-                for accum, parameter in zip(grad_accumulator, model.parameters()):
-                    parameter.grad = accum.clone()
-                    accum.zero_()
-
+            for parameter, gradient in zip(parameters, accumulator):
+                parameter.grad = None if gradient is None else gradient / accum_samples
             current_lr = learning_rate_at_step(
-                training_config,
-                global_step,
-                total_steps,
-                is_finetune=is_finetune,
-                samples_seen=global_samples,
+                training_config, global_step, total_steps,
+                is_finetune=is_finetune, samples_seen=global_samples,
             )
             set_optimizer_learning_rate(optimizer, current_lr)
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
-
             if ema_model is not None:
                 ema_model.update_parameters(model)
-
-            accum_count = 0
+            accumulator = [None] * len(parameters)
+            accum_count = accum_samples = 0
             global_step += 1
+            if reached_budget:
+                break
 
-        # Partial accumulation at end of epoch is discarded — next epoch
-        # starts fresh with a cleared optimizer and accumulator. This
-        # keeps epoch boundaries crisp for checkpointing.
-        if accum_count > 0:
-            optimizer.zero_grad(set_to_none=True)
-            if grad_accumulator is not None:
-                for accum in grad_accumulator:
-                    accum.zero_()
-            accum_count = 0
-
+        require_finite_state((model.state_dict(), optimizer.state_dict()))
         epoch_metrics: dict[str, float | int] = {
             "epoch": epoch,
             "train_loss": total_train_loss / max(total_train_examples, 1),
@@ -1092,6 +1295,11 @@ def fit(
                 f"samples={global_samples}"
             )
 
+        improved = "val_loss" in epoch_metrics and (best_val_loss is None or float(epoch_metrics["val_loss"]) < best_val_loss)
+        if improved:
+            best_val_loss = float(epoch_metrics["val_loss"])
+        rng_state = _rng_state(train_loader, val_loader)
+
         if training_config.latest_checkpoint_path is not None:
             save_checkpoint(
                 training_config.latest_checkpoint_path,
@@ -1106,12 +1314,13 @@ def fit(
                 data_config=data_config,
                 training_config=training_config,
                 model_config=model_config,
+                resume_contract=resume_contract,
+                rng_state=rng_state,
+                run_id=run_id,
             )
 
         if training_config.best_checkpoint_path is not None and "val_loss" in epoch_metrics:
-            current_val_loss = float(epoch_metrics["val_loss"])
-            if best_val_loss is None or current_val_loss < best_val_loss:
-                best_val_loss = current_val_loss
+            if improved:
                 save_checkpoint(
                     training_config.best_checkpoint_path,
                     epoch=epoch,
@@ -1125,6 +1334,9 @@ def fit(
                     data_config=data_config,
                     training_config=training_config,
                     model_config=model_config,
+                    resume_contract=resume_contract,
+                    rng_state=rng_state,
+                    run_id=run_id,
                 )
 
     return model, history
@@ -1145,6 +1357,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--processed-features-dir", type=str, default="data/processed_features")
     parser.add_argument("--processed-labels-dir", type=str, default="data/processed_labels")
     parser.add_argument("--val-fraction", type=float, default=0.1)
+    parser.add_argument("--train-chains-manifest", type=Path, default=None)
+    parser.add_argument("--val-chains-manifest", type=Path, default=None)
     parser.add_argument("--crop-size", type=int, default=256)
     parser.add_argument("--msa-depth", type=int, default=128)
     parser.add_argument("--extra-msa-depth", type=int, default=1024)
@@ -1206,6 +1420,8 @@ def main(argv: list[str] | None = None) -> tuple[AlphaFold2, list[dict[str, floa
         processed_features_dir=args.processed_features_dir,
         processed_labels_dir=args.processed_labels_dir,
         val_fraction=args.val_fraction,
+        train_chains_manifest=args.train_chains_manifest,
+        val_chains_manifest=args.val_chains_manifest,
         crop_size=args.crop_size,
         msa_depth=args.msa_depth,
         extra_msa_depth=args.extra_msa_depth,

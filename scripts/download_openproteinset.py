@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import argparse
 import os
-from pathlib import Path
+import re
 import subprocess
+import tempfile
+from pathlib import Path
 from typing import Sequence
 from urllib.error import HTTPError
 from urllib.request import urlopen
@@ -48,9 +50,25 @@ def read_chain_ids(chain_id_file: str, limit: int) -> list[str]:
         for line in Path(chain_id_file).read_text().splitlines()
         if line.strip() and not line.lstrip().startswith("#")
     ]
+    if limit < 0:
+        raise ValueError("limit must be nonnegative")
+    for chain_id in chain_ids:
+        _validate_chain_id(chain_id)
+    if len(set(chain_ids)) != len(chain_ids):
+        raise ValueError("Duplicate requested chain IDs")
     if limit > 0:
         chain_ids = chain_ids[:limit]
     return chain_ids
+
+
+def _validate_chain_id(chain_id: str) -> None:
+    if re.fullmatch(r"[A-Za-z0-9]{4}_[A-Za-z0-9]+", chain_id) is None:
+        raise ValueError(f"Invalid chain ID: {chain_id}")
+
+
+def _validate_filename(name: str) -> None:
+    if Path(name).name != name or name in ("", ".", ".."):
+        raise ValueError("Asset names must be plain filenames")
 
 
 def download_url(url: str, destination: Path, dry_run: bool) -> bool:
@@ -60,8 +78,20 @@ def download_url(url: str, destination: Path, dry_run: bool) -> bool:
 
     destination.parent.mkdir(parents=True, exist_ok=True)
     try:
-        with urlopen(url) as response:
-            destination.write_bytes(response.read())
+        with urlopen(url, timeout=60) as response:
+            data = response.read()
+        if not data:
+            raise ValueError(f"Empty downloaded asset: {url}")
+        fd, temporary = tempfile.mkstemp(prefix=f".{destination.name}.", dir=destination.parent)
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, destination)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
     except HTTPError as exc:
         print(f"WARNING: failed to download {url} ({exc.code})")
         return False
@@ -75,7 +105,10 @@ def subset_alignment_urls(
     *,
     skip_templates: bool,
 ) -> list[tuple[str, Path]]:
+    _validate_chain_id(chain_id)
     msa_names = [msa_name] if isinstance(msa_name, str) else list(msa_name)
+    for name in [*msa_names, template_hhr_name]:
+        _validate_filename(name)
     targets = [
         (
             f"https://openfold.s3.amazonaws.com/pdb/{chain_id}/a3m/{name}",
@@ -94,6 +127,7 @@ def subset_alignment_urls(
 
 
 def subset_structure_url(chain_id: str) -> tuple[str, Path]:
+    _validate_chain_id(chain_id)
     pdb_id = chain_id.split("_", 1)[0].upper()
     return (
         f"https://files.rcsb.org/download/{pdb_id}.cif",
@@ -112,6 +146,7 @@ def download_subset(
     dry_run: bool,
 ) -> None:
     resolved_msa_names = normalize_msa_names(msa_name, msa_names)
+    failures = []
     for chain_id in chain_ids:
         for url, relative_destination in subset_alignment_urls(
             chain_id,
@@ -119,10 +154,14 @@ def download_subset(
             template_hhr_name,
             skip_templates=skip_templates,
         ):
-            download_url(url, data_root / relative_destination, dry_run=dry_run)
+            if not download_url(url, data_root / relative_destination, dry_run=dry_run):
+                failures.append(str(relative_destination))
 
         structure_url, structure_destination = subset_structure_url(chain_id)
-        download_url(structure_url, data_root / structure_destination, dry_run=dry_run)
+        if not download_url(structure_url, data_root / structure_destination, dry_run=dry_run):
+            failures.append(str(structure_destination))
+    if failures:
+        raise RuntimeError(f"Subset download incomplete: {len(failures)} required assets failed")
 
 
 def build_alignment_sync_command(
@@ -182,6 +221,8 @@ def expand_duplicate_alignments(roda_root: Path, duplicate_chains_file: Path) ->
         chain_ids = [token.strip() for token in line.split() if token.strip()]
         if len(chain_ids) < 2:
             continue
+        for chain_id in chain_ids:
+            _validate_chain_id(chain_id)
 
         representative = None
         for chain_id in chain_ids:
@@ -197,7 +238,7 @@ def expand_duplicate_alignments(roda_root: Path, duplicate_chains_file: Path) ->
             target = roda_root / chain_id
             if target.exists():
                 continue
-            os.symlink(representative, target, target_is_directory=True)
+            os.symlink(representative.resolve(), target, target_is_directory=True)
 
 
 def main() -> None:

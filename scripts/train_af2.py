@@ -45,6 +45,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from minalphafold.data import ProcessedOpenProteinSetDataset, validate_split_manifests
 from minalphafold.trainer import (
     DataConfig,
     StageConfig,
@@ -69,18 +70,6 @@ def _epochs_for_target_samples(target_samples: int, dataset_size: int) -> int:
     if dataset_size <= 0:
         return 1
     return max(math.ceil(target_samples / dataset_size), 1)
-
-
-def _count_training_chains(labels_dir: Path) -> int:
-    """Rough dataset size estimate for the epochs calculation.
-
-    One NPZ per chain, so the label count is the upper bound on training
-    examples per epoch. The actual train/val split will lop ``val_fraction``
-    off the top; we round up the epoch count to tolerate that.
-    """
-    if not labels_dir.exists():
-        return 0
-    return sum(1 for _ in labels_dir.glob("*.npz"))
 
 
 def data_config_for_stage(
@@ -136,6 +125,8 @@ def training_config_for_stage(
       §1.11.3 verbatim. ``lr_schedule`` is left at ``"constant"`` so
       the step-based path is disabled.
     """
+    if not is_finetune and stage.violation_loss_weight != 0:
+        raise ValueError("The initial stage requires zero violation loss; select fine-tuning to enable it")
     optimizer = protocol.optimizer
     return TrainingConfig(
         epochs=epochs,
@@ -158,6 +149,7 @@ def training_config_for_stage(
         n_cycles=n_cycles,
         n_ensemble=n_ensemble,
         finetune=is_finetune,
+        structural_violation_weight=stage.violation_loss_weight,
         finetune_lr_scale=1.0,  # stage LR already encodes the Table 4 halving
         latest_checkpoint_path=latest_checkpoint_path,
         best_checkpoint_path=best_checkpoint_path,
@@ -182,6 +174,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--processed-features-dir", type=Path, default=Path("data/processed_features"))
     parser.add_argument("--processed-labels-dir", type=Path, default=Path("data/processed_labels"))
     parser.add_argument("--val-fraction", type=float, default=0.0)
+    parser.add_argument("--train-chains-manifest", type=Path, default=None)
+    parser.add_argument("--val-chains-manifest", type=Path, default=None)
     parser.add_argument(
         "--chains-manifest", type=Path, default=None,
         help="Path to a JSON manifest from scripts/filter_openproteinset.py. "
@@ -224,19 +218,25 @@ def main(argv: list[str] | None = None) -> None:
 
     # Effective batch = batch_size × grad_accum_steps. Default scales
     # grad_accum_steps so the product matches the paper's mini_batch_size.
+    if args.batch_size < 1:
+        raise ValueError("batch_size must be positive")
     grad_accum_steps = args.grad_accum_steps
     if grad_accum_steps is None:
-        grad_accum_steps = max(protocol.optimizer.mini_batch_size // args.batch_size, 1)
+        if protocol.optimizer.mini_batch_size % args.batch_size:
+            raise ValueError("batch_size must divide protocol mini_batch_size, or specify grad_accum_steps")
+        grad_accum_steps = protocol.optimizer.mini_batch_size // args.batch_size
     effective_batch = args.batch_size * grad_accum_steps
 
     args.checkpoint_dir.mkdir(parents=True, exist_ok=True)
     latest_path = args.checkpoint_dir / f"{args.stage}_latest.pt"
-    best_path = args.checkpoint_dir / f"{args.stage}_best.pt" if args.val_fraction > 0 else None
+    best_path = args.checkpoint_dir / f"{args.stage}_best.pt" if args.val_fraction > 0 or args.val_chains_manifest is not None else None
 
     # --- Fine-tune init vs resume resolution --------------------------
     # Fine-tune from scratch requires --init-from (cross-stage weight
     # hand-off). Resume (within-stage) supersedes init-from — it already
     # restores the live model state.
+    if args.stage == "initial" and args.init_from is not None:
+        raise ValueError("--init-from is supported only for the fine-tune stage")
     init_weights_from: Path | None = None
     if args.resume is None and args.stage == "finetune":
         if args.init_from is None:
@@ -246,29 +246,28 @@ def main(argv: list[str] | None = None) -> None:
             )
         init_weights_from = args.init_from
     elif args.resume is not None and args.init_from is not None:
-        print(
-            "[train] --resume set, ignoring --init-from "
-            "(resume already restores model weights)."
-        )
-
-    # Epoch count: prefer explicit, otherwise derive from Table 4 target.
-    if args.epochs is not None:
-        epochs = args.epochs
-    else:
-        dataset_size = _count_training_chains(args.processed_labels_dir)
-        epochs = _epochs_for_target_samples(stage.total_samples, dataset_size)
-        print(
-            f"[train] dataset_size≈{dataset_size} chains → "
-            f"epochs={epochs} for target_samples={stage.total_samples:,}"
-        )
+        raise ValueError("Choose either --resume or --init-from")
 
     data_config = data_config_for_stage(
-        stage,
-        processed_features_dir=args.processed_features_dir,
+        stage, processed_features_dir=args.processed_features_dir,
         processed_labels_dir=args.processed_labels_dir,
-        val_fraction=args.val_fraction,
-        chains_manifest=args.chains_manifest,
+        val_fraction=args.val_fraction, chains_manifest=args.chains_manifest,
     )
+    if args.train_chains_manifest is not None or args.val_chains_manifest is not None:
+        if args.train_chains_manifest is None or args.val_chains_manifest is None or args.val_fraction != 0:
+            raise ValueError("Explicit splitting needs both role manifests and val_fraction=0")
+        validate_split_manifests(args.train_chains_manifest, args.val_chains_manifest)
+        data_config.train_chains_manifest = args.train_chains_manifest
+        data_config.val_chains_manifest = args.val_chains_manifest
+    dataset = ProcessedOpenProteinSetDataset(
+        args.processed_features_dir, args.processed_labels_dir,
+        split="all" if args.train_chains_manifest is not None else "train",
+        split_manifest=args.train_chains_manifest,
+        val_fraction=args.val_fraction, seed=args.seed, chains_manifest=args.chains_manifest,
+    )
+    if not len(dataset):
+        raise ValueError("The filtered training split is empty")
+    epochs = args.epochs if args.epochs is not None else _epochs_for_target_samples(stage.total_samples, len(dataset))
     training_config = training_config_for_stage(
         protocol, stage,
         device=args.device,
@@ -285,6 +284,9 @@ def main(argv: list[str] | None = None) -> None:
         resume_from_checkpoint=args.resume,
         init_weights_from_checkpoint=init_weights_from,
     )
+
+    if args.epochs is None:
+        training_config.max_samples = stage.total_samples
 
     print(
         f"[train] stage={args.stage} protocol={protocol.protocol} "

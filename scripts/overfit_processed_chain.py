@@ -38,7 +38,6 @@ from typing import Any
 import numpy as np
 import torch
 
-
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -56,6 +55,7 @@ from minalphafold.data import (
     cluster_statistics,
     crop_example,
     hhblits_profile,
+    loss_residue_index,
     masked_msa_inputs,
     sample_cluster_and_extra,
 )
@@ -65,9 +65,11 @@ from minalphafold.pdbio import write_atom14_pdb, write_model_output_pdb
 from minalphafold.trainer import (
     DataConfig,
     TrainingConfig,
+    _file_digest,
     build_dataloader,
     build_optimizer,
-    collapse_sampled_batch_tensor,
+    checked_loss,
+    clip_gradients,
     list_available_profiles,
     load_model_config,
     loss_inputs_from_batch,
@@ -75,15 +77,19 @@ from minalphafold.trainer import (
     move_to_device,
     set_optimizer_learning_rate,
     set_seed,
+    validate_training_config,
     zero_dropout_model_config,
 )
-
 
 ARTIFACT_ROOT = ROOT / "artifacts" / "overfit_processed_chain"
 
 
 def kabsch_align(pred: torch.Tensor, truth: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Rigid-body alignment of ``pred`` onto ``truth`` (min-RMSD orthogonal Procrustes)."""
+    if pred.shape != truth.shape or pred.ndim != 2 or pred.shape[0] < 3 or pred.shape[1] != 3:
+        raise ValueError("Kabsch alignment needs at least three corresponding atoms")
+    if not torch.isfinite(pred).all() or not torch.isfinite(truth).all():
+        raise ValueError("Kabsch coordinates must be finite")
     pred_center = pred.mean(dim=0)
     truth_center = truth.mean(dim=0)
     covariance = (pred - pred_center).transpose(0, 1) @ (truth - truth_center)
@@ -98,10 +104,12 @@ def kabsch_align(pred: torch.Tensor, truth: torch.Tensor) -> tuple[torch.Tensor,
 
 
 def rmsd(a: torch.Tensor, b: torch.Tensor) -> float:
+    if a.shape != b.shape or a.numel() == 0:
+        raise ValueError("RMSD needs nonempty corresponding coordinates")
     return float(torch.sqrt(torch.mean(torch.sum((a - b) ** 2, dim=-1))).item())
 
 
-def structure_metrics(outputs: dict, batch: dict) -> dict[str, float]:
+def structure_metrics(outputs: dict, batch: dict) -> dict:
     """Kabsch-aligned backbone / Cα / all-atom RMSDs + peptide-bond stats."""
     pred = outputs["atom14_coords"][0].detach().cpu()
     pred_mask = outputs["atom14_mask"][0].detach().cpu()
@@ -124,34 +132,25 @@ def structure_metrics(outputs: dict, batch: dict) -> dict[str, float]:
     pred_bb = pred[:, bb_atoms][bb_common]
     truth_bb = truth[:, bb_atoms][bb_common]
 
-    if pred_bb.shape[0] < 3:
-        # Not enough backbone atoms to align — skip.
-        return {
-            "backbone_rmsd_after_alignment": float("nan"),
-            "ca_rmsd_after_alignment": float("nan"),
-            "all_atom_rmsd_after_alignment": float("nan"),
-            "peptide_bond_mean": float("nan"),
-            "peptide_bond_max": float("nan"),
-            "peptide_bond_min": float("nan"),
-        }
-
     _, R, t = kabsch_align(pred_bb, truth_bb)
     aligned = pred @ R.transpose(0, 1) + t
 
-    ca_valid = truth_mask[:, 1] > 0.5
+    ca_valid = (truth_mask[:, 1] > 0.5) & (pred_mask[:, 1] > 0.5)
     common = (truth_mask > 0.5) & (pred_mask > 0.5)
 
     # C_i → N_{i+1} peptide-bond lengths (ideal 1.329 Å, PyMOL draws up to ~1.9 Å).
     c_i = pred[:-1, 2]
     n_next = pred[1:, 0]
-    peptide_bonds = torch.linalg.norm(c_i - n_next, dim=-1)
+    residue_index = batch.get("loss_residue_index", batch["residue_index"])[0].detach().cpu()
+    neighbor_mask = (residue_index[1:] - residue_index[:-1] == 1) & (pred_mask[:-1, 2] > 0.5) & (pred_mask[1:, 0] > 0.5)
+    peptide_bonds = torch.linalg.norm(c_i - n_next, dim=-1)[neighbor_mask]
     return {
         "backbone_rmsd_after_alignment": rmsd(aligned[:, bb_atoms][bb_common], truth_bb),
         "ca_rmsd_after_alignment": rmsd(aligned[ca_valid, 1], truth[ca_valid, 1]),
         "all_atom_rmsd_after_alignment": rmsd(aligned[common], truth[common]),
-        "peptide_bond_mean": float(peptide_bonds.mean().item()),
-        "peptide_bond_max": float(peptide_bonds.max().item()),
-        "peptide_bond_min": float(peptide_bonds.min().item()),
+        "peptide_bond_mean": float(peptide_bonds.mean().item()) if peptide_bonds.numel() else None,
+        "peptide_bond_max": float(peptide_bonds.max().item()) if peptide_bonds.numel() else None,
+        "peptide_bond_min": float(peptide_bonds.min().item()) if peptide_bonds.numel() else None,
     }
 
 
@@ -301,6 +300,8 @@ def _build_frozen_context(args, device: torch.device) -> dict[str, Any]:
         cropped["aatype"],
         cropped["atom14_positions"],
         cropped["atom14_mask"],
+        residue_index=cropped.get("residue_index"),
+        between_segment_residues=cropped.get("between_segment_residues"),
     )
 
     residue_index = cropped.get("residue_index")
@@ -318,6 +319,7 @@ def _build_frozen_context(args, device: torch.device) -> dict[str, Any]:
         "chain_id": cropped["chain_id"],
         "aatype": cropped["aatype"],
         "residue_index": residue_index,
+        "loss_residue_index": loss_residue_index(residue_index, cropped.get("between_segment_residues")),
         "target_feat": target_feat,
         "template_pair_feat": template_pair_feat,
         "template_angle_feat": template_angle_feat,
@@ -337,6 +339,7 @@ def _build_frozen_context(args, device: torch.device) -> dict[str, Any]:
 
 
 _SUPERVISION_KEYS = (
+    "loss_residue_index",
     "true_rotations",
     "true_translations",
     "true_atom_positions",
@@ -585,8 +588,18 @@ def main(argv: list[str] | None = None) -> dict:
                             "it. Unclamping at handoff provides a permanent restoring force."
                         ))
     args = parser.parse_args(argv)
+    if args.steps < 1 or args.log_every < 1 or args.eval_every < 1 or args.n_cycles < 1:
+        raise ValueError("steps, log_every, and n_cycles must be positive")
+    if args.violation_ramp_steps < 0 or not np.isfinite(args.fine_tune_lr_scale) or args.fine_tune_lr_scale <= 0:
+        raise ValueError("Invalid fine-tuning schedule")
+    if args.violations_after_step is not None and args.violations_after_step < 0:
+        raise ValueError("violations_after_step must be nonnegative")
+    if args.use_clamped_fape is not None and not 0 <= args.use_clamped_fape <= 1:
+        raise ValueError("use_clamped_fape must lie in [0, 1]")
 
     out_dir = args.out_dir or (ARTIFACT_ROOT / args.chain_id)
+    if out_dir.exists() and any(out_dir.iterdir()):
+        raise FileExistsError(f"Output directory is not empty: {out_dir}; choose a fresh run directory")
     out_dir.mkdir(parents=True, exist_ok=True)
 
     set_seed(args.seed)
@@ -702,6 +715,10 @@ def main(argv: list[str] | None = None) -> dict:
             n_cycles=args.n_cycles,
             n_ensemble=args.n_ensemble,
         )
+        assert isinstance(train_loader.dataset, ProcessedOpenProteinSetDataset)
+        assert isinstance(eval_loader.dataset, ProcessedOpenProteinSetDataset)
+        train_loader.dataset.chain_ids = [args.chain_id]
+        eval_loader.dataset.chain_ids = [args.chain_id]
         batch_iter = _cycle(train_loader)
 
         def _next_batch() -> dict:
@@ -709,6 +726,7 @@ def main(argv: list[str] | None = None) -> dict:
 
         eval_batch = move_to_device(next(iter(eval_loader)), device)
 
+    validate_training_config(training_config)
     optimizer = build_optimizer(model, training_config)
     # Two-stage training mirroring supplement 1.11.1 / Table 4: `finetune=False`
     # during initial training (violation weight 0.0, exp-resolved weight 0.0),
@@ -761,10 +779,9 @@ def main(argv: list[str] | None = None) -> dict:
         optimizer.zero_grad(set_to_none=True)
         outputs = model(**model_inputs_from_batch(batch, training_config))
         per_example_loss = loss_fn(**loss_inputs_from_batch(batch, outputs))
-        loss = per_example_loss.mean()
+        loss = checked_loss(per_example_loss)
         loss.backward()
-        if training_config.grad_clip_norm is not None:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), training_config.grad_clip_norm)
+        clip_gradients(model, training_config.grad_clip_norm)
         optimizer.step()
 
         loss_value = float(loss.item())
@@ -787,8 +804,8 @@ def main(argv: list[str] | None = None) -> dict:
                 f"bb_rmsd={metrics['backbone_rmsd_after_alignment']:.3f}  "
                 f"ca_rmsd={metrics['ca_rmsd_after_alignment']:.3f}  "
                 f"aa_rmsd={metrics['all_atom_rmsd_after_alignment']:.3f}  "
-                f"pep={metrics['peptide_bond_mean']:.2f}"
-                f"[{metrics['peptide_bond_min']:.2f},{metrics['peptide_bond_max']:.2f}]"
+                f"pep={metrics['peptide_bond_mean']}"
+                f"[{metrics['peptide_bond_min']},{metrics['peptide_bond_max']}]"
             )
             print(f"[overfit] losses {step:4d}/{args.steps}  {_format_loss_breakdown(term_values)}")
             ca_rmsd = metrics["ca_rmsd_after_alignment"]
@@ -825,6 +842,10 @@ def main(argv: list[str] | None = None) -> dict:
     write_pymol_script(out_dir / "view_in_pymol.pml", predicted_pdb, truth_pdb)
 
     metrics_payload = {
+        "arguments": vars(args),
+        "input_sha256": {"features": _file_digest(feature_cache), "labels": _file_digest(label_cache)},
+        "model_config": vars(model_config),
+        "source_sha256": _file_digest(Path(__file__)),
         "chain_id": args.chain_id,
         "steps": args.steps,
         "model_profile": args.model_profile,
@@ -841,8 +862,8 @@ def main(argv: list[str] | None = None) -> dict:
         "ground_truth_pdb": str(truth_pdb),
         "pymol_script": str(out_dir / "view_in_pymol.pml"),
     }
-    (out_dir / "metrics.json").write_text(json.dumps(metrics_payload, indent=2, default=str))
-    (out_dir / "losses.json").write_text(json.dumps(history, indent=2, default=str))
+    (out_dir / "metrics.json").write_text(json.dumps(metrics_payload, indent=2, default=str, allow_nan=False))
+    (out_dir / "losses.json").write_text(json.dumps(history, indent=2, default=str, allow_nan=False))
 
     print()
     print(f"[overfit] final metrics: {final_metrics}")

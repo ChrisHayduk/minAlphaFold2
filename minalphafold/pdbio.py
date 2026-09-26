@@ -89,6 +89,11 @@ def atom14_to_pdb_string(
             f"got {aatype_tensor.shape[0]} and {positions_tensor.shape[0]}"
         )
 
+    if not torch.all(torch.isfinite(mask_tensor) & ((mask_tensor == 0) | (mask_tensor == 1))):
+        raise ValueError("atom14_mask must be finite and binary")
+    if not torch.isfinite(positions_tensor[mask_tensor.bool()]).all():
+        raise ValueError("Observed atom14 positions must be finite")
+
     num_residues = aatype_tensor.shape[0]
     if residue_index is None:
         residue_index_tensor = torch.arange(num_residues, dtype=torch.long)
@@ -119,6 +124,11 @@ def atom14_to_pdb_string(
             "occupancies length must match the number of residues, "
             f"got {occupancy_tensor.shape[0]} and {num_residues}"
         )
+
+    if not torch.isfinite(b_factor_tensor).all() or not torch.isfinite(occupancy_tensor).all():
+        raise ValueError("PDB temperature factors and occupancies must be finite")
+    if not torch.all((occupancy_tensor >= 0) & (occupancy_tensor <= 1)):
+        raise ValueError("PDB occupancies must lie in [0, 1]")
 
     lines: list[str] = []
     atom_serial = serial_start
